@@ -1,7 +1,7 @@
 # Working on the backend
 
 Not started (2026-08-30). Read the umbrella's
-[AGENTS.md](https://github.com/plantbutler/plantbutler/blob/main/AGENTS.md) and
+[AGENTS.md](https://github.com/plantbutler/plantbutler/blob/main/AGENTS.md) (on this machine: `~/projects/plant-butler/AGENTS.md`) and
 [DECISIONS.md](https://github.com/plantbutler/plantbutler/blob/main/DECISIONS.md) first; decisions
 #2, #4, #5 and #6 are the ones this repository implements.
 
