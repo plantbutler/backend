@@ -20,6 +20,16 @@ The backend decides when to water (thresholds, smoothing, per-pot cooldown, dail
 hours) and never enqueues on a stale heartbeat or an empty reservoir. NAS or WiFi down means no
 watering.
 
+## What is here (2026-08-31)
+
+- `butler.py` — the whole service: `create_app` factory (env: `BUTLER_TOKEN` required,
+  `BUTLER_DB`, `BUTLER_NEXT_S`), `POST /report` (k=v body, `X-Token` header, refuses whole on
+  malformed channels, ignores unknown keys, stamps arrival time, answers `next=60`),
+  `GET /health` (count, last ts, controllers).
+- `schema.sql` — additive-only DDL, `readings` table + index. `Dockerfile` — python-slim,
+  port 9380, `/data` volume. `tests/test_report.py` — the endpoint's contract, `uv run pytest`.
+- Pitch 1 is built and tested on the laptop; not yet deployed to the NAS.
+
 ## Pitches, in order (titles in the plan)
 
 1. **Readings land on the NAS** (cycle 1, Claude, Jacopo reviews) — the container, the readings
@@ -74,6 +84,7 @@ proposal to approve and verdict at the pot. The flip to auto is a human act, per
 ## When you start
 
 Stack (chosen 2026-08-31): a `uv` project, FastAPI + uvicorn, standard-library `sqlite3`, one
-`schema.sql`. Ask Jacopo for NAS
-access before the first pitch — Container Manager in the DSM UI or SSH. The token and the NAS
-address never enter the repository.
+`schema.sql`. NAS access exists: SSH with key auth (host alias in ~/.ssh/config on the laptop), and
+passwordless sudo scoped to the docker binary only. Jacopo's standing rule: announce and ask
+before EVERY operation on the NAS that changes, installs or writes anything; reading is free.
+The token and the NAS address never enter the repository.
