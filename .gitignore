@@ -1,0 +1,8 @@
+# The token and the NAS address never enter the repository.
+deploy.env
+*.db
+*.db-wal
+*.db-shm
+.venv/
+__pycache__/
+.pytest_cache/
