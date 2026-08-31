@@ -28,7 +28,9 @@ watering.
   `GET /health` (count, last ts, controllers).
 - `schema.sql` — additive-only DDL, `readings` table + index. `Dockerfile` — python-slim,
   port 9380, `/data` volume. `tests/test_report.py` — the endpoint's contract, `uv run pytest`.
-- Pitch 1 is built and tested on the laptop; not yet deployed to the NAS.
+- Pitch 1 is deployed (2026-08-31): container `plantbutler` on the NAS, port 9380, image
+  `plantbutler-backend:0.1.0` shipped via `docker save | ssh docker load`, database on
+  `/volume1/docker/plantbutler/data`, token in `deploy.env` beside it (600, not in git).
 
 ## Pitches, in order (titles in the plan)
 
