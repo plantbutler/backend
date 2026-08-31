@@ -58,16 +58,18 @@ seconds-only and the meter stays safety-only.
 
 Tables (`schema.sql`): `readings(ts, controller, channel, raw)`; `pots(id, name, controller,
 channel, outlet, plant_type, plant_size, pot_size, soil, dry_raw, wet_raw, target_low_pct,
-target_high_pct, cooldown_h, daily_cap_ml, enabled)` — mapping, calibration, thresholds and the descriptive
+target_high_pct, dose_ml, mode, cooldown_h, daily_cap_ml, enabled)` (`mode`:
+manual | learning | auto) — mapping, calibration, thresholds and the descriptive
 fields (Planta-style: what is potted, how big, in what) in one table until that hurts; `commands(id, created_ts,
-outlet, ml, cap_s, state queued→sent→acked/expired/failed, source, result)` — the command log is
+outlet, ml, cap_s, state proposed→queued→sent→acked/expired/failed, source, result, verdict)` — the command log is
 the watering history; `events(ts, kind, detail)`. Percentages are derived at read time, never
 stored. Air temperature and light ride the same readings table as extra channels (the sensor kit
 has both modules); season is derived from the date. Adaptive dosing from range, temperature,
 light and season is a later pitch — see the plan's Planta note — v1 rules stay thresholds.
 
 Rules run in-process on each report arrival, no cron: median over a window → N consecutive dry →
-cooldown → daily cap → quiet hours → heartbeat fresh and float ok and position ok → enqueue.
+cooldown → daily cap → quiet hours → heartbeat fresh and float ok and position ok → enqueue — directly in auto; in learning, a
+proposal to approve and verdict at the pot. The flip to auto is a human act, per pot.
 
 ## When you start
 
