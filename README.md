@@ -28,6 +28,22 @@ curl -s -X POST http://localhost:8000/report \
 curl -s http://localhost:8000/health
 ```
 
+Queue a command for the board's next report, or change its report interval:
+
+```bash
+curl -s -X POST http://localhost:8000/command \
+  -H 'X-Token: dev' --data-binary 'c=butler1 water=3 ml=50 cap_s=30'
+# -> cmd=1        (409 busy: ... while the slot is taken; stop=1 instead of a dose)
+curl -s -X POST http://localhost:8000/interval \
+  -H 'X-Token: dev' --data-binary 'c=butler1 next=120'
+```
+
+Or skip curl and let a fake board do the whole dance — report, receive, water, ack:
+
+```bash
+python fake_device.py --token dev --cycles 3
+```
+
 ## Deploy
 
 `docker build` the image (the NAS is x86_64), run it with `/data` bind-mounted to a volume the
