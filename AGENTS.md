@@ -23,11 +23,21 @@ watering.
 ## What is here (2026-08-31)
 
 - `butler.py` — the whole service: `create_app` factory (env: `BUTLER_TOKEN` required,
-  `BUTLER_DB`, `BUTLER_NEXT_S`), `POST /report` (k=v body, `X-Token` header, refuses whole on
-  malformed channels, ignores unknown keys, stamps arrival time, answers `next=60`),
-  `GET /health` (count, last ts, controllers).
-- `schema.sql` — additive-only DDL, `readings` table + index. `Dockerfile` — python-slim,
-  port 9380, `/data` volume. `tests/test_report.py` — the endpoint's contract, `uv run pytest`.
+  `BUTLER_DB`, `BUTLER_NEXT_S`, `BUTLER_CMD_TTL_S`), `POST /report` (k=v body, `X-Token`
+  header, refuses whole on malformed channels, ignores unknown keys, stamps arrival time,
+  answers `next=` plus at most one `cmd=` line), `POST /command` (queue `water=<outlet>
+  ml= cap_s=` or `stop=1`, one slot per controller, 409 when busy), `POST /interval`
+  (per-controller `next=` override, 0 clears), `GET /health` (count, last ts, per-controller
+  heartbeat/knob/open command).
+- The command slot: queued → handed exactly once in a report response (sent) → acked by the
+  next report's `ack=<id> flow_ml=`; a no-ack report or the TTL expires it. Expired is gone —
+  ask again. The commands table is never pruned: it doubles as the watering history.
+- `schema.sql` — additive-only DDL: `readings`, `commands`, `controllers` + indexes.
+  `Dockerfile` — python-slim, port 9380, `/data` volume. `tests/` — the endpoints' contracts,
+  `uv run pytest`.
+- `fake_device.py` — stdlib board simulator: reports on the `next=` beat, executes the one
+  command a response carries, acks it on the following report. `python fake_device.py --token
+  dev --cycles 3` against a local uvicorn or the NAS.
 - Pitch 1 is deployed (2026-08-31): container `plantbutler` on the NAS, port 9380, image
   `plantbutler-backend:0.1.0` shipped via `docker save | ssh docker load`, database on
   `/volume1/docker/plantbutler/data`, token in `deploy.env` beside it (600, not in git).

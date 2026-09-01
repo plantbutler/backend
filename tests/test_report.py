@@ -20,7 +20,7 @@ def db(tmp_path):
 
 @pytest.fixture
 def client(db):
-    app = create_app(db_path=str(db), token=TOKEN, next_s=60)
+    app = create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900)
     return TestClient(app)
 
 
@@ -57,7 +57,7 @@ def test_the_server_stamps_arrival_time_itself(client, db):
 
 
 def test_keys_this_version_does_not_know_are_ignored(client, db):
-    body = "c=butler1 float=1 pos=ok last=ok ack=17 flow_ml=48 ch0=8123\n"
+    body = "c=butler1 float=1 pos=ok last=ok zz=9 ch0=8123\n"
     answer = post(client, body)
 
     assert answer.status_code == 200
@@ -71,7 +71,7 @@ def test_reports_append_and_health_counts_them(client, db):
     health = client.get("/health").json()
     assert health["ok"] is True
     assert health["readings"] == 2
-    assert health["controllers"] == ["butler1"]
+    assert [c["controller"] for c in health["controllers"]] == ["butler1"]
     assert health["last_ts"] is not None
 
 
@@ -145,6 +145,11 @@ def test_a_non_ascii_token_is_a_401_not_a_500(client, db):
         "c=butler1 c=butler2 ch0=1\n",  # two controllers in one report
         "c=butler1 ch0=1 notakv\n",  # not k=v
         "c=butler1 t=abc ch0=1\n",  # t= not an integer
+        "c= c=evil ch0=1\n",  # empty c= must not open the door to a second
+        "c=butler1 ch0=1 =5\n",  # empty key
+        "c=butler1 ch0=١٢٣\n",  # Unicode digits: refusal, not repair
+        "c=butler1 t=1_000 ch0=5\n",  # int() underscores are not board output
+        "c=butler1 ch0=+5\n",  # neither is a leading +
     ],
 )
 def test_a_malformed_report_is_refused_whole(client, db, body):
@@ -210,7 +215,7 @@ def test_a_data_path_without_a_data_mount_refuses_to_serve():
 
 
 def test_parse_is_strict_about_shape_and_silent_about_unknowns():
-    controller, channels, t = parse_report("c=x unknown=1 t=99 ch7=99")
-    assert (controller, channels, t) == ("x", {7: 99}, 99)
+    report = parse_report("c=x unknown=1 t=99 ch7=99")
+    assert report[:3] == ("x", {7: 99}, 99)
     with pytest.raises(ValueError):
         parse_report("c=x notakv")
