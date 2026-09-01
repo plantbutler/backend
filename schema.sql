@@ -94,3 +94,28 @@ CREATE TABLE IF NOT EXISTS verdicts (
 
 CREATE INDEX IF NOT EXISTS commands_by_outlet
   ON commands (controller, outlet, sent_ts);
+
+-- Tell me when it's wrong (cycle 2). `status` is each controller's latest
+-- safety fields, with a `since` per value so a float bouncing at the
+-- waterline or a manifold homing at boot must persist before it alarms.
+-- `alerts` is the alerting state, one row per condition or judgement,
+-- overwritten in place: which conditions are raised now, when a cleared one
+-- may sound again, which doses are already judged. State, not history —
+-- ntfy keeps no archive and neither does this (a no-go in the pitch).
+
+CREATE TABLE IF NOT EXISTS status (
+  controller  TEXT PRIMARY KEY,
+  ts          INTEGER NOT NULL,  -- when the latest report landed
+  float_ok    INTEGER,           -- float= in that report, NULL if not sent
+  float_since INTEGER,           -- when float_ok last changed value
+  pos         TEXT,              -- pos= in that report, NULL if not sent
+  pos_since   INTEGER            -- when pos last changed value
+);
+
+CREATE TABLE IF NOT EXISTS alerts (
+  key        TEXT PRIMARY KEY,  -- silent:<c> | float:<c> | pos:<c> |
+                                -- dose:<id> | proposal:<c>:<outlet>
+  raised_ts  INTEGER NOT NULL,
+  cleared_ts INTEGER,           -- NULL while the condition stands
+  detail     TEXT               -- dose judgements: 'ok' | 'failed'
+);

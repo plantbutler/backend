@@ -68,6 +68,24 @@ Or skip curl and let a fake board do the whole dance — report, receive, water,
 python fake_device.py --token dev --cycles 3
 ```
 
+## When something is wrong, the phone buzzes
+
+Set `BUTLER_NTFY_TOPIC` (the topic name is the secret: pick something unguessable) and the butler
+posts to `https://ntfy.sh/<topic>` — subscribe to it in the ntfy app. The rules, evaluated once a
+minute from database state: a controller silent for `max(BUTLER_SILENT_S, 3x its interval)`;
+`float=0` (reservoir empty) or `pos=unknown` (manifold lost) persisting for a few minutes; a dose
+that was never acked, came up short on the meter, or did not raise moisture a soak later; a
+learning proposal waiting for approval (one nudge per hose per day). Raises and clears are
+debounced and a cleared condition re-raises at most hourly — a muted phone is worse than a late
+alert — and a dose that worked is recorded silently: this tells you when it's *wrong*.
+
+Set `BUTLER_DEADMAN_URL` (a healthchecks.io ping URL, say) and every clean pass GETs it, so the
+butler dying — or failing to reach ntfy — stops the pings and the monitor speaks up through its
+own channel (give it one that is not ntfy: it must not share the failure domain). Ten minutes
+after every start, one min-priority "butler is up" message probes the topic end to end, because
+ntfy answers 200 on any topic name and a typo'd topic would otherwise be a permanent, silent
+blackout.
+
 ## Deploy
 
 `docker build` the image (the NAS is x86_64), run it with `/data` bind-mounted to a volume the

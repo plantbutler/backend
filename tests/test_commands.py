@@ -210,6 +210,8 @@ def test_health_lists_a_configured_but_never_seen_controller(client, db):
         "last_seen": 0,
         "next_s": 120,
         "command": None,
+        "float": None,
+        "pos": None,
     }
 
 
