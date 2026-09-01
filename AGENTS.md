@@ -52,9 +52,11 @@ watering.
 - `fake_device.py` — stdlib board simulator: reports on the `next=` beat, executes the one
   command a response carries, acks it on the following report. `python fake_device.py --token
   dev --cycles 3` against a local uvicorn or the NAS.
-- Pitches 1-3 are deployed (2026-09-01): container `plantbutler` on the NAS, port 9380,
-  image `plantbutler-backend:0.3.0` shipped via `docker save | ssh docker load`, database on
-  `/volume1/docker/plantbutler/data`, token in `deploy.env` beside it (600, not in git).
+- Pitches 1-3 and the rules engine are deployed (2026-09-01): container `plantbutler` on the
+  NAS, port 9380, image `plantbutler-backend:0.4.0` shipped via `docker save | ssh docker
+  load`, database on `/volume1/docker/plantbutler/data`, token in `deploy.env` beside it
+  (600, not in git), `-e TZ=Europe/Zurich` so BUTLER_QUIET means local night. The rules run
+  dark until the firmware sends `float=`/`pos=`.
 
 ## Pitches, in order (titles in the plan)
 
