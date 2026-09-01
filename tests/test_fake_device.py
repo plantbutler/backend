@@ -8,6 +8,11 @@ def test_a_report_looks_like_the_boards():
     assert body == "c=fake1 t=61000 ch0=8123 ch1=7902 ack=17 flow_ml=48\n"
 
 
+def test_it_reports_reservoir_and_position():
+    body = build_report("fake1", 5, [7], float_ok=1, pos="ok")
+    assert body == "c=fake1 t=5 ch0=7 float=1 pos=ok\n"
+
+
 def test_it_understands_a_water_command():
     next_s, cmd = parse_response("next=60\ncmd=17 water=3 ml=50 cap_s=30\n")
     assert next_s == 60

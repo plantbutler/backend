@@ -50,6 +50,18 @@ curl -s -X POST http://localhost:8000/pot \
 curl -s http://localhost:8000/pots     # the garden, with latest raw and derived %
 ```
 
+Once a pot is calibrated, has a target range and a dose, and is flipped to `mode=learning`
+or `mode=auto` (a human act, per pot), the rules water it — but only when the board's own
+report says the reservoir floats and the manifold knows where it is. Learning mode proposes
+instead of watering:
+
+```bash
+curl -s http://localhost:8000/pots                # the proposal shows up here
+curl -s -X POST http://localhost:8000/approve -H 'X-Token: dev' --data-binary 'cmd=17'
+curl -s -X POST http://localhost:8000/verdict -H 'X-Token: dev' \
+  --data-binary 'cmd=17 verdict=ok'               # or too_much / too_little
+```
+
 Or skip curl and let a fake board do the whole dance — report, receive, water, ack:
 
 ```bash

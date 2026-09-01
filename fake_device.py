@@ -24,10 +24,16 @@ import urllib.request
 FULL_SCALE = 16383  # 14-bit, like the real ADC
 
 
-def build_report(controller, t_ms, values, ack=None, flow_ml=None):
+def build_report(
+    controller, t_ms, values, ack=None, flow_ml=None, float_ok=None, pos=None
+):
     """One report body, exactly as the board would write it."""
     tokens = [f"c={controller}", f"t={t_ms}"]
     tokens += [f"ch{i}={v}" for i, v in enumerate(values)]
+    if float_ok is not None:
+        tokens.append(f"float={float_ok}")
+    if pos is not None:
+        tokens.append(f"pos={pos}")
     if ack is not None:
         tokens += [f"ack={ack}", f"flow_ml={flow_ml}"]
     return " ".join(tokens) + "\n"
@@ -62,6 +68,20 @@ def main():
     ap.add_argument("--controller", default="fake1")
     ap.add_argument("--channels", type=int, default=5)
     ap.add_argument("--cycles", type=int, default=0, help="0 = run forever")
+    ap.add_argument(
+        "--float",
+        type=int,
+        choices=[0, 1],
+        default=1,
+        dest="float_ok",
+        help="reservoir float switch (0 simulates an empty tank)",
+    )
+    ap.add_argument(
+        "--pos",
+        choices=["ok", "unknown"],
+        default="ok",
+        help="manifold position status",
+    )
     args = ap.parse_args()
     if not args.token:
         ap.error("--token or BUTLER_TOKEN is required")
@@ -82,7 +102,9 @@ def main():
             t_ms = int((time.monotonic() - start) * 1000)
             ack, flow_ml = pending if pending else (None, None)
             pending = None
-            body = build_report(args.controller, t_ms, values, ack, flow_ml)
+            body = build_report(
+                args.controller, t_ms, values, ack, flow_ml, args.float_ok, args.pos
+            )
             attempts = 0
         attempts += 1
         try:
