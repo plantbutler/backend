@@ -47,15 +47,20 @@ records how the dose worked out. The flip to auto is a human act, per pot.
 
 Alerting is a ticker, the one periodic thing here: a quiet controller
 cannot be noticed on report arrival. Every ALERT_TICK_S it evaluates the
-alert rules from database state alone — controller silent, reservoir empty,
-manifold position lost, a dose that was never acked or came up short on the
-meter or did not raise moisture, a learning proposal waiting — posts the
-transitions to a public ntfy.sh topic (BUTLER_NTFY_TOPIC; the topic name is
-the secret), and then, only after a fully clean pass, GETs
-BUTLER_DEADMAN_URL so an external monitor notices when the butler itself
-dies — or cannot reach ntfy. Raising and clearing are debounced (PERSIST_S
-both ways, one re-raise per REALERT_FLOOR_S per condition) because a phone
-that gets muted is worse than an alert that arrives three minutes late.
+alert rules from database state alone — controller silent, a mapped
+sensor's channel gone missing, reservoir empty, manifold position lost, a
+safety field that vanished after the board had been sending it, a dose
+that was never acked or came up short on the meter or did not raise
+moisture, a learning proposal waiting — posts the transitions to a public
+ntfy.sh topic (BUTLER_NTFY_TOPIC; the topic name is the secret), and only
+after a fully clean pass GETs BUTLER_DEADMAN_URL. A pass with nothing to
+send must first prove ntfy reachable, so the butler dying and the butler
+losing ntfy both stop the pings. Raising is debounced (two bad sightings
+inside FLAP_WINDOW_S for the board's own fields, thresholds for silence)
+under one re-raise per REALERT_FLOOR_S per condition, dose failures are
+floored per controller, and the observation window survives short restarts
+via a bookkeeping row — because a phone that gets muted is worse than an
+alert that arrives three minutes late.
 """
 
 import asyncio
@@ -99,6 +104,9 @@ DOSE_LOOKBACK_S = 86400  # doses older than a day are history, not news
 PROPOSAL_NUDGE_S = 86400  # one proposal nudge per hose per day
 UP_AFTER_S = 600  # the one "butler is up" probe, once uptime clears this
 NTFY_TIMEOUT_S = 10
+FLAP_WINDOW_S = 600  # two bad float/pos sightings this close together raise
+RESUME_GRACE_S = 600  # a restart shorter than this keeps the observation window
+UP_PROBE_FLOOR_S = 86400  # the up-probe fires at most daily, across restarts
 
 
 class Report(NamedTuple):
@@ -139,6 +147,17 @@ def hhmm(ts: int) -> str:
     return time.strftime("%H:%M", time.localtime(ts))
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    # urllib follows a 301/302 by replaying the POST as a bodyless GET; on a
+    # to-HTTPS-redirecting proxy that "succeeds" while the message is
+    # dropped. A redirect here is a misconfiguration: fail it loudly.
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def post_ntfy(base_url: str, topic: str, alert: Alert) -> bool:
     """One message to ntfy, True only on a 2xx. Never raises — alerting must
     never take the service down — and a False is retried on a later tick."""
@@ -154,7 +173,7 @@ def post_ntfy(base_url: str, topic: str, alert: Alert) -> bool:
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=NTFY_TIMEOUT_S) as answer:
+        with _OPENER.open(request, timeout=NTFY_TIMEOUT_S) as answer:
             return 200 <= answer.status < 300
     except (OSError, http.client.HTTPException, ValueError):
         return False
@@ -163,7 +182,7 @@ def post_ntfy(base_url: str, topic: str, alert: Alert) -> bool:
 def ping_deadman(url: str) -> bool:
     """GET the dead-man URL; True on a 2xx. The same never-raise contract."""
     try:
-        with urllib.request.urlopen(url, timeout=NTFY_TIMEOUT_S) as answer:
+        with _OPENER.open(url, timeout=NTFY_TIMEOUT_S) as answer:
             return 200 <= answer.status < 300
     except (OSError, http.client.HTTPException, ValueError):
         return False
@@ -477,6 +496,7 @@ def create_app(
     tick_s: float | None = None,
     send: Callable[[Alert], bool] | None = None,
     ping: Callable[[], bool] | None = None,
+    probe: Callable[[], bool] | None = None,
 ) -> FastAPI:
     """Everything configurable comes from the environment, overridable for tests.
 
@@ -548,10 +568,19 @@ def create_app(
             "BUTLER_DEADMAN_URL is set but BUTLER_NTFY_TOPIC is not: the "
             "dead-man would report a healthy butler whose alerting is off"
         )
+    check = probe
     if send is None and topic:
 
         def send(alert: Alert) -> bool:
             return post_ntfy(base_url, topic, alert)
+
+        if check is None:
+
+            def check() -> bool:
+                # Reachability for quiet passes: a healthy garden sends no
+                # messages, so without this an ntfy outage would never stop
+                # the dead-man.
+                return ping_deadman(f"{base_url.rstrip('/')}/v1/health")
 
     if ping is None and deadman:
 
@@ -695,20 +724,47 @@ def create_app(
                 "ON CONFLICT(controller) DO UPDATE SET last_seen = excluded.last_seen",
                 (r.controller, now),
             )
-            # The latest safety fields, with a `since` per value: the alert
-            # rules need to know how long a state has held, or a float
-            # bouncing at the waterline would page the phone once a report.
+            # The latest safety fields, with enough history for the alert
+            # rules: when each value last changed (`since`), when each was
+            # last sent at all (`seen` — its vanishing is an alarm), and the
+            # last two bad sightings (`bad`, `bad_prev` — a float flapping
+            # at the waterline must still page). All SET expressions read
+            # the pre-update row, so the ordering below is safe.
             con.execute(
-                "INSERT INTO status "
-                "(controller, ts, float_ok, float_since, pos, pos_since) "
-                "VALUES (?, ?, ?, ?, ?, ?) "
+                "INSERT INTO status (controller, ts, float_ok, float_since, "
+                "pos, pos_since, float_seen, pos_seen, float_bad, "
+                "float_bad_prev, pos_bad, pos_bad_prev) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL) "
                 "ON CONFLICT(controller) DO UPDATE SET ts = excluded.ts, "
                 "float_ok = excluded.float_ok, pos = excluded.pos, "
                 "float_since = CASE WHEN status.float_ok IS excluded.float_ok "
                 "THEN status.float_since ELSE excluded.ts END, "
                 "pos_since = CASE WHEN status.pos IS excluded.pos "
-                "THEN status.pos_since ELSE excluded.ts END",
-                (r.controller, now, r.float_ok, now, r.pos, now),
+                "THEN status.pos_since ELSE excluded.ts END, "
+                "float_seen = CASE WHEN excluded.float_ok IS NOT NULL "
+                "THEN excluded.ts ELSE status.float_seen END, "
+                "pos_seen = CASE WHEN excluded.pos IS NOT NULL "
+                "THEN excluded.ts ELSE status.pos_seen END, "
+                "float_bad_prev = CASE WHEN excluded.float_ok = 0 "
+                "THEN status.float_bad ELSE status.float_bad_prev END, "
+                "float_bad = CASE WHEN excluded.float_ok = 0 "
+                "THEN excluded.ts ELSE status.float_bad END, "
+                "pos_bad_prev = CASE WHEN excluded.pos = 'unknown' "
+                "THEN status.pos_bad ELSE status.pos_bad_prev END, "
+                "pos_bad = CASE WHEN excluded.pos = 'unknown' "
+                "THEN excluded.ts ELSE status.pos_bad END",
+                (
+                    r.controller,
+                    now,
+                    r.float_ok,
+                    now,
+                    r.pos,
+                    now,
+                    now if r.float_ok is not None else None,
+                    now if r.pos is not None else None,
+                    now if r.float_ok == 0 else None,
+                    now if r.pos == "unknown" else None,
+                ),
             )
             if r.ack is not None:
                 con.execute(
@@ -931,6 +987,17 @@ def create_app(
     started = int(time.time())
     observed = {"since": started, "last_tick": None}
     up_sent = False
+    with connect() as con:
+        prior = con.execute(
+            "SELECT raised_ts, detail FROM alerts WHERE key = 'meta:tick'"
+        ).fetchone()
+    if prior is not None and started - prior[0] <= RESUME_GRACE_S:
+        # A short restart (a redeploy, a crash loop) must not blind the
+        # silent and sensor rules for another threshold on every
+        # incarnation: inherit the observation window the previous process
+        # earned.
+        with contextlib.suppress(TypeError, ValueError):
+            observed["since"] = min(started, int(prior[1]))
 
     def median_window_pct(
         con: sqlite3.Connection,
@@ -965,6 +1032,7 @@ def create_app(
         record step so the tick can apply it only once its message went out.
         """
         found: list[Alert] = []
+        paged_hoses: set[str] = set()
         standing = {
             key: (raised_ts, cleared_ts)
             for key, raised_ts, cleared_ts in con.execute(
@@ -1005,9 +1073,11 @@ def create_app(
         # the butler's own observation window too: after a redeploy or a NAS
         # reboot, last_seen is stale because the BUTLER was away — that is
         # the dead-man's news, not this rule's.
+        heartbeat: dict[str, tuple[int, int | None]] = {}
         for controller, last_seen, override in con.execute(
             "SELECT controller, last_seen, next_s FROM controllers WHERE last_seen > 0"
         ):
+            heartbeat[controller] = (last_seen, override)
             threshold = max(silent_after, 3 * (override or interval))
             key = f"silent:{controller}"
             if now - max(last_seen, since) > threshold:
@@ -1034,65 +1104,164 @@ def create_app(
                     )
                 )
 
-        # The board said so itself: reservoir empty, or the manifold no
-        # longer knows where it is. Either way the rules are refusing to
-        # water — silently, which is exactly the fail-silent this pitch
-        # exists to remove. NULL (the board does not send the field yet)
-        # neither raises nor clears.
-        for controller, float_ok, float_since, pos, pos_since in con.execute(
-            "SELECT controller, float_ok, float_since, pos, pos_since FROM status"
+        # A sensor whose channel stopped arriving while its controller stays
+        # healthy: water_rules errs dry and skips the pot forever, which
+        # without this rule is a plant quietly dying behind a green
+        # dead-man. Same threshold and observation window as the silent
+        # rule; a controller that is itself silent already pages there.
+        for name, controller, channel in con.execute(
+            "SELECT name, controller, channel FROM pots WHERE enabled = 1 "
+            "AND controller IS NOT NULL AND channel IS NOT NULL ORDER BY name"
         ):
-            key = f"float:{controller}"
-            if float_ok == 0 and now - float_since >= PERSIST_S:
+            pulse = heartbeat.get(controller)
+            if pulse is None:
+                continue  # never-heard controller: nothing to compare against
+            last_seen, override = pulse
+            threshold = max(silent_after, 3 * (override or interval))
+            if now - last_seen > threshold:
+                continue  # the whole controller is silent: that rule pages
+            (latest,) = con.execute(
+                "SELECT MAX(ts) FROM readings WHERE controller = ? AND channel = ?",
+                (controller, channel),
+            ).fetchone()
+            key = f"sensor:{controller}:{channel}"
+            if now - max(latest or 0, since) > threshold:
                 if not raised(key) and floor_ok(key):
                     found.append(
                         Alert(
                             key,
                             "high",
                             "warning",
-                            f"the reservoir on {controller} is empty: "
-                            "watering is on hold",
+                            f"the sensor for {name} ({controller} ch{channel}) "
+                            "stopped reporting: the rules cannot water it",
                             mark(key),
                         )
                     )
-            elif float_ok == 1 and now - float_since >= PERSIST_S and raised(key):
+            elif latest is not None and now - latest <= threshold and raised(key):
                 found.append(
                     Alert(
                         key,
                         "default",
                         "white_check_mark",
-                        f"the reservoir on {controller} is full again",
-                        clear(key),
-                    )
-                )
-            key = f"pos:{controller}"
-            if pos == "unknown" and now - pos_since >= PERSIST_S:
-                if not raised(key) and floor_ok(key):
-                    found.append(
-                        Alert(
-                            key,
-                            "high",
-                            "warning",
-                            f"{controller} lost track of its manifold "
-                            "position: watering is on hold",
-                            mark(key),
-                        )
-                    )
-            elif pos == "ok" and now - pos_since >= PERSIST_S and raised(key):
-                found.append(
-                    Alert(
-                        key,
-                        "default",
-                        "white_check_mark",
-                        f"{controller} knows its manifold position again",
+                        f"the sensor for {name} is back",
                         clear(key),
                     )
                 )
 
-        # Every dose the board was handed gets judged exactly once, a soak
-        # after it (should have) run: never acked, short on the meter, or no
-        # moisture rise. A dose that worked is recorded silently — this is
-        # "tell me when it's wrong", not a watering feed.
+        # The board said so itself: reservoir empty, or the manifold no
+        # longer knows where it is — both mean the rules refuse to water,
+        # silently. Two bad sightings inside FLAP_WINDOW_S raise (a single
+        # blip at the waterline is slosh; a flap or a steady bad is an
+        # empty tank — a sub-persistence debounce would sleep through the
+        # flap); the clear needs the value good with no bad sighting for a
+        # full window. NULL never counts as bad, but a field VANISHING
+        # after the board had been sending it is its own alarm: absence
+        # disables all watering with every tick looking clean.
+        for (
+            controller,
+            _ts,
+            float_ok,
+            float_since,
+            pos,
+            pos_since,
+            float_seen,
+            pos_seen,
+            float_bad,
+            float_bad_prev,
+            pos_bad,
+            pos_bad_prev,
+        ) in con.execute(
+            "SELECT controller, ts, float_ok, float_since, pos, pos_since, "
+            "float_seen, pos_seen, float_bad, float_bad_prev, pos_bad, "
+            "pos_bad_prev FROM status"
+        ):
+            pos_value = {"ok": 1, "unknown": 0}.get(pos)
+            for kind, value, value_since, seen, bad, bad_prev, trouble, relief in (
+                (
+                    "float",
+                    float_ok,
+                    float_since,
+                    float_seen,
+                    float_bad,
+                    float_bad_prev,
+                    (
+                        f"the reservoir on {controller} is empty or at the "
+                        "waterline: watering is on hold"
+                    ),
+                    f"the reservoir on {controller} is full again",
+                ),
+                (
+                    "pos",
+                    pos_value,
+                    pos_since,
+                    pos_seen,
+                    pos_bad,
+                    pos_bad_prev,
+                    (
+                        f"{controller} lost track of its manifold position: "
+                        "watering is on hold"
+                    ),
+                    f"{controller} knows its manifold position again",
+                ),
+            ):
+                key = f"{kind}:{controller}"
+                flapped = (
+                    bad is not None
+                    and bad_prev is not None
+                    and now - bad <= FLAP_WINDOW_S
+                    and now - bad_prev <= FLAP_WINDOW_S
+                )
+                if flapped:
+                    if not raised(key) and floor_ok(key):
+                        found.append(Alert(key, "high", "warning", trouble, mark(key)))
+                elif (
+                    value == 1
+                    and (bad is None or now - bad > FLAP_WINDOW_S)
+                    and raised(key)
+                ):
+                    found.append(
+                        Alert(key, "default", "white_check_mark", relief, clear(key))
+                    )
+                vkey = f"fields:{kind}:{controller}"
+                if (
+                    value is None
+                    and seen is not None
+                    and now - value_since >= PERSIST_S
+                ):
+                    if not raised(vkey) and floor_ok(vkey):
+                        found.append(
+                            Alert(
+                                vkey,
+                                "high",
+                                "warning",
+                                f"{controller} stopped sending {kind}=: "
+                                "watering is on hold",
+                                mark(vkey),
+                            )
+                        )
+                elif (
+                    value is not None
+                    and now - value_since >= PERSIST_S
+                    and raised(vkey)
+                ):
+                    found.append(
+                        Alert(
+                            vkey,
+                            "default",
+                            "white_check_mark",
+                            f"{controller} sends {kind}= again",
+                            clear(vkey),
+                        )
+                    )
+
+        # Every dose the board was handed gets judged exactly once: never
+        # acked (judged immediately — the loss is proven the moment the next
+        # report failed to ack), short on the meter, or no moisture rise
+        # (both a soak later). A dose that worked is recorded silently —
+        # this is "tell me when it's wrong", not a watering feed. The 24 h
+        # lookback bounds the first-deploy burst; its cost is that a
+        # judgement ntfy could not take for a full day is dropped, and by
+        # then the dead-man has been quiet for most of it.
         for (
             cmd_id,
             controller,
@@ -1119,8 +1288,8 @@ def create_app(
             # hold no readings at all and every dose would judge on nothing.
             soak = max(SOAK_S, 3 * ((row and row[0]) or interval))
             judge_at = (acked_ts or sent_ts) + soak
-            if now < judge_at:
-                continue  # still soaking in
+            if acked_ts is not None and now < judge_at:
+                continue  # still soaking in; an expiry needs no wait
             key = f"dose:{cmd_id}"
             pot = con.execute(
                 "SELECT name, channel, dry_raw, wet_raw FROM pots "
@@ -1130,12 +1299,16 @@ def create_app(
             name = pot[0] if pot else f"outlet {outlet}"
             symptoms: list[str] = []
             priority = "default"
+            evidence = False  # did anything actually vouch for this dose?
             if acked_ts is None:  # handed out, expired unacknowledged
                 symptoms.append("it was handed to the board and never acknowledged")
                 priority = "high"
-            elif flow_ml is not None and ml is not None and 2 * flow_ml < ml:
-                symptoms.append(f"the meter counted {flow_ml} of {ml} ml")
-                priority = "high"
+                evidence = True
+            elif flow_ml is not None and ml is not None:
+                evidence = True
+                if 2 * flow_ml < ml:
+                    symptoms.append(f"the meter counted {flow_ml} of {ml} ml")
+                    priority = "high"
             if (
                 pot is not None
                 and acked_ts is not None
@@ -1160,26 +1333,55 @@ def create_app(
                 # hose-priming test dose would page the phone. The rise-only
                 # symptom stays at default priority until the bench rig says
                 # what a dose actually does to a sensor.
-                if (
-                    before is not None
-                    and after is not None
-                    and before < 100 - MIN_RISE_PCT
-                    and after - before < MIN_RISE_PCT
-                ):
-                    symptoms.append(f"moisture went {before}% to {after}%")
+                if before is not None and after is not None:
+                    evidence = True
+                    if before < 100 - MIN_RISE_PCT and after - before < MIN_RISE_PCT:
+                        symptoms.append(f"moisture went {before}% to {after}%")
             if symptoms:
+                # Failures correlate: a dead pump takes every pot down at
+                # once, and one high page per dose per pot is the muted
+                # topic the docstring warns about. One page per controller
+                # per floor; the rest are judged and recorded silently.
+                hose = f"dosefail:{controller}"
+                floored = standing.get(hose)
+                if hose in paged_hoses or (
+                    floored is not None and now - floored[0] < REALERT_FLOOR_S
+                ):
+                    found.append(
+                        Alert(key, "min", "droplet", None, mark(key, "failed"))
+                    )
+                else:
+                    paged_hoses.add(hose)
+
+                    def record_failure(
+                        con: sqlite3.Connection, _key=key, _hose=hose
+                    ) -> None:
+                        mark(_key, "failed")(con)
+                        mark(_hose)(con)
+
+                    found.append(
+                        Alert(
+                            key,
+                            priority,
+                            "warning,droplet",
+                            f"the {ml} ml dose on {name} did not work: "
+                            + "; ".join(symptoms),
+                            record_failure,
+                        )
+                    )
+            else:
+                # No symptom, but 'ok' only when something vouched for it: a
+                # dose with no meter number and no usable readings is
+                # 'unverified', not quietly fine.
                 found.append(
                     Alert(
                         key,
-                        priority,
-                        "warning,droplet",
-                        f"the {ml} ml dose on {name} did not work: "
-                        + "; ".join(symptoms),
-                        mark(key, "failed"),
+                        "min",
+                        "droplet",
+                        None,
+                        mark(key, "ok" if evidence else "unverified"),
                     )
                 )
-            else:
-                found.append(Alert(key, "min", "droplet", None, mark(key, "ok")))
 
         # A learning proposal nobody is polling /pots for. Keyed on the
         # hose, not the command: proposals expire and respawn with fresh ids
@@ -1243,36 +1445,72 @@ def create_app(
             observed["since"] = now  # the butler was away, not the boards
         observed["last_tick"] = now
         with connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            # The observation window survives short restarts through this
+            # row (read back in create_app): a crash-looping butler must not
+            # blind the silent and sensor rules on every incarnation.
+            con.execute(
+                "INSERT OR REPLACE INTO alerts "
+                "(key, raised_ts, cleared_ts, detail) "
+                "VALUES ('meta:tick', ?, NULL, ?)",
+                (now, str(observed["since"])),
+            )
+        with connect() as con:
             pending = evaluate(con, now, observed["since"])
         ok = True
+        attempted = False
         for alert in pending:
-            if alert.message is not None and not send(alert):
-                ok = False
-                break
+            if alert.message is not None:
+                attempted = True
+                if not send(alert):
+                    ok = False
+                    break
             with connect() as con:
                 con.execute("BEGIN IMMEDIATE")
                 alert.record(con)
         if ok and not up_sent and now - started >= UP_AFTER_S:
-            # One end-to-end probe of the topic per process, uptime-gated so
-            # a crash-looping container never sends it. Without this, a
-            # typo'd topic is a permanent, undetectable alert blackout: ntfy
-            # answers 200 on any topic, and a healthy garden is also silent.
+            # One end-to-end probe of the topic: uptime-gated so a fast
+            # crash loop never sends it, floored at one a day across
+            # restarts so a slow loop cannot spam either. Without it, a
+            # typo'd topic is a permanent, undetectable alert blackout:
+            # ntfy answers 200 on any topic, and a healthy garden is also
+            # silent.
             with connect() as con:
                 (raised_count,) = con.execute(
                     "SELECT COUNT(*) FROM alerts WHERE cleared_ts IS NULL "
-                    "AND (key LIKE 'silent:%' OR key LIKE 'float:%' "
-                    "OR key LIKE 'pos:%')"
+                    "AND key NOT LIKE 'dose:%' AND key NOT LIKE 'dosefail:%' "
+                    "AND key NOT LIKE 'proposal:%' AND key NOT LIKE 'meta:%'"
                 ).fetchone()
-            probe = Alert(
-                None,
-                "min",
-                "robot",
-                f"the butler is up; {raised_count} condition(s) raised",
-            )
-            if send(probe):
-                up_sent = True
+                last_probe = con.execute(
+                    "SELECT raised_ts FROM alerts WHERE key = 'meta:up'"
+                ).fetchone()
+            if last_probe is not None and now - last_probe[0] < UP_PROBE_FLOOR_S:
+                up_sent = True  # probed recently enough, across restarts
             else:
-                ok = False
+                probe_alert = Alert(
+                    None,
+                    "min",
+                    "robot",
+                    f"the butler is up; {raised_count} condition(s) raised",
+                )
+                attempted = True
+                if send(probe_alert):
+                    up_sent = True
+                    with connect() as con:
+                        con.execute("BEGIN IMMEDIATE")
+                        con.execute(
+                            "INSERT OR REPLACE INTO alerts "
+                            "(key, raised_ts, cleared_ts, detail) "
+                            "VALUES ('meta:up', ?, NULL, NULL)",
+                            (now,),
+                        )
+                else:
+                    ok = False
+        if ok and not attempted and check is not None and not check():
+            # A pass that sent nothing proved nothing: a healthy garden is
+            # quiet, and the dead-man must still stop when ntfy has been
+            # unreachable for days.
+            ok = False
         if ok and ping is not None:
             ok = ping()
         return ok
@@ -1292,6 +1530,11 @@ def create_app(
         task = asyncio.create_task(ticker()) if alerts_on else None
         yield
         if task is not None:
+            # The cancel lands between ticks; a tick already running in the
+            # threadpool finishes on its own, worst case ~one network
+            # timeout. If docker's stop grace expires first, SIGKILL may
+            # repeat one sent-but-unrecorded message on the next start:
+            # at-least-once, loud beats lost.
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
@@ -1532,9 +1775,10 @@ def create_app(
                     {"key": key, "raised_ts": ts}
                     for key, ts in con.execute(
                         "SELECT key, raised_ts FROM alerts "
-                        "WHERE cleared_ts IS NULL AND (key LIKE 'silent:%' "
-                        "OR key LIKE 'float:%' OR key LIKE 'pos:%') "
-                        "ORDER BY key"
+                        "WHERE cleared_ts IS NULL AND key NOT LIKE 'dose:%' "
+                        "AND key NOT LIKE 'dosefail:%' "
+                        "AND key NOT LIKE 'proposal:%' "
+                        "AND key NOT LIKE 'meta:%' ORDER BY key"
                     )
                 ]
                 for cmd_id, controller, kind, state in con.execute(

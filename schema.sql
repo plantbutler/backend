@@ -104,18 +104,28 @@ CREATE INDEX IF NOT EXISTS commands_by_outlet
 -- ntfy keeps no archive and neither does this (a no-go in the pitch).
 
 CREATE TABLE IF NOT EXISTS status (
-  controller  TEXT PRIMARY KEY,
-  ts          INTEGER NOT NULL,  -- when the latest report landed
-  float_ok    INTEGER,           -- float= in that report, NULL if not sent
-  float_since INTEGER,           -- when float_ok last changed value
-  pos         TEXT,              -- pos= in that report, NULL if not sent
-  pos_since   INTEGER            -- when pos last changed value
+  controller     TEXT PRIMARY KEY,
+  ts             INTEGER NOT NULL,  -- when the latest report landed
+  float_ok       INTEGER,           -- float= in that report, NULL if not sent
+  float_since    INTEGER,           -- when float_ok last changed value
+  pos            TEXT,              -- pos= in that report, NULL if not sent
+  pos_since      INTEGER,           -- when pos last changed value
+  float_seen     INTEGER,           -- last time float= arrived at all: its
+                                    -- vanishing afterwards is its own alarm
+  pos_seen       INTEGER,
+  float_bad      INTEGER,           -- the last two float=0 sightings: two
+  float_bad_prev INTEGER,           -- inside FLAP_WINDOW_S raise, so a float
+                                    -- flapping at the waterline still pages
+  pos_bad        INTEGER,           -- same, for pos=unknown
+  pos_bad_prev   INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS alerts (
-  key        TEXT PRIMARY KEY,  -- silent:<c> | float:<c> | pos:<c> |
-                                -- dose:<id> | proposal:<c>:<outlet>
+  key        TEXT PRIMARY KEY,  -- silent:<c> | sensor:<c>:<ch> | float:<c> |
+                                -- pos:<c> | fields:<kind>:<c> | dose:<id> |
+                                -- dosefail:<c> | proposal:<c>:<outlet>, plus
+                                -- meta:tick / meta:up bookkeeping rows
   raised_ts  INTEGER NOT NULL,
   cleared_ts INTEGER,           -- NULL while the condition stands
-  detail     TEXT               -- dose judgements: 'ok' | 'failed'
+  detail     TEXT               -- dose judgements: 'ok'|'failed'|'unverified'
 );
