@@ -20,7 +20,7 @@ The backend decides when to water (thresholds, smoothing, per-pot cooldown, dail
 hours) and never enqueues on a stale heartbeat or an empty reservoir. NAS or WiFi down means no
 watering.
 
-## What is here (2026-08-31)
+## What is here (2026-09-01)
 
 - `butler.py` — the whole service: `create_app` factory (env: `BUTLER_TOKEN` required,
   `BUTLER_DB`, `BUTLER_NEXT_S`, `BUTLER_CMD_TTL_S`), `POST /report` (k=v body, `X-Token`
@@ -38,8 +38,8 @@ watering.
 - `fake_device.py` — stdlib board simulator: reports on the `next=` beat, executes the one
   command a response carries, acks it on the following report. `python fake_device.py --token
   dev --cycles 3` against a local uvicorn or the NAS.
-- Pitch 1 is deployed (2026-08-31): container `plantbutler` on the NAS, port 9380, image
-  `plantbutler-backend:0.1.0` shipped via `docker save | ssh docker load`, database on
+- Pitches 1 and 2 are deployed (2026-09-01): container `plantbutler` on the NAS, port 9380,
+  image `plantbutler-backend:0.2.0` shipped via `docker save | ssh docker load`, database on
   `/volume1/docker/plantbutler/data`, token in `deploy.env` beside it (600, not in git).
 
 ## Pitches, in order (titles in the plan)
