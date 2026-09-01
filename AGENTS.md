@@ -23,7 +23,8 @@ watering.
 ## What is here (2026-09-01)
 
 - `butler.py` — the whole service: `create_app` factory (env: `BUTLER_TOKEN` required,
-  `BUTLER_DB`, `BUTLER_NEXT_S`, `BUTLER_CMD_TTL_S`), `POST /report` (k=v body, `X-Token`
+  `BUTLER_DB`, `BUTLER_NEXT_S`, `BUTLER_CMD_TTL_S`, `BUTLER_QUIET`,
+  `BUTLER_NTFY_TOPIC`, `BUTLER_NTFY_URL`, `BUTLER_DEADMAN_URL`, `BUTLER_SILENT_S`), `POST /report` (k=v body, `X-Token`
   header, refuses whole on malformed channels, ignores unknown keys, stamps arrival time,
   answers `next=` plus at most one `cmd=` line), `POST /command` (queue `water=<outlet>
   ml= cap_s=` or `stop=1`, one slot per controller, 409 when busy), `POST /interval`
@@ -39,6 +40,18 @@ watering.
   no open command on the hose, cooldown passed (default 6 h, 0 disables), daily cap unspent
   (default 3 doses). Auto queues directly; learning proposes. The board does not send float=
   or pos= yet, so the rules ship dark and `fake_device.py --float/--pos` exercises them.
+- The alert ticker — the one periodic thing here: every minute it evaluates alert rules from
+  database state (controller silent, a mapped sensor's channel gone missing, `float=0` /
+  `pos=unknown` seen twice in ten minutes, a safety field that vanished after being seen, a
+  dose never acked / short on the meter / no moisture rise a soak later, a learning proposal
+  waiting) and posts the transitions to `BUTLER_NTFY_TOPIC` (unset = alerts off; the topic name
+  is the secret and lives in deploy.env). Cleared conditions re-raise at most hourly and dose
+  failures page once per controller per hour. `BUTLER_DEADMAN_URL` is GET only after a fully
+  clean pass — a quiet pass first proves ntfy reachable — so the butler dying and the butler
+  losing ntfy both stop the pings; the observation window survives short restarts via a
+  `meta:tick` row. `status` and `alerts` tables carry the state; `/health` shows `float`/`pos`
+  per controller and what stands raised; one "butler is up" probe, at most daily, 10 min after
+  a start.
 - The command slot: queued → handed exactly once in a report response (sent) → acked by the
   next report's `ack=<id> flow_ml=`; a no-ack report or the TTL expires it. Expired is gone —
   ask again. The commands table is never pruned: it doubles as the watering history.
