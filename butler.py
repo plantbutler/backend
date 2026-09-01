@@ -209,6 +209,89 @@ def parse_interval(text: str) -> tuple[str, int]:
     return controller, next_s
 
 
+POT_INT_FIELDS = {  # half-open bounds, like every other field
+    "channel": (0, MAX_CHANNEL + 1),
+    "outlet": (0, MAX_CHANNEL + 1),
+    "dry_raw": (0, MAX_RAW),
+    "wet_raw": (0, MAX_RAW),
+    "target_low_pct": (0, 101),
+    "target_high_pct": (0, 101),
+    "dose_ml": (1, MAX_DOSE_ML + 1),
+    "cooldown_h": (0, 8761),  # a year of cooldown is already a config error
+    "daily_cap_ml": (0, 100_001),
+    "enabled": (0, 2),
+}
+POT_TEXT_FIELDS = ("controller", "plant_type", "plant_size", "pot_size", "soil")
+POT_MODES = ("manual", "learning", "auto")
+POT_COLUMNS = (
+    "id",
+    "name",
+    "controller",
+    "channel",
+    "outlet",
+    "plant_type",
+    "plant_size",
+    "pot_size",
+    "soil",
+    "dry_raw",
+    "wet_raw",
+    "target_low_pct",
+    "target_high_pct",
+    "dose_ml",
+    "mode",
+    "cooldown_h",
+    "daily_cap_ml",
+    "enabled",
+)
+
+
+def parse_pot(text: str) -> dict:
+    """The `POST /pot` body: `name=<pot>` plus whatever fields to set.
+
+    A partial upsert — only the keys given change, so recalibration is
+    `name=basil dry_raw=13000 wet_raw=4200` and nothing else moves. Values
+    are single k=v tokens, so multi-word text uses underscores. Unknown
+    keys are ignored, for the same reason as everywhere else.
+    """
+    fields: dict = {}
+    known = {"name", "mode", *POT_TEXT_FIELDS, *POT_INT_FIELDS}
+    for token in text.split():
+        key, sep, value = token.partition("=")
+        if not sep or not key:
+            raise ValueError(f"not a k=v token: {token!r}")
+        if key not in known:
+            continue
+        if key in fields:
+            raise ValueError(f"{key}= given twice")
+        if not value:
+            raise ValueError(f"{key}= is empty")
+        if key in POT_INT_FIELDS:
+            low, high = POT_INT_FIELDS[key]
+            fields[key] = _int_in(value, key, low, high)
+        elif key == "mode":
+            if value not in POT_MODES:
+                raise ValueError(f"mode= must be one of {'|'.join(POT_MODES)}")
+            fields[key] = value
+        else:
+            fields[key] = value
+    if "name" not in fields:
+        raise ValueError("no name= in the request")
+    return fields
+
+
+def moisture_pct(raw: int, dry_raw: int | None, wet_raw: int | None) -> int | None:
+    """Linear between the two calibration points, clamped to 0..100.
+
+    None while uncalibrated. Works whichever way the sensor counts (dry
+    high or dry low) because both endpoints are stored. Derived at read
+    time and never stored: recalibrating reinterprets history.
+    """
+    if dry_raw is None or wet_raw is None or dry_raw == wet_raw:
+        return None
+    pct = (dry_raw - raw) * 100 / (dry_raw - wet_raw)
+    return max(0, min(100, round(pct)))
+
+
 def create_app(
     db_path: str | None = None,
     token: str | None = None,
@@ -374,6 +457,67 @@ def create_app(
             )
         return value or interval
 
+    def upsert_pot(fields: dict) -> None:
+        """Create or partially update one pot, refusing inconsistent merges.
+
+        Validation runs on the MERGED row (stored values plus this
+        request), so `dry_raw=5000` today and `wet_raw=5000` tomorrow is
+        refused just like both in one request. Column names come from the
+        parse_pot whitelist, never from the wire, so building SQL from
+        them is safe.
+        """
+        name = fields["name"]
+        sets = {k: v for k, v in fields.items() if k != "name"}
+        with connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                f"SELECT {', '.join(POT_COLUMNS)} FROM pots WHERE name = ?",
+                (name,),
+            ).fetchone()
+            current = (
+                dict(zip(POT_COLUMNS, row))
+                if row
+                else dict.fromkeys(POT_COLUMNS) | {"mode": "manual", "enabled": 1}
+            )
+            merged = current | sets
+            if merged["dry_raw"] is not None and merged["dry_raw"] == merged["wet_raw"]:
+                raise ValueError("dry_raw and wet_raw must differ")
+            if (
+                merged["target_low_pct"] is not None
+                and merged["target_high_pct"] is not None
+                and merged["target_low_pct"] >= merged["target_high_pct"]
+            ):
+                raise ValueError("target_low_pct must be below target_high_pct")
+            if merged["enabled"] and merged["controller"] is not None:
+                # Two enabled pots on one sensor or one hose is a config
+                # error that would misread or miswater — refuse loudly.
+                for col in ("channel", "outlet"):
+                    if merged[col] is None:
+                        continue
+                    other = con.execute(
+                        f"SELECT name FROM pots WHERE controller = ? AND {col} = ? "
+                        "AND enabled = 1 AND name != ? LIMIT 1",
+                        (merged["controller"], merged[col], name),
+                    ).fetchone()
+                    if other:
+                        raise ValueError(
+                            f"{col} {merged[col]} on {merged['controller']} "
+                            f"is taken by pot {other[0]}"
+                        )
+            if row and sets:
+                con.execute(
+                    f"UPDATE pots SET {', '.join(k + ' = ?' for k in sets)} "
+                    "WHERE name = ?",
+                    [*sets.values(), name],
+                )
+            elif not row:
+                keys = list(fields)
+                con.execute(
+                    f"INSERT INTO pots ({', '.join(keys)}) "
+                    f"VALUES ({', '.join('?' * len(keys))})",
+                    [fields[k] for k in keys],
+                )
+
     app = FastAPI()
 
     def bad_token(request: Request) -> bool:
@@ -463,6 +607,52 @@ def create_app(
         except sqlite3.OperationalError as why:
             return PlainTextResponse(f"try again: {why}\n", status_code=503)
         return PlainTextResponse(f"next={effective}\n")
+
+    @app.post("/pot")
+    async def pot(request: Request):
+        if bad_token(request):
+            return PlainTextResponse("bad token\n", status_code=401)
+        body = await slurp(request)
+        if isinstance(body, PlainTextResponse):
+            return body
+        try:
+            parsed = parse_pot(body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=400)
+        try:
+            await run_in_threadpool(upsert_pot, parsed)
+        except ValueError as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=400)
+        except sqlite3.OperationalError as why:
+            return PlainTextResponse(f"try again: {why}\n", status_code=503)
+        return PlainTextResponse(f"pot={parsed['name']}\n")
+
+    @app.get("/pots")
+    def pots():
+        try:
+            with connect() as con:
+                garden = []
+                for row in con.execute(
+                    f"SELECT {', '.join(POT_COLUMNS)} FROM pots ORDER BY name"
+                ):
+                    entry = dict(zip(POT_COLUMNS, row))
+                    entry["raw"] = entry["read_ts"] = entry["pct"] = None
+                    if entry["controller"] is not None and entry["channel"] is not None:
+                        latest = con.execute(
+                            "SELECT raw, ts FROM readings "
+                            "WHERE controller = ? AND channel = ? "
+                            "ORDER BY ts DESC LIMIT 1",
+                            (entry["controller"], entry["channel"]),
+                        ).fetchone()
+                        if latest:
+                            entry["raw"], entry["read_ts"] = latest
+                            entry["pct"] = moisture_pct(
+                                entry["raw"], entry["dry_raw"], entry["wet_raw"]
+                            )
+                    garden.append(entry)
+        except sqlite3.OperationalError as why:
+            return PlainTextResponse(f"try again: {why}\n", status_code=503)
+        return JSONResponse({"pots": garden})
 
     @app.get("/health")
     def health():

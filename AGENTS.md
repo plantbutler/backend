@@ -27,12 +27,16 @@ watering.
   header, refuses whole on malformed channels, ignores unknown keys, stamps arrival time,
   answers `next=` plus at most one `cmd=` line), `POST /command` (queue `water=<outlet>
   ml= cap_s=` or `stop=1`, one slot per controller, 409 when busy), `POST /interval`
-  (per-controller `next=` override, 0 clears), `GET /health` (count, last ts, per-controller
-  heartbeat/knob/open command).
+  (per-controller `next=` override, 0 clears), `POST /pot` (partial upsert by name: mapping,
+  calibration, Planta-style fields, rules knobs; refuses inconsistent merges and channel/outlet
+  collisions), `GET /pots` (the garden with latest raw and derived %), `GET /health` (count,
+  last ts, per-controller heartbeat/knob/open command).
 - The command slot: queued → handed exactly once in a report response (sent) → acked by the
   next report's `ack=<id> flow_ml=`; a no-ack report or the TTL expires it. Expired is gone —
   ask again. The commands table is never pruned: it doubles as the watering history.
-- `schema.sql` — additive-only DDL: `readings`, `commands`, `controllers` + indexes.
+- `schema.sql` — additive-only DDL: `readings`, `commands`, `controllers`, `pots` + indexes.
+  Moisture % is derived at read time from each pot's (dry_raw, wet_raw), never stored:
+  recalibrating reinterprets history instead of losing it.
   `Dockerfile` — python-slim, port 9380, `/data` volume. `tests/` — the endpoints' contracts,
   `uv run pytest`.
 - `fake_device.py` — stdlib board simulator: reports on the `next=` beat, executes the one

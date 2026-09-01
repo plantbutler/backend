@@ -38,6 +38,18 @@ curl -s -X POST http://localhost:8000/interval \
   -H 'X-Token: dev' --data-binary 'c=butler1 next=120'
 ```
 
+Tell it what hangs where — a pot is a name plus whatever fields you feel like setting
+(repotting or swapping a hose is an edit; recalibrating is two numbers):
+
+```bash
+curl -s -X POST http://localhost:8000/pot \
+  -H 'X-Token: dev' \
+  --data-binary 'name=basil controller=butler1 channel=0 outlet=3 plant_type=basil pot_size=14cm'
+curl -s -X POST http://localhost:8000/pot \
+  -H 'X-Token: dev' --data-binary 'name=basil dry_raw=12000 wet_raw=4000'
+curl -s http://localhost:8000/pots     # the garden, with latest raw and derived %
+```
+
 Or skip curl and let a fake board do the whole dance — report, receive, water, ack:
 
 ```bash
