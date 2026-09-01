@@ -52,3 +52,31 @@ CREATE TABLE IF NOT EXISTS controllers (
   last_seen  INTEGER NOT NULL,  -- 0 = configured but never heard from
   next_s     INTEGER
 );
+
+-- Pots, plants and calibration (cycle 2). One row per pot: the channel ->
+-- outlet -> pot -> plant mapping, the two calibration numbers, the
+-- Planta-style descriptive fields, and the knobs the watering rules will
+-- read later. One table until that hurts. Percentages are derived at read
+-- time from (dry_raw, wet_raw) and never stored, so recalibrating
+-- reinterprets history instead of losing it.
+
+CREATE TABLE IF NOT EXISTS pots (
+  id              INTEGER PRIMARY KEY,
+  name            TEXT    NOT NULL UNIQUE,
+  controller      TEXT,     -- where its sensor reports from
+  channel         INTEGER,  -- chN in that controller's reports
+  outlet          INTEGER,  -- flat outlet index its hose hangs on
+  plant_type      TEXT,     -- descriptive, Planta-style
+  plant_size      TEXT,
+  pot_size        TEXT,
+  soil            TEXT,
+  dry_raw         INTEGER,  -- calibration: raw count bone dry
+  wet_raw         INTEGER,  -- calibration: raw count soaked
+  target_low_pct  INTEGER,  -- the ideal moisture range
+  target_high_pct INTEGER,
+  dose_ml         INTEGER,  -- for the rules pitch
+  mode            TEXT    NOT NULL DEFAULT 'manual',  -- manual|learning|auto
+  cooldown_h      INTEGER,
+  daily_cap_ml    INTEGER,
+  enabled         INTEGER NOT NULL DEFAULT 1
+);
