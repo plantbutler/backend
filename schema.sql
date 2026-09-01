@@ -80,3 +80,17 @@ CREATE TABLE IF NOT EXISTS pots (
   daily_cap_ml    INTEGER,
   enabled         INTEGER NOT NULL DEFAULT 1
 );
+
+-- Rules that water (cycle 2). Proposals live in the commands table as
+-- state 'proposed' (source 'rules'); verdicts are the learning log — one
+-- human judgement per executed dose, the dataset adaptive dosing will one
+-- day fit on. Never pruned.
+
+CREATE TABLE IF NOT EXISTS verdicts (
+  command_id INTEGER PRIMARY KEY,  -- one verdict per dose; re-verdict replaces
+  ts         INTEGER NOT NULL,
+  verdict    TEXT    NOT NULL     -- 'ok' | 'too_much' | 'too_little'
+);
+
+CREATE INDEX IF NOT EXISTS commands_by_outlet
+  ON commands (controller, outlet, sent_ts);

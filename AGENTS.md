@@ -29,12 +29,22 @@ watering.
   ml= cap_s=` or `stop=1`, one slot per controller, 409 when busy), `POST /interval`
   (per-controller `next=` override, 0 clears), `POST /pot` (partial upsert by name: mapping,
   calibration, Planta-style fields, rules knobs; refuses inconsistent merges and channel/outlet
-  collisions), `GET /pots` (the garden with latest raw and derived %), `GET /health` (count,
-  last ts, per-controller heartbeat/knob/open command).
+  collisions), `GET /pots` (the garden with latest raw, derived % and any open proposal),
+  `POST /approve` (proposed -> queued, slot permitting), `POST /verdict` (ok | too_much |
+  too_little per executed dose), `GET /health` (count, last ts, per-controller
+  heartbeat/knob/open command).
+- The rules ladder runs in-process on each fresh report, stateless, inside the report's own
+  transaction: float=1 and pos=ok from that very report, outside BUTLER_QUIET (HH-HH, server
+  local time — set TZ in the container), median of the last 5 readings below target_low_pct,
+  no open command on the hose, cooldown passed (default 6 h, 0 disables), daily cap unspent
+  (default 3 doses). Auto queues directly; learning proposes. The board does not send float=
+  or pos= yet, so the rules ship dark and `fake_device.py --float/--pos` exercises them.
 - The command slot: queued → handed exactly once in a report response (sent) → acked by the
   next report's `ack=<id> flow_ml=`; a no-ack report or the TTL expires it. Expired is gone —
   ask again. The commands table is never pruned: it doubles as the watering history.
-- `schema.sql` — additive-only DDL: `readings`, `commands`, `controllers`, `pots` + indexes.
+- `schema.sql` — additive-only DDL: `readings`, `commands`, `controllers`, `pots`,
+  `verdicts` + indexes. Proposals are commands in state 'proposed'; the verdict log is the
+  dataset adaptive dosing will one day fit on.
   Moisture % is derived at read time from each pot's (dry_raw, wet_raw), never stored:
   recalibrating reinterprets history instead of losing it.
   `Dockerfile` — python-slim, port 9380, `/data` volume. `tests/` — the endpoints' contracts,

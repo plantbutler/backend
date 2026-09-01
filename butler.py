@@ -14,7 +14,7 @@ exactly like a working system with dead sensors, and a board bug should be
 loud. Strictness covers the encoding too: invalid UTF-8 is a refusal, not a
 repair, because one flipped byte in `c=` would otherwise mint a phantom
 controller and quietly fork the readings. Unknown KEYS, by contrast, are
-ignored on purpose: the board will grow `float=` and `pos=` before this
+ignored on purpose: the board will grow keys like `last=` before this
 service learns to read them, and a report must land whole the day either
 side updates first.
 
@@ -34,6 +34,16 @@ it was lost or the board dropped it — both mean the board does not have it,
 and re-handing a watering command the board might still execute is how a
 plant drowns. A queued command nobody collected within BUTLER_CMD_TTL_S
 expires too. Expired means gone; whoever wants water asks again.
+
+Watering rules run in-process on each fresh report — no cron, no thread.
+Every gate errs dry: rules act only when the report itself says the
+reservoir floats (`float=1`) and the manifold knows where it is (`pos=ok`),
+outside quiet hours, on a full median window below the pot's target, with
+no open command on the hose, cooldown passed and the daily cap unspent.
+The board does not send `float=` or `pos=` yet, so the rules ship dark and
+the fake device exercises them. In auto the command is queued directly; in
+learning it becomes a proposal for `POST /approve`, and `POST /verdict`
+records how the dose worked out. The flip to auto is a human act, per pot.
 """
 
 import hmac
@@ -55,6 +65,12 @@ MAX_RAW = 2**31  # 14-bit ADC today; headroom without letting 2**63 near sqlite
 MAX_DOSE_ML = 1000  # a liter in one command is already implausible for a pot
 MAX_CAP_S = 60  # the firmware enforces its own cap; this bounds what we ask
 MIN_NEXT_S, MAX_NEXT_S = 5, 3600  # the interval knob's sane range
+RULES_WINDOW = 5  # median of this many readings is the whole smoothing story
+PROPOSAL_TTL_S = 7200  # a proposal nobody approved in 2 h expires
+DEFAULT_COOLDOWN_H = 6  # when a pot does not set its own; 0 disables
+DEFAULT_DAILY_CAP_DOSES = 3  # a NULL daily_cap_ml means this many doses
+FLOW_FLOOR_ML_S = 20  # worst-case pump flow, sizes cap_s; bench-rig-tunable
+VERDICT_VALUES = ("ok", "too_much", "too_little")
 
 
 class Report(NamedTuple):
@@ -63,6 +79,8 @@ class Report(NamedTuple):
     t: int | None  # board uptime, ms
     ack: int | None  # command id the board says it executed
     flow_ml: int | None  # what the flow meter counted while executing it
+    float_ok: int | None  # reservoir float switch: 1 floats, 0 empty
+    pos: str | None  # manifold position: 'ok' or 'unknown'
 
 
 class Command(NamedTuple):
@@ -95,7 +113,7 @@ def parse_report(text: str) -> Report:
     """
     controller = None
     channels: dict[int, int] = {}
-    t = ack = flow_ml = None
+    t = ack = flow_ml = float_ok = pos = None
     for token in text.split():
         key, sep, value = token.partition("=")
         if not sep or not key:
@@ -116,6 +134,16 @@ def parse_report(text: str) -> Report:
             if flow_ml is not None:
                 raise ValueError("flow_ml= given twice")
             flow_ml = _int_in(value, "flow_ml", 0, MAX_RAW)
+        elif key == "float":
+            if float_ok is not None:
+                raise ValueError("float= given twice")
+            float_ok = _int_in(value, "float", 0, 2)
+        elif key == "pos":
+            if pos is not None:
+                raise ValueError("pos= given twice")
+            if value not in ("ok", "unknown"):
+                raise ValueError(f"pos= must be ok or unknown, got {value!r}")
+            pos = value
         elif key.startswith("ch") and key[2:].isascii() and key[2:].isdigit():
             channel = int(key[2:])
             if channel > MAX_CHANNEL:
@@ -129,7 +157,7 @@ def parse_report(text: str) -> Report:
         raise ValueError("no chN= in the report")
     if flow_ml is not None and ack is None:
         raise ValueError("flow_ml= without ack=")
-    return Report(controller, channels, t, ack, flow_ml)
+    return Report(controller, channels, t, ack, flow_ml, float_ok, pos)
 
 
 def parse_command(text: str) -> Command:
@@ -292,11 +320,78 @@ def moisture_pct(raw: int, dry_raw: int | None, wet_raw: int | None) -> int | No
     return max(0, min(100, round(pct)))
 
 
+def parse_approve(text: str) -> int:
+    """The `POST /approve` body: `cmd=<id>`."""
+    cmd_id = None
+    for token in text.split():
+        key, sep, value = token.partition("=")
+        if not sep or not key:
+            raise ValueError(f"not a k=v token: {token!r}")
+        if key == "cmd":
+            if cmd_id is not None:
+                raise ValueError("cmd= given twice")
+            cmd_id = _int_in(value, "cmd", 1, 2**63)
+    if cmd_id is None:
+        raise ValueError("no cmd= in the request")
+    return cmd_id
+
+
+def parse_verdict(text: str) -> tuple[int, str]:
+    """The `POST /verdict` body: `cmd=<id> verdict=ok|too_much|too_little`."""
+    cmd_id = None
+    verdict = None
+    for token in text.split():
+        key, sep, value = token.partition("=")
+        if not sep or not key:
+            raise ValueError(f"not a k=v token: {token!r}")
+        if key == "cmd":
+            if cmd_id is not None:
+                raise ValueError("cmd= given twice")
+            cmd_id = _int_in(value, "cmd", 1, 2**63)
+        elif key == "verdict":
+            if verdict is not None:
+                raise ValueError("verdict= given twice")
+            if value not in VERDICT_VALUES:
+                raise ValueError(f"verdict= must be one of {'|'.join(VERDICT_VALUES)}")
+            verdict = value
+    if cmd_id is None:
+        raise ValueError("no cmd= in the request")
+    if verdict is None:
+        raise ValueError("no verdict= in the request")
+    return cmd_id, verdict
+
+
+def parse_quiet(text: str) -> tuple[int, int]:
+    """BUTLER_QUIET, `HH-HH` in the server's local time; `0-0` disables.
+
+    The container runs UTC unless TZ is set — set TZ in the deployment or
+    the quiet window is quiet somewhere else.
+    """
+    start, sep, end = text.partition("-")
+    ok = sep and start.isascii() and start.isdigit() and end.isascii() and end.isdigit()
+    if not ok:
+        raise ValueError(f"BUTLER_QUIET must be HH-HH, got {text!r}")
+    s, e = int(start), int(end)
+    if not (0 <= s <= 23 and 0 <= e <= 23):
+        raise ValueError(f"BUTLER_QUIET hours out of range: {text}")
+    return s, e
+
+
+def in_quiet(hour: int, start: int, end: int) -> bool:
+    """Whether `hour` falls in the quiet window; start == end means never."""
+    if start == end:
+        return False
+    if start < end:
+        return start <= hour < end
+    return hour >= start or hour < end
+
+
 def create_app(
     db_path: str | None = None,
     token: str | None = None,
     next_s: int | None = None,
     cmd_ttl_s: int | None = None,
+    quiet: str | None = None,
 ) -> FastAPI:
     """Everything configurable comes from the environment, overridable for tests.
 
@@ -339,6 +434,10 @@ def create_app(
             "dead between two on-time reports"
         )
 
+    quiet_window = parse_quiet(
+        quiet if quiet is not None else os.environ.get("BUTLER_QUIET") or "22-08"
+    )
+
     if db.parent == Path("/data") and not os.path.ismount("/data"):
         raise ValueError(
             "BUTLER_DB is under /data but /data is not a mounted volume; "
@@ -355,10 +454,116 @@ def create_app(
         con.execute("PRAGMA journal_mode=WAL")
         return con
 
+    def water_rules(con: sqlite3.Connection, r: Report, now: int) -> None:
+        """The ladder from the design sketch, statelessly, inside the
+        report's own transaction. Median over the last RULES_WINDOW
+        readings is both the smoothing and the consecutive-dry test: a
+        dry median of five means most of the window was dry. Every gate
+        errs dry; a skipped pot is retried on the next report for free.
+        """
+        con.execute(
+            "UPDATE commands SET state = 'expired' "
+            "WHERE controller = ? AND state = 'proposed' AND created_ts < ?",
+            (r.controller, now - PROPOSAL_TTL_S),
+        )
+        if r.float_ok != 1 or r.pos != "ok":
+            return  # no reservoir, no known position, no report field: dry
+        if in_quiet(time.localtime(now).tm_hour, *quiet_window):
+            return
+        candidates = con.execute(
+            "SELECT name, channel, outlet, dry_raw, wet_raw, target_low_pct, "
+            "dose_ml, mode, cooldown_h, daily_cap_ml FROM pots "
+            "WHERE enabled = 1 AND mode IN ('learning', 'auto') "
+            "AND controller = ? AND channel IS NOT NULL AND outlet IS NOT NULL "
+            "AND dry_raw IS NOT NULL AND wet_raw IS NOT NULL "
+            "AND target_low_pct IS NOT NULL AND dose_ml IS NOT NULL "
+            "ORDER BY name",
+            (r.controller,),
+        ).fetchall()
+        for (
+            name,
+            channel,
+            outlet,
+            dry,
+            wet,
+            low,
+            dose,
+            mode,
+            cool_h,
+            cap_ml,
+        ) in candidates:
+            if channel not in r.channels:
+                # A sensor that went silent errs dry, exactly like a missing
+                # float=: without it the window would freeze on stale values
+                # and water the pot at cooldown pace forever.
+                continue
+            window = [
+                raw
+                for (raw,) in con.execute(
+                    "SELECT raw FROM readings "
+                    "WHERE controller = ? AND channel = ? "
+                    "ORDER BY ts DESC, rowid DESC LIMIT ?",
+                    (r.controller, channel, RULES_WINDOW),
+                )
+            ]
+            if len(window) < RULES_WINDOW:
+                continue
+            window.sort()  # median of raw == median of pct: the map is monotonic
+            median_pct = moisture_pct(window[RULES_WINDOW // 2], dry, wet)
+            if median_pct is None or median_pct >= low:
+                continue
+            open_cmd = con.execute(
+                "SELECT 1 FROM commands WHERE controller = ? AND outlet = ? "
+                "AND state IN ('proposed', 'queued', 'sent') LIMIT 1",
+                (r.controller, outlet),
+            ).fetchone()
+            if open_cmd:
+                continue
+            # Cooldown counts from the last command the board ever HELD
+            # (sent_ts set): an expired-unacked command may still have
+            # watered, so it cools the pot just like an acked one.
+            cooldown_s = (cool_h if cool_h is not None else DEFAULT_COOLDOWN_H) * 3600
+            watered = con.execute(
+                "SELECT 1 FROM commands WHERE controller = ? AND outlet = ? "
+                "AND sent_ts IS NOT NULL AND COALESCE(acked_ts, sent_ts) > ? "
+                "LIMIT 1",
+                (r.controller, outlet, now - cooldown_s),
+            ).fetchone()
+            if watered:
+                continue
+            cap = cap_ml if cap_ml is not None else DEFAULT_DAILY_CAP_DOSES * dose
+            (spent,) = con.execute(
+                "SELECT COALESCE(SUM(COALESCE(flow_ml, ml)), 0) FROM commands "
+                "WHERE controller = ? AND outlet = ? AND sent_ts IS NOT NULL "
+                "AND sent_ts > ?",
+                (r.controller, outlet, now - 86400),
+            ).fetchone()
+            if spent + dose > cap:
+                continue
+            state = "proposed"
+            if mode == "auto":
+                slot_busy = con.execute(
+                    "SELECT 1 FROM commands WHERE controller = ? "
+                    "AND state IN ('queued', 'sent') LIMIT 1",
+                    (r.controller,),
+                ).fetchone()
+                if slot_busy:
+                    continue  # the next report retries; dry beats flooded
+                state = "queued"
+            cap_s = min(MAX_CAP_S, max(5, dose // FLOW_FLOOR_ML_S + 5))
+            con.execute(
+                "INSERT INTO commands "
+                "(created_ts, controller, kind, outlet, ml, cap_s, state, source) "
+                "VALUES (?, ?, 'water', ?, ?, ?, ?, 'rules')",
+                (now, r.controller, outlet, dose, cap_s, state),
+            )
+
     def handle_report(r: Report) -> tuple[int, tuple | None]:
         """One report, one transaction: heartbeat, ack, expiries, dedup, the
-        readings, and at most one command handed out — atomically, so two
-        writers cannot hand the same command twice."""
+        readings, the watering rules, and at most one command handed out —
+        atomically, so two writers cannot hand the same command twice. A
+        command the rules queue here rides out on this very response: the
+        safety fields it was judged on are from this same report."""
         now = int(time.time())
         with connect() as con:
             con.execute("BEGIN IMMEDIATE")  # writers serialize up front
@@ -403,6 +608,7 @@ def create_app(
                         for ch, raw in sorted(r.channels.items())
                     ],
                 )
+                water_rules(con, r, now)
             handed = con.execute(
                 "SELECT id, kind, outlet, ml, cap_s FROM commands "
                 "WHERE controller = ? AND state = 'queued' ORDER BY id LIMIT 1",
@@ -518,6 +724,72 @@ def create_app(
                     [fields[k] for k in keys],
                 )
 
+    def approve(cmd_id: int) -> tuple | None:
+        """proposed -> queued, slot permitting; returns the blocker if busy.
+
+        created_ts restarts on approval: the queued-TTL clock should time
+        the wait for the board, not the hours the proposal sat waiting for
+        a human.
+        """
+        now = int(time.time())
+        with connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            # The proposal-TTL sweep normally runs on the controller's own
+            # reports; a board gone dark never sweeps, so enforce the TTL
+            # here too — a days-old proposal must not water on the stale
+            # evidence it was made from.
+            con.execute(
+                "UPDATE commands SET state = 'expired' "
+                "WHERE id = ? AND state = 'proposed' AND created_ts < ?",
+                (cmd_id, now - PROPOSAL_TTL_S),
+            )
+            row = con.execute(
+                "SELECT controller FROM commands WHERE id = ? AND state = 'proposed'",
+                (cmd_id,),
+            ).fetchone()
+            if not row:
+                # Keep the expiry sweep even though we refuse: the with-block
+                # would roll it back along with the raise, and /pots and the
+                # database should agree the proposal is gone.
+                con.commit()
+                raise ValueError(f"no proposed command {cmd_id}")
+            # The same TTL backstop enqueue runs: a dead board's abandoned
+            # command must not wedge approval behind a 409 forever.
+            con.execute(
+                "UPDATE commands SET state = 'expired' "
+                "WHERE controller = ? AND state IN ('queued', 'sent') "
+                "AND COALESCE(sent_ts, created_ts) < ?",
+                (row[0], now - cmd_ttl),
+            )
+            busy = con.execute(
+                "SELECT id, state FROM commands WHERE controller = ? "
+                "AND state IN ('queued', 'sent') LIMIT 1",
+                (row[0],),
+            ).fetchone()
+            if busy:
+                return busy
+            con.execute(
+                "UPDATE commands SET state = 'queued', created_ts = ? WHERE id = ?",
+                (now, cmd_id),
+            )
+            return None
+
+    def record_verdict(cmd_id: int, verdict: str) -> None:
+        """One human judgement per executed dose; a re-verdict replaces."""
+        now = int(time.time())
+        with connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT sent_ts FROM commands WHERE id = ?", (cmd_id,)
+            ).fetchone()
+            if not row or row[0] is None:
+                raise ValueError(f"command {cmd_id} was never handed to the board")
+            con.execute(
+                "INSERT OR REPLACE INTO verdicts (command_id, ts, verdict) "
+                "VALUES (?, ?, ?)",
+                (cmd_id, now, verdict),
+            )
+
     app = FastAPI()
 
     def bad_token(request: Request) -> bool:
@@ -627,6 +899,48 @@ def create_app(
             return PlainTextResponse(f"try again: {why}\n", status_code=503)
         return PlainTextResponse(f"pot={parsed['name']}\n")
 
+    @app.post("/approve")
+    async def approve_proposal(request: Request):
+        if bad_token(request):
+            return PlainTextResponse("bad token\n", status_code=401)
+        body = await slurp(request)
+        if isinstance(body, PlainTextResponse):
+            return body
+        try:
+            cmd_id = parse_approve(body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=400)
+        try:
+            busy = await run_in_threadpool(approve, cmd_id)
+        except ValueError as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=400)
+        except sqlite3.OperationalError as why:
+            return PlainTextResponse(f"try again: {why}\n", status_code=503)
+        if busy:
+            return PlainTextResponse(
+                f"busy: cmd={busy[0]} state={busy[1]}\n", status_code=409
+            )
+        return PlainTextResponse(f"cmd={cmd_id}\n")
+
+    @app.post("/verdict")
+    async def verdict_knob(request: Request):
+        if bad_token(request):
+            return PlainTextResponse("bad token\n", status_code=401)
+        body = await slurp(request)
+        if isinstance(body, PlainTextResponse):
+            return body
+        try:
+            cmd_id, verdict = parse_verdict(body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=400)
+        try:
+            await run_in_threadpool(record_verdict, cmd_id, verdict)
+        except ValueError as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=400)
+        except sqlite3.OperationalError as why:
+            return PlainTextResponse(f"try again: {why}\n", status_code=503)
+        return PlainTextResponse(f"cmd={cmd_id} verdict={verdict}\n")
+
     @app.get("/pots")
     def pots():
         try:
@@ -648,6 +962,23 @@ def create_app(
                             entry["raw"], entry["read_ts"] = latest
                             entry["pct"] = moisture_pct(
                                 entry["raw"], entry["dry_raw"], entry["wet_raw"]
+                            )
+                    entry["proposal"] = None
+                    if entry["controller"] is not None and entry["outlet"] is not None:
+                        prop = con.execute(
+                            "SELECT id, ml, cap_s, created_ts FROM commands "
+                            "WHERE controller = ? AND outlet = ? "
+                            "AND state = 'proposed' AND created_ts >= ? "
+                            "ORDER BY id LIMIT 1",
+                            (
+                                entry["controller"],
+                                entry["outlet"],
+                                int(time.time()) - PROPOSAL_TTL_S,
+                            ),
+                        ).fetchone()
+                        if prop:
+                            entry["proposal"] = dict(
+                                zip(("id", "ml", "cap_s", "created_ts"), prop)
                             )
                     garden.append(entry)
         except sqlite3.OperationalError as why:
