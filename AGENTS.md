@@ -27,11 +27,13 @@ watering.
   `BUTLER_NTFY_TOPIC`, `BUTLER_NTFY_URL`, `BUTLER_DEADMAN_URL`, `BUTLER_SILENT_S`), `POST /report` (k=v body, `X-Token`
   header, refuses whole on malformed channels, ignores unknown keys, stamps arrival time,
   answers `next=` plus at most one `cmd=` line), `POST /command` (queue `water=<outlet>
-  ml= cap_s=` or `stop=1`, one slot per controller, 409 when busy), `POST /interval`
+  ml= [cap_s=]` or `stop=1`, one slot per controller, 409 when busy; a missing cap_s is sized
+  by `cap_for`, the one owner of FLOW_FLOOR_ML_S), `POST /interval`
   (per-controller `next=` override, 0 clears), `POST /pot` (partial upsert by name: mapping,
   calibration, Planta-style fields, rules knobs; refuses inconsistent merges and channel/outlet
   collisions), `GET /pots` (the garden with latest raw, derived %, any open proposal and the last handed
-  dose with its verdict),
+  dose with its verdict), `GET /history` (`c= ch= hours= bucket_s=`: bucketed raw counts with
+  lo/hi/n and the server's `since`/`to`, `since` on a bucket boundary, at most 2016 buckets — the chart's wire),
   `POST /approve` (proposed -> queued, slot permitting), `POST /verdict` (ok | too_much |
   too_little per executed dose), `GET /health` (count, last ts, the default interval, per-controller
   heartbeat/knob/open command/safety fields, raised alerts).

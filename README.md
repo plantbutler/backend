@@ -33,7 +33,8 @@ Queue a command for the board's next report, or change its report interval:
 ```bash
 curl -s -X POST http://localhost:8000/command \
   -H 'X-Token: dev' --data-binary 'c=butler1 water=3 ml=50 cap_s=30'
-# -> cmd=1        (409 busy: ... while the slot is taken; stop=1 instead of a dose)
+# -> cmd=1        (409 busy: ... while the slot is taken; stop=1 instead of a dose;
+#                  leave cap_s out and the rules' own formula sizes it)
 curl -s -X POST http://localhost:8000/interval \
   -H 'X-Token: dev' --data-binary 'c=butler1 next=120'
 ```
@@ -48,6 +49,10 @@ curl -s -X POST http://localhost:8000/pot \
 curl -s -X POST http://localhost:8000/pot \
   -H 'X-Token: dev' --data-binary 'name=basil dry_raw=12000 wet_raw=4000'
 curl -s http://localhost:8000/pots     # the garden, with latest raw and derived %
+curl -s 'http://localhost:8000/history?c=butler1&ch=0&hours=24&bucket_s=300'
+# -> {"since": ..., "to": ..., "points": [{"ts", "raw", "lo", "hi", "n"}, ...]}: the chart's
+#    wire, raw counts bucketed on the server's clock; the app derives % from the pot's
+#    calibration, so recalibrating re-reads the whole curve
 ```
 
 Once a pot is calibrated, has a target range and a dose, and is flipped to `mode=learning`

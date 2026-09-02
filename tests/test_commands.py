@@ -5,7 +5,8 @@ import sqlite3
 import pytest
 from fastapi.testclient import TestClient
 
-from butler import create_app, parse_command, parse_report
+import butler
+from butler import cap_for, create_app, parse_command, parse_report
 
 TOKEN = "test-token"
 
@@ -220,6 +221,17 @@ def test_health_lists_a_configured_but_never_seen_controller(client, db):
 # --------------------------------------------------------------------------- #
 
 
+def test_a_dose_without_a_cap_gets_the_rules_own_cap(client, db):
+    # One owner for the flow constant: the app never copies the formula.
+    assert command(client, "c=butler1 water=3 ml=50").status_code == 200
+    handed = report(client, "c=butler1 ch0=1").text
+    assert "cmd=1 water=3 ml=50 cap_s=7" in handed  # 50 // 20 + 5
+    report(client, "c=butler1 ch0=1 ack=1 flow_ml=50")
+    command(client, "c=butler1 water=3 ml=1000")
+    handed = report(client, "c=butler1 ch0=1").text
+    assert "cmd=2 water=3 ml=1000 cap_s=55" in handed  # 1000 // 20 + 5, under MAX_CAP_S
+
+
 @pytest.mark.parametrize(
     "body",
     [
@@ -229,7 +241,6 @@ def test_health_lists_a_configured_but_never_seen_controller(client, db):
         "c=butler1 stop=2",  # stop= is 1 or absent
         "c=butler1 stop=1 ml=50",  # stop takes no dose
         "c=butler1 water=3 cap_s=30",  # no ml=
-        "c=butler1 water=3 ml=50",  # no cap_s=
         "c=butler1 water=3 ml=0 cap_s=30",  # zero dose
         "c=butler1 water=3 ml=5000 cap_s=30",  # a flood
         "c=butler1 water=3 ml=50 cap_s=600",  # cap too long
@@ -305,3 +316,10 @@ def test_ack_parsing_is_as_strict_as_the_rest():
 def test_parse_command_shapes():
     assert parse_command("c=x water=3 ml=50 cap_s=30") == ("x", "water", 3, 50, 30)
     assert parse_command("c=x stop=1 future=1") == ("x", "stop", None, None, None)
+
+
+def test_cap_for_stays_under_the_firmware_cap_after_a_retune(monkeypatch):
+    assert cap_for(1) == 5  # the slack alone
+    assert cap_for(butler.MAX_DOSE_ML) == 55  # under MAX_CAP_S at today's flow floor
+    monkeypatch.setattr(butler, "FLOW_FLOOR_ML_S", 10)  # a bench retune
+    assert cap_for(butler.MAX_DOSE_ML) == butler.MAX_CAP_S
