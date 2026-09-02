@@ -348,6 +348,17 @@ POT_INT_FIELDS = {  # half-open bounds, like every other field
 }
 POT_TEXT_FIELDS = ("controller", "plant_type", "plant_size", "pot_size", "soil")
 POT_MODES = ("manual", "learning", "auto")
+LAST_DOSE_KEYS = (
+    "id",
+    "ml",
+    "cap_s",
+    "flow_ml",
+    "state",
+    "source",
+    "sent_ts",
+    "acked_ts",
+    "verdict",
+)
 POT_COLUMNS = (
     "id",
     "name",
@@ -1714,7 +1725,7 @@ def create_app(
                             entry["pct"] = moisture_pct(
                                 entry["raw"], entry["dry_raw"], entry["wet_raw"]
                             )
-                    entry["proposal"] = None
+                    entry["proposal"] = entry["last_dose"] = None
                     if entry["controller"] is not None and entry["outlet"] is not None:
                         prop = con.execute(
                             "SELECT id, ml, cap_s, created_ts FROM commands "
@@ -1731,6 +1742,22 @@ def create_app(
                             entry["proposal"] = dict(
                                 zip(("id", "ml", "cap_s", "created_ts"), prop)
                             )
+                        # The newest dose handed to the board on this hose,
+                        # with its human verdict: the id POST /verdict needs
+                        # was otherwise visible only in the log. One row on
+                        # the commands_by_outlet index.
+                        dose = con.execute(
+                            "SELECT c.id, c.ml, c.cap_s, c.flow_ml, c.state, "
+                            "c.source, c.sent_ts, c.acked_ts, v.verdict "
+                            "FROM commands c "
+                            "LEFT JOIN verdicts v ON v.command_id = c.id "
+                            "WHERE c.controller = ? AND c.outlet = ? "
+                            "AND c.kind = 'water' AND c.sent_ts IS NOT NULL "
+                            "ORDER BY c.sent_ts DESC, c.id DESC LIMIT 1",
+                            (entry["controller"], entry["outlet"]),
+                        ).fetchone()
+                        if dose:
+                            entry["last_dose"] = dict(zip(LAST_DOSE_KEYS, dose))
                     garden.append(entry)
         except sqlite3.OperationalError as why:
             return PlainTextResponse(f"try again: {why}\n", status_code=503)
@@ -1797,6 +1824,7 @@ def create_app(
                 "ok": True,
                 "readings": count,
                 "last_ts": last,
+                "next_default": interval,
                 "controllers": [known[k] for k in sorted(known)],
                 "alerts": raised,
             }

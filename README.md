@@ -56,11 +56,15 @@ report says the reservoir floats and the manifold knows where it is. Learning mo
 instead of watering:
 
 ```bash
-curl -s http://localhost:8000/pots                # the proposal shows up here
+curl -s http://localhost:8000/pots                # the proposal shows up here, later the dose
 curl -s -X POST http://localhost:8000/approve -H 'X-Token: dev' --data-binary 'cmd=17'
 curl -s -X POST http://localhost:8000/verdict -H 'X-Token: dev' \
   --data-binary 'cmd=17 verdict=ok'               # or too_much / too_little
 ```
+
+Each pot in `GET /pots` also carries `last_dose`: the newest command handed to the board on
+that hose, with what the meter counted and the verdict so far. That is what the app judges
+from; a manual water-now on the same hose replaces it.
 
 Or skip curl and let a fake board do the whole dance — report, receive, water, ack:
 

@@ -269,6 +269,64 @@ def test_approved_proposal_is_handed_acked_and_verdicted(client, db):
         ]
 
 
+def test_the_garden_carries_the_last_handed_dose_and_its_verdict(client, db):
+    # POST /verdict wants a command id; the app finds it here, never in a log.
+    make_pot(client, mode="learning")
+    soak(client, 5)
+    (entry,) = client.get("/pots").json()["pots"]
+    assert entry["proposal"]["id"] == 1
+    assert entry["last_dose"] is None  # proposed is not handed
+
+    post(client, "/approve", "cmd=1")
+    report(client)  # handed to the board
+    dose = client.get("/pots").json()["pots"][0]["last_dose"]
+    assert (dose["id"], dose["state"], dose["source"], dose["ml"]) == (
+        1,
+        "sent",
+        "rules",
+        100,
+    )
+    assert dose["sent_ts"] is not None
+    assert (dose["flow_ml"], dose["acked_ts"], dose["verdict"]) == (None, None, None)
+
+    report(client, extra="ack=1 flow_ml=97")
+    post(client, "/verdict", "cmd=1 verdict=too_much")
+    dose = client.get("/pots").json()["pots"][0]["last_dose"]
+    assert (dose["state"], dose["flow_ml"], dose["verdict"]) == (
+        "acked",
+        97,
+        "too_much",
+    )
+    assert dose["acked_ts"] is not None
+
+    # A manual water-now on the same hose takes its place.
+    post(client, "/command", "c=b1 water=3 ml=50 cap_s=5")
+    report(client, raw=WET)
+    dose = client.get("/pots").json()["pots"][0]["last_dose"]
+    assert (dose["id"], dose["source"], dose["ml"], dose["verdict"]) == (
+        2,
+        "manual",
+        50,
+        None,
+    )
+
+    # Pin the ORDER BY without trusting the wall clock: on a sent_ts tie the
+    # newer id wins; a newer id handed EARLIER loses to sent_ts (a proposal
+    # approved after a manual water-now is the real case).
+    def last_dose_id():
+        return client.get("/pots").json()["pots"][0]["last_dose"]["id"]
+
+    with sqlite3.connect(db) as con:
+        con.execute(
+            "UPDATE commands SET sent_ts = (SELECT sent_ts FROM commands WHERE id = 1) "
+            "WHERE id = 2"
+        )
+    assert last_dose_id() == 2
+    with sqlite3.connect(db) as con:
+        con.execute("UPDATE commands SET sent_ts = sent_ts - 60 WHERE id = 2")
+    assert last_dose_id() == 1
+
+
 def test_approval_restarts_the_queued_ttl_clock(client, db):
     make_pot(client, mode="learning")
     soak(client, 5)

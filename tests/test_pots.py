@@ -55,6 +55,7 @@ def test_a_pot_is_born_from_one_line(client):
     assert entry["mode"] == "manual"
     assert entry["enabled"] == 1
     assert entry["pct"] is None  # uncalibrated
+    assert entry["last_dose"] is None  # never watered
 
 
 def test_an_update_touches_only_the_keys_given(client):

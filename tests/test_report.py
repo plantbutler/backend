@@ -80,6 +80,22 @@ def test_reports_append_and_health_counts_them(client, db):
 # --------------------------------------------------------------------------- #
 
 
+def test_health_reports_the_default_interval_not_an_override(db):
+    # The app assumes this interval instead of its own hard-coded 60, so the
+    # suite must tell a literal from the configured value.
+    client = TestClient(
+        create_app(db_path=str(db), token=TOKEN, next_s=45, cmd_ttl_s=900)
+    )
+    post(client, "c=b1 ch0=1\n")
+    knob = client.post("/interval", content="c=b1 next=120", headers={"X-Token": TOKEN})
+    assert knob.status_code == 200
+    health = client.get("/health").json()
+    assert health["next_default"] == 45
+    assert (
+        health["controllers"][0]["next_s"] == 120
+    )  # the override stays per-controller
+
+
 def test_an_identical_retry_is_answered_200_and_stored_once(client, db):
     first = post(client, REPORT)
     retry = post(client, REPORT)
