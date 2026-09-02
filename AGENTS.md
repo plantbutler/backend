@@ -30,10 +30,11 @@ watering.
   ml= cap_s=` or `stop=1`, one slot per controller, 409 when busy), `POST /interval`
   (per-controller `next=` override, 0 clears), `POST /pot` (partial upsert by name: mapping,
   calibration, Planta-style fields, rules knobs; refuses inconsistent merges and channel/outlet
-  collisions), `GET /pots` (the garden with latest raw, derived % and any open proposal),
+  collisions), `GET /pots` (the garden with latest raw, derived %, any open proposal and the last handed
+  dose with its verdict),
   `POST /approve` (proposed -> queued, slot permitting), `POST /verdict` (ok | too_much |
-  too_little per executed dose), `GET /health` (count, last ts, per-controller
-  heartbeat/knob/open command).
+  too_little per executed dose), `GET /health` (count, last ts, the default interval, per-controller
+  heartbeat/knob/open command/safety fields, raised alerts).
 - The rules ladder runs in-process on each fresh report, stateless, inside the report's own
   transaction: float=1 and pos=ok from that very report, outside BUTLER_QUIET (HH-HH, server
   local time — set TZ in the container), median of the last 5 readings below target_low_pct,
