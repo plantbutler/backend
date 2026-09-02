@@ -79,6 +79,7 @@ from typing import NamedTuple
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import QueryParams
 from starlette.requests import ClientDisconnect
 
 BODY_CAP = 4096  # a full 15-channel report is ~200 bytes; 4 KB is generous
@@ -257,12 +258,21 @@ def parse_report(text: str) -> Report:
     return Report(controller, channels, t, ack, flow_ml, float_ok, pos)
 
 
+def cap_for(ml: int) -> int:
+    """Seconds the pump may run for a dose: worst-case flow plus slack,
+    bounded by MAX_CAP_S. The one owner of FLOW_FLOOR_ML_S — the rules and
+    a manual command without cap_s= both size their cap here, so a bench
+    retune happens in one place."""
+    return min(MAX_CAP_S, ml // FLOW_FLOOR_ML_S + 5)
+
+
 def parse_command(text: str) -> Command:
     """The `POST /command` body, same dialect and strictness as a report.
 
-    `c=<controller>` plus either `water=<outlet> ml=<dose> cap_s=<cap>` or
-    `stop=1`. Unknown keys are ignored here too, so the app can grow fields
-    before this service reads them.
+    `c=<controller>` plus either `water=<outlet> ml=<dose> [cap_s=<cap>]` or
+    `stop=1`; a dose without cap_s= gets the rules' own cap. Unknown keys
+    are ignored here too, so the app can grow fields before this service
+    reads them.
     """
     controller = None
     outlet = ml = cap_s = None
@@ -301,9 +311,11 @@ def parse_command(text: str) -> Command:
         return Command(controller, "stop", None, None, None)
     if outlet is None:
         raise ValueError("neither water= nor stop=1")
-    if ml is None or cap_s is None:
-        raise ValueError("water= needs both ml= and cap_s=")
-    return Command(controller, "water", outlet, ml, cap_s)
+    if ml is None:
+        raise ValueError("water= needs ml=")
+    return Command(
+        controller, "water", outlet, ml, cap_for(ml) if cap_s is None else cap_s
+    )
 
 
 def parse_interval(text: str) -> tuple[str, int]:
@@ -332,6 +344,42 @@ def parse_interval(text: str) -> tuple[str, int]:
     if next_s is None:
         raise ValueError("no next= in the request")
     return controller, next_s
+
+
+# The whole window at the default bucket (2016); a week at a minute would
+# be 10080 rows of JSON.
+HISTORY_MAX_BUCKETS = 168 * 3600 // 300
+
+
+def parse_history(params: QueryParams) -> tuple[str, int, int, int]:
+    """`GET /history?c=<controller>&ch=<channel>&hours=<1..168>&bucket_s=<60..3600>`.
+
+    Query parameters instead of a body because it is a read; the same
+    ASCII-digit strictness and the same "given twice" refusal as every k=v
+    field (a multidict would otherwise take the last value quietly), and
+    the same plain-text refusal, so the app has one error dialect to show.
+    """
+
+    def one(key: str, default: str | None = None) -> str | None:
+        values = params.getlist(key)
+        if len(values) > 1:
+            raise ValueError(f"{key}= given twice")
+        return values[0] if values else default
+
+    controller = one("c")
+    if not controller:
+        raise ValueError("no c= in the request")
+    ch = one("ch")
+    if ch is None:
+        raise ValueError("no ch= in the request")
+    channel = _int_in(ch, "ch", 0, MAX_CHANNEL + 1)
+    hours = _int_in(one("hours", "24") or "", "hours", 1, 169)
+    bucket_s = _int_in(one("bucket_s", "300") or "", "bucket_s", 60, 3601)
+    if hours * 3600 // bucket_s > HISTORY_MAX_BUCKETS:
+        raise ValueError(
+            f"too many buckets: {hours} h at {bucket_s} s is over {HISTORY_MAX_BUCKETS}"
+        )
+    return controller, channel, hours, bucket_s
 
 
 POT_INT_FIELDS = {  # half-open bounds, like every other field
@@ -713,7 +761,7 @@ def create_app(
                 if slot_busy:
                     continue  # the next report retries; dry beats flooded
                 state = "queued"
-            cap_s = min(MAX_CAP_S, max(5, dose // FLOW_FLOOR_ML_S + 5))
+            cap_s = cap_for(dose)
             con.execute(
                 "INSERT INTO commands "
                 "(created_ts, controller, kind, outlet, ml, cap_s, state, source) "
@@ -1762,6 +1810,44 @@ def create_app(
         except sqlite3.OperationalError as why:
             return PlainTextResponse(f"try again: {why}\n", status_code=503)
         return JSONResponse({"pots": garden})
+
+    @app.get("/history")
+    def history(request: Request):
+        """Bucketed raw counts for one (controller, channel): the chart's
+        wire. Raw only, so the app derives % from the pot's current
+        calibration and a recalibration re-reads the whole curve; `to` is
+        the server's clock so the axis never trusts the phone's."""
+        try:
+            controller, channel, hours, bucket_s = parse_history(request.query_params)
+        except ValueError as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=400)
+        now = int(time.time())
+        # A bucket boundary, so `since` bounds every point and the first
+        # bucket is whole instead of a partial that wobbles with the clock.
+        since = (now - hours * 3600) // bucket_s * bucket_s
+        try:
+            with connect() as con:
+                points = [
+                    {"ts": bucket, "raw": round(avg), "lo": lo, "hi": hi, "n": n}
+                    for bucket, avg, lo, hi, n in con.execute(
+                        "SELECT (ts / ?) * ?, AVG(raw), MIN(raw), MAX(raw), COUNT(*) "
+                        "FROM readings WHERE controller = ? AND channel = ? "
+                        "AND ts >= ? GROUP BY 1 ORDER BY 1",
+                        (bucket_s, bucket_s, controller, channel, since),
+                    )
+                ]
+        except sqlite3.OperationalError as why:
+            return PlainTextResponse(f"try again: {why}\n", status_code=503)
+        return JSONResponse(
+            {
+                "controller": controller,
+                "channel": channel,
+                "since": since,
+                "to": now,
+                "bucket_s": bucket_s,
+                "points": points,
+            }
+        )
 
     @app.get("/health")
     def health():
