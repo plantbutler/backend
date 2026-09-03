@@ -38,7 +38,13 @@ def garden(client):
 
 
 def pot_id(answer):
-    """The id out of a `pot=<id> name=<name>` answer."""
+    """The id out of a `pot=<id> name=<name>` answer.
+
+    Asserts the 200 first: a refusal's text parses into a plausible-looking
+    string too, and a test that then asks about that id gets an empty answer
+    and passes for the wrong reason.
+    """
+    assert answer.status_code == 200, answer.text
     return answer.text.split()[0].removeprefix("pot=")
 
 
@@ -80,9 +86,9 @@ def test_a_pot_is_born_from_one_line(client):
 
 
 def test_an_update_touches_only_the_keys_given(client):
-    pot(client, "name=basil controller=butler1 channel=0 plant_type=basil")
+    basil = pot_id(pot(client, "name=basil controller=butler1 channel=0 plant_type=basil"))
 
-    pot(client, "name=basil outlet=4")
+    pot(client, f"id={basil} outlet=4")
 
     (entry,) = garden(client)
     assert entry["outlet"] == 4
@@ -102,11 +108,11 @@ def test_a_name_alone_is_a_valid_pot(client):
 
 
 def test_calibration_turns_raw_into_percent(client):
-    pot(client, "name=basil controller=butler1 channel=0")
+    basil = pot_id(pot(client, "name=basil controller=butler1 channel=0"))
     report(client, "c=butler1 t=1000 ch0=8000")
     assert garden(client)[0]["pct"] is None
 
-    pot(client, "name=basil dry_raw=12000 wet_raw=4000")
+    pot(client, f"id={basil} dry_raw=12000 wet_raw=4000")
 
     (entry,) = garden(client)
     assert entry["raw"] == 8000
@@ -114,11 +120,11 @@ def test_calibration_turns_raw_into_percent(client):
 
 
 def test_recalibrating_reinterprets_history_without_touching_it(client, db):
-    pot(client, "name=basil controller=butler1 channel=0 dry_raw=12000 wet_raw=4000")
+    basil = pot_id(pot(client, "name=basil controller=butler1 channel=0 dry_raw=12000 wet_raw=4000"))
     report(client, "c=butler1 t=1000 ch0=8000")
     assert garden(client)[0]["pct"] == 50
 
-    pot(client, "name=basil dry_raw=10000 wet_raw=8000")  # no new reading
+    pot(client, f"id={basil} dry_raw=10000 wet_raw=8000")  # no new reading
 
     (entry,) = garden(client)
     assert entry["pct"] == 100  # same raw, new meaning
@@ -138,15 +144,15 @@ def test_percent_clamps_and_survives_either_sensor_direction():
 def test_equal_calibration_points_are_refused_even_across_requests(client):
     assert pot(client, "name=a dry_raw=5000 wet_raw=5000").status_code == 400
 
-    pot(client, "name=b dry_raw=5000")
-    answer = pot(client, "name=b wet_raw=5000")
+    b = pot_id(pot(client, "name=b dry_raw=5000"))
+    answer = pot(client, f"id={b} wet_raw=5000")
     assert answer.status_code == 400
     assert "must differ" in answer.text
 
 
 def test_an_inverted_target_range_is_refused(client):
-    pot(client, "name=a target_low_pct=30")
-    answer = pot(client, "name=a target_high_pct=30")
+    a = pot_id(pot(client, "name=a target_low_pct=30"))
+    answer = pot(client, f"id={a} target_high_pct=30")
     assert answer.status_code == 400
     assert "target_low_pct" in answer.text
 
@@ -173,8 +179,8 @@ def test_two_enabled_pots_cannot_share_an_outlet(client):
 
 
 def test_a_disabled_pot_frees_its_channel_and_hose(client):
-    pot(client, "name=basil controller=butler1 channel=0 outlet=3")
-    pot(client, "name=basil enabled=0")
+    basil = pot_id(pot(client, "name=basil controller=butler1 channel=0 outlet=3"))
+    pot(client, f"id={basil} enabled=0")
 
     assert (
         pot(client, "name=mint controller=butler1 channel=0 outlet=3").status_code
@@ -189,7 +195,7 @@ def test_a_disabled_pot_lets_go_of_the_hose_it_no_longer_holds(client, db):
     different one depending on which query you ask. The newcomer displaces
     the disabled pot, which is what physically happened."""
     basil = pot_id(pot(client, "name=basil controller=butler1 channel=0 outlet=3"))
-    pot(client, "name=basil enabled=0")
+    pot(client, f"id={basil} enabled=0")
     assert mappings(db, basil) == [(0, 3, None)], "still open while nobody else wants it"
 
     mint = pot_id(pot(client, "name=mint controller=butler1 channel=0 outlet=3"))
@@ -229,7 +235,7 @@ def test_a_displaced_window_keeps_the_doses_it_held(client, db):
             "(1, ?, 'butler1', 'water', 3, 100, 30, 'acked', 'manual', ?, ?, 98)",
             (now - 510, now - 500, now - 490),
         )
-    pot(client, "name=basil enabled=0")
+    assert pot(client, f"id={basil} enabled=0").status_code == 200
     mint = pot_id(pot(client, "name=mint controller=butler1 channel=0 outlet=3"))
 
     mine = client.get(f"/doses?pot={basil}").json()["doses"]
@@ -475,3 +481,38 @@ def test_species_round_trips(client):
     (entry,) = garden(client)
     assert entry["species"] == "Ocimum_basilicum"
     assert entry["id"] == pid
+
+
+def test_a_create_never_edits_the_pot_that_already_has_that_name(client, db):
+    """The whole pitch: an id-less POST /pot is a create, always. It used to
+    look the name up and edit whatever answered to it, so a "new pot" made
+    against a stale list quietly overwrote an existing one."""
+    basil = pot_id(pot(client, "name=basil controller=butler1 channel=0 soil=loam"))
+
+    answer = pot(client, "name=basil soil=peat")
+    assert answer.status_code == 400
+    assert "taken by pot" in answer.text
+    assert "open it instead of creating one" in answer.text
+
+    # Nothing moved, and no second pot appeared.
+    (entry,) = garden(client)
+    assert entry["id"] == basil
+    assert entry["soil"] == "loam"
+
+
+def test_editing_that_pot_still_works_through_its_id(client):
+    basil = pot_id(pot(client, "name=basil soil=loam"))
+    assert pot(client, f"id={basil} soil=peat").status_code == 200
+    (entry,) = garden(client)
+    assert entry["soil"] == "peat"
+    assert entry["id"] == basil
+
+
+def test_a_rename_onto_a_taken_name_keeps_its_own_words(client):
+    """The rename refusal is not the create's: there is nothing to open."""
+    pot(client, "name=basil")
+    mint = pot_id(pot(client, "name=mint"))
+    answer = pot(client, f"id={mint} name=basil")
+    assert answer.status_code == 400
+    assert "taken by pot" in answer.text
+    assert "creating one" not in answer.text
