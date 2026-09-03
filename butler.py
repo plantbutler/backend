@@ -513,6 +513,11 @@ def parse_interval(text: str) -> tuple[str, int]:
 
 # The whole window at the default bucket (2016); a week at a minute would
 # be 10080 rows of JSON.
+# A month back, which is what the app's widest chart window asks for. The
+# bucket cap is unchanged and still what actually bounds the answer: a month
+# at hourly buckets is 744 points, well under it, while a month at five
+# minutes would be refused as it always was.
+HISTORY_MAX_HOURS = 24 * 31
 HISTORY_MAX_BUCKETS = 168 * 3600 // 300
 
 
@@ -571,7 +576,7 @@ def parse_history(params: QueryParams) -> tuple[str, int, int, int]:
     if ch is None:
         raise ValueError("no ch= in the request")
     channel = _int_in(ch, "ch", 0, MAX_CHANNEL + 1)
-    hours = _int_in(one("hours", "24") or "", "hours", 1, 169)
+    hours = _int_in(one("hours", "24") or "", "hours", 1, HISTORY_MAX_HOURS + 1)
     bucket_s = _int_in(one("bucket_s", "300") or "", "bucket_s", 60, 3601)
     if hours * 3600 // bucket_s > HISTORY_MAX_BUCKETS:
         raise ValueError(

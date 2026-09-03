@@ -89,7 +89,7 @@ def test_history_needs_no_token(client, db):
         ("c=b1", "no ch="),
         ("c=b1&ch=x", "ch= is not an integer"),
         ("c=b1&ch=0&hours=0", "hours= out of range"),
-        ("c=b1&ch=0&hours=169", "hours= out of range"),
+        ("c=b1&ch=0&hours=745", "hours= out of range"),  # a month is the ceiling
         ("c=b1&ch=0&bucket_s=59", "bucket_s= out of range"),
         ("c=b1&ch=0&hours=168&bucket_s=60", "too many buckets"),
         ("c=b1&c=b2&ch=0", "c= given twice"),  # last-wins would chart b2
@@ -129,3 +129,29 @@ def test_the_whole_window_fits_at_the_default_bucket():
         parse_history(
             QueryParams({"c": "b1", "ch": "0", "hours": "168", "bucket_s": "299"})
         )
+
+
+def test_a_month_back_is_askable_at_a_sane_bucket(client, db):
+    """The app's widest chart window. A month at hourly buckets is 744
+    points; the bucket cap, not the hours cap, is what still bounds this."""
+    now = int(time.time())
+    plant(db, [(now - 25 * 24 * 3600, "b1", 0, 8000), (now - 60, "b1", 0, 9000)])
+    answer = client.get("/history", params={"c": "b1", "ch": 0, "hours": 744, "bucket_s": 3600})
+    assert answer.status_code == 200, answer.text
+    body = answer.json()
+    assert body["bucket_s"] == 3600
+    assert [p["raw"] for p in body["points"]] == [8000, 9000]
+    assert body["to"] - body["since"] >= 743 * 3600
+
+
+def test_past_a_month_is_still_refused(client):
+    answer = client.get("/history", params={"c": "b1", "ch": 0, "hours": 745, "bucket_s": 3600})
+    assert answer.status_code == 400
+    assert "hours" in answer.text
+
+
+def test_a_month_at_five_minute_buckets_is_still_too_many(client):
+    """Raising the hours cap must not let the bucket cap be walked past."""
+    answer = client.get("/history", params={"c": "b1", "ch": 0, "hours": 744, "bucket_s": 300})
+    assert answer.status_code == 400
+    assert "too many buckets" in answer.text

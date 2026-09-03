@@ -36,7 +36,9 @@ watering.
   also means a client that keys on the name forks the pot the day it is renamed and the old name
   comes free. Refuses inconsistent merges and channel/outlet collisions), `GET /pots` (the garden with latest raw, derived %, any open
   proposal and the last handed dose with its verdict), `GET /history` (`c= ch= hours= bucket_s=`: bucketed raw counts with
-  lo/hi/n and the server's `since`/`to`, `since` on a bucket boundary, at most 2016 buckets — the chart's wire),
+  lo/hi/n and the server's `since`/`to`, `since` on a bucket boundary, `hours` up to a month and
+  at most 2016 buckets — the bucket cap is the one that bites, so a month has to be asked for
+  hourly. The chart's wire),
   `GET /doses` (`pot= limit= before= before_id=`: the watering history, newest first — what was
   asked, what the meter counted, how it ended, the verdict, and the pot attributed through its own
   mapping windows. Proposals are left out (offers, not water) and so are stops (no outlet, no
