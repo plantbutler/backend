@@ -226,3 +226,94 @@ def test_starting_on_a_live_old_database_rebuilds_it(tmp_path):
         create_app(db_path=path, token="test-token", next_s=60, cmd_ttl_s=900)
     )
     assert again.get("/pots").json()["pots"] == pots
+
+
+# --------------------------------------------------------------------------- #
+# Two container starts on one /data
+# --------------------------------------------------------------------------- #
+
+
+def overlapping_start(path, at):
+    """A connection standing in for the second of two overlapping starts.
+
+    Container Manager can leave two starts on the same /data briefly. The
+    idempotence guard is `PRAGMA table_info(pots)`, read outside any lock,
+    so both starts can pass it before either has committed; the WAL-busy
+    check does not stop that either, because it only fires while another
+    connection is actually holding a read transaction open.
+
+    This connection is the one that passed the guard and lost the race:
+    the FIRST container runs its whole rebuild, to completion, the moment
+    this one reaches `at` — "backup" just before it takes its own copy,
+    "rebuild" once it has its rows and is on its way to BEGIN IMMEDIATE.
+    """
+    first = sqlite3.connect(path, timeout=5)
+    ran = []
+
+    class SecondContainer(sqlite3.Connection):
+        def execute(self, sql, *args):
+            if at == "backup" and not ran and sql.startswith("PRAGMA wal_checkpoint"):
+                ran.append(migrate(first, path))
+            return super().execute(sql, *args)
+
+        def executescript(self, sql):
+            if at == "rebuild" and not ran:
+                ran.append(migrate(first, path))
+            return super().executescript(sql)
+
+    return sqlite3.connect(path, timeout=5, factory=SecondContainer), ran
+
+
+def test_an_overlapping_start_does_not_replace_the_backup(tmp_path):
+    """The backup is the only copy of the pre-identity garden. Written once.
+
+    The loser of the race copies the database AFTER the winner has rebuilt
+    it, so `<db>.pre-identity.bak` ends up holding an already-migrated
+    file and the garden as it was is gone — irreversibly, since the
+    rebuild rewrites every pot id.
+
+    Keep, then, rather than overwrite. An existing backup is always a
+    valid pre-identity snapshot: it is only ever written while `pots`
+    still has its `controller` column, and a rebuild that dies rolls back
+    to exactly that shape. Refusing to start would be wrong for the same
+    reason — the retry after a killed rebuild finds its own backup there.
+    """
+    path, seed = old_db(tmp_path)
+    seed.close()
+    con, ran = overlapping_start(path, at="backup")
+
+    with pytest.raises(sqlite3.OperationalError):
+        migrate(con, path)  # its own SELECT finds no `controller` any more
+    assert ran == [True]  # the other container really did rebuild
+
+    backup = sqlite3.connect(str(tmp_path / "old.db.pre-identity.bak"))
+    assert "controller" in [r[1] for r in backup.execute("PRAGMA table_info(pots)")]
+    assert backup.execute("SELECT name FROM pots ORDER BY name").fetchall() == [
+        ("basil",),
+        ("unmapped",),
+    ]
+
+
+def test_an_overlapping_start_does_not_rebuild_what_was_just_rebuilt(tmp_path):
+    """The guard has to be re-read with the write lock held, or it is a
+    suggestion.
+
+    This one takes its backup and reads the old rows before the winner
+    commits, so both are honest — and then it blocks on BEGIN IMMEDIATE,
+    wakes up, and rebuilds the winner's fresh table AGAIN from the rows it
+    read. Every pot gets a second id, and the winner's pot_mappings rows
+    are left pointing at ids that no longer exist in `pots`: the wiring is
+    orphaned and the garden loses its hoses.
+    """
+    path, seed = old_db(tmp_path)
+    seed.close()
+    con, ran = overlapping_start(path, at="rebuild")
+
+    assert migrate(con, path) is False  # the work was already done
+    assert ran == [True]
+
+    check = sqlite3.connect(path)
+    live = {i for (i,) in check.execute("SELECT id FROM pots")}
+    assert len(live) == 2
+    mapped = [p for (p,) in check.execute("SELECT pot_id FROM pot_mappings")]
+    assert mapped and [p for p in mapped if p not in live] == []

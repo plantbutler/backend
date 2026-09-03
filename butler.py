@@ -234,7 +234,28 @@ def migrate(con: sqlite3.Connection, db_path: str) -> bool:
                 "connection is holding it open, and the backup would be short"
             )
         backup = db_path + ".pre-identity.bak"
-        shutil.copyfile(db_path, backup)
+        # Created exclusively, and kept if it is already there. A backup is
+        # only ever written while `pots` still has its `controller` column,
+        # and a rebuild that dies rolls back to exactly that shape, so an
+        # existing one is always a good pre-identity copy. Reaching here a
+        # second time is a retry after a killed rebuild — or a container
+        # start that overlapped another, which would otherwise copy an
+        # ALREADY-REBUILT file over the only copy of the garden. Bailing
+        # out instead of keeping would lose the other way: the retry after
+        # a kill has to be able to finish.
+        try:
+            with open(backup, "xb") as copy, open(db_path, "rb") as live:
+                shutil.copyfileobj(live, copy)
+        except FileExistsError:
+            print(
+                f"a backup is already at {backup}: keeping it, not rewriting it",
+                file=sys.stderr,
+            )
+        except BaseException:
+            # A half-written backup would be kept by every later run.
+            with contextlib.suppress(OSError):
+                os.unlink(backup)
+            raise
     rows = con.execute(
         f"SELECT {', '.join(_OLD_POT_COLUMNS)} FROM pots ORDER BY id"
     ).fetchall()
@@ -245,6 +266,16 @@ def migrate(con: sqlite3.Connection, db_path: str) -> bool:
     con.executescript(SCHEMA_SQL)
     con.execute("BEGIN IMMEDIATE")
     with con:
+        # The guard again, this time with the write lock held. The one at
+        # the top of this function is read outside any lock, so two
+        # container starts on the same /data — Container Manager can leave
+        # two overlapping briefly — both pass it, and the one that waits
+        # here for the lock would wake up and rebuild the winner's fresh
+        # table a second time from the rows it read before, minting new
+        # ids and orphaning the winner's pot_mappings rows against ids
+        # that no longer exist.
+        if "controller" not in [r[1] for r in con.execute("PRAGMA table_info(pots)")]:
+            return False
         # One transaction, DDL included (sqlite rolls that back like any
         # other statement). A container killed mid-rebuild — a NAS reboot, an
         # OOM kill, a power cut — must come back with the old table intact
