@@ -2,10 +2,12 @@
 
 import sqlite3
 import time
+import types
 
 import pytest
 from fastapi.testclient import TestClient
 
+import butler
 from butler import create_app, in_quiet, parse_quiet, parse_report
 
 TOKEN = "test-token"
@@ -44,6 +46,7 @@ def make_pot(client, drop=None, **over):
     body = " ".join(f"{k}={v}" for k, v in fields.items())
     answer = client.post("/pot", content=body, headers={"X-Token": TOKEN})
     assert answer.status_code == 200, answer.text
+    return answer.text.split()[0].removeprefix("pot=")
 
 
 def report(client, raw=DRY, safe=True, extra="", token=TOKEN):
@@ -60,6 +63,14 @@ def soak(client, n, raw=DRY, safe=True):
     for _ in range(n):
         last = report(client, raw, safe)
     return last
+
+
+def soak_both(client, n):
+    """Reports carrying ch0 and ch1, so a pot whose sensor channel is
+    corrected mid-test keeps reading a channel that is actually there: a
+    silent channel is skipped by the ladder before any gate is reached."""
+    for _ in range(n):
+        report(client, extra=f"ch1={DRY}")
 
 
 def commands(db):
@@ -426,3 +437,264 @@ def test_verdict_refusals(client, db):
     assert post(client, "/verdict", "cmd=1").status_code == 400
     assert post(client, "/verdict", "verdict=ok").status_code == 400
     assert post(client, "/verdict", "cmd=1 verdict=ok", token="nope").status_code == 401
+
+
+# --------------------------------------------------------------------------- #
+# Remapping: the dose belongs to the pot, not to the hose
+# --------------------------------------------------------------------------- #
+
+
+def rewind(db, seconds):
+    """Everything that has happened so far moves that far into the past.
+
+    Mapping windows and commands are stamped in whole seconds and a test
+    runs in milliseconds, so without this the pot is created, watered and
+    remapped at one single timestamp and every window boundary is also
+    the dose. Real gardens are not repotted in the second the pump runs.
+    """
+    with sqlite3.connect(db) as con:
+        con.execute(
+            "UPDATE commands SET created_ts = created_ts - ?, "
+            "sent_ts = sent_ts - ?, acked_ts = acked_ts - ?",
+            (seconds, seconds, seconds),
+        )
+        con.execute(
+            "UPDATE pot_mappings SET from_ts = from_ts - ?, to_ts = to_ts - ?",
+            (seconds, seconds),
+        )
+
+
+def cards(client):
+    return {p["name"]: p for p in client.get("/pots").json()["pots"]}
+
+
+def test_a_dose_stays_with_the_pot_when_the_hoses_are_swapped(client, db):
+    """Whose dose was it? The pot that was on that hose when it was handed.
+
+    Otherwise the verdict the app files from mint's card — the learning
+    log adaptive dosing will be fit on — judges mint's soil against the
+    dose basil got.
+    """
+    basil = make_pot(client)
+    soak(client, 5)  # basil waters on outlet 3
+    report(client, extra="ack=1 flow_ml=97")
+    rewind(db, 3600)  # an hour later, the hoses are swapped
+
+    post(client, "/pot", f"id={basil} channel=1 outlet=4")
+    post(client, "/pot", "name=mint controller=b1 channel=0 outlet=3")
+
+    assert cards(client)["basil"]["last_dose"]["id"] == 1
+    assert cards(client)["mint"]["last_dose"] is None  # mint was never watered
+
+
+def test_a_water_now_on_a_hose_the_pot_has_left_is_not_its_dose(client, db):
+    """The sentence the README owes the app's author, pinned.
+
+    `last_dose` is not "the newest command on that hose": basil is dosed
+    on outlet 3, then moves to outlet 4 while mint takes outlet 3, and the
+    water-now that goes down outlet 3 next is MINT's. A client written to
+    the older wording files basil's verdict against mint's soil — into the
+    log adaptive dosing will one day be fit on.
+    """
+    basil = make_pot(client)
+    soak(client, 5)
+    report(client, extra="ack=1 flow_ml=97")  # cmd 1: basil's, on outlet 3
+    rewind(db, 3600)  # an hour later the hoses are rearranged
+
+    post(client, "/pot", f"id={basil} channel=1 outlet=4")
+    post(client, "/pot", "name=mint controller=b1 channel=0 outlet=3")
+    post(client, "/command", "c=b1 water=3 ml=50 cap_s=5")
+    report(client, extra=f"ch1={DRY}")  # cmd 2 handed out, down outlet 3
+
+    assert cards(client)["basil"]["last_dose"]["id"] == 1
+    assert cards(client)["mint"]["last_dose"]["id"] == 2
+
+
+def test_a_proposal_is_not_inherited_by_the_next_pot_on_the_hose(client, db):
+    """A proposal is an offer to open a hose, so it does not travel with the
+    pot either — and the pot that arrives on that hose must not be offered
+    a dose that was sized for someone else's dryness."""
+    basil = make_pot(client, mode="learning")
+    soak(client, 5)  # proposal 1, for basil, on outlet 3
+    rewind(db, 3600)
+
+    post(client, "/pot", f"id={basil} outlet=4")
+    post(client, "/pot", "name=mint controller=b1 channel=1 outlet=3")
+
+    assert cards(client)["mint"]["proposal"] is None
+    assert cards(client)["basil"]["proposal"] is None  # not on that hose now
+
+
+def test_the_cooldown_stays_with_the_pot_when_its_hose_moves(client, db):
+    """The six hours belong to the plant, not to the plumbing. Watering a
+    pot and then moving its hose must not water it twice.
+
+    No rewind here on purpose: the remap lands in the very second of the
+    dose, which is the one genuinely ambiguous point of the window, and
+    the gates have to read that ambiguity as "watered" in both directions.
+    """
+    basil = make_pot(client)  # auto, outlet 3, default 6 h cooldown
+    soak(client, 5)
+    report(client, extra="ack=1 flow_ml=97")
+
+    post(client, "/pot", f"id={basil} outlet=4")
+
+    soak(client, 6)  # still bone dry, still freshly watered
+    assert len(commands(db)) == 1
+
+
+def test_the_daily_cap_stays_with_the_pot_when_its_hose_moves(client, db):
+    """The same, for the millilitres: a remap is not a fresh allowance."""
+    basil = make_pot(client, cooldown_h=0, daily_cap_ml=150)
+    soak(client, 5)
+    report(client, extra="ack=1 flow_ml=100")
+
+    post(client, "/pot", f"id={basil} outlet=4")
+
+    soak(client, 6)  # 100 + 100 > 150 wherever the hose hangs
+    assert len(commands(db)) == 1
+
+
+def test_a_proposal_survives_a_correction_that_leaves_the_hose_alone(client, db):
+    """A proposal is about a HOSE, and fixing a miswired sensor channel does
+    not move the hose. It opens a new mapping window all the same, and if
+    the offer is bound to that window it silently leaves the card — while
+    its 'proposed' row goes on holding the hose slot, so nothing can be
+    approved and nothing else can be proposed until it times out.
+    """
+    basil = make_pot(client, mode="learning")
+    soak(client, 5)  # proposal 1, for basil, on outlet 3
+    rewind(db, 600)  # ten minutes later the sensor channel is corrected
+
+    post(client, "/pot", f"id={basil} channel=1")
+
+    assert cards(client)["basil"]["proposal"]["id"] == 1
+
+
+def test_a_remap_in_the_second_of_a_dose_spends_the_cap_once(client, db):
+    """Both ends of the mapping window are inclusive on purpose, so a dose
+    handed in the very second of a remap is held by the pot that left AND
+    by the pot that arrived — two pots waiting errs dry.
+
+    When the remap leaves the hose alone, though — a miswired sensor
+    channel corrected — those two windows belong to the SAME pot, the dose
+    matches both, and the daily cap SUMs it twice. One 100 ml dose spends
+    200 of the allowance and the pot is refused for the rest of the day.
+    """
+    basil = make_pot(client, cooldown_h=0, daily_cap_ml=250)
+    soak_both(client, 5)  # cmd 1: 100 ml on outlet 3, handed out
+    rewind(db, 600)  # so the first window is a real one, not a single second
+
+    post(client, "/pot", f"id={basil} channel=1")  # the sensor was miswired
+    with sqlite3.connect(db) as con:
+        # Put the dose on the boundary the remap wrote as the old window's
+        # to_ts and the new one's from_ts: the one ambiguous second.
+        (edge,) = con.execute(
+            "SELECT from_ts FROM pot_mappings WHERE pot_id = ? AND to_ts IS NULL",
+            (basil,),
+        ).fetchone()
+        con.execute(
+            "UPDATE commands SET state = 'acked', sent_ts = ?, acked_ts = ?, "
+            "flow_ml = 100 WHERE id = 1",
+            (edge, edge),
+        )
+
+    soak_both(client, 6)  # 100 ml of 250 spent, so the next 100 ml fits
+    assert len(commands(db)) == 2
+
+
+# --------------------------------------------------------------------------- #
+# Attribution can fail; the gates cannot
+# --------------------------------------------------------------------------- #
+
+
+def prime_the_line_by_hand(client, db, ml=120):
+    """A dose on b1/outlet 3 that no pot can claim, a minute in the past.
+
+    Setup day: the operator primes the line before anything is registered,
+    so when the pot that hangs on that hose is saved a minute later, its
+    first mapping window starts AFTER the dose and no window of its own
+    holds it. The same shape arrives without a human when the server clock
+    steps while the wiring is being saved.
+    """
+    post(client, "/command", f"c=b1 water=3 ml={ml}")
+    report(client)  # the board is handed it
+    report(client, extra=f"ack=1 flow_ml={ml}")
+    with sqlite3.connect(db) as con:
+        con.execute(
+            "UPDATE commands SET created_ts = created_ts - 60, "
+            "sent_ts = sent_ts - 60, acked_ts = acked_ts - 60"
+        )
+
+
+def test_a_dose_the_pot_cannot_claim_still_holds_its_cooldown(client, db):
+    """A dose that matches no mapping window is a dose that happened.
+
+    Attribution is a lookup, and a lookup can come back empty for reasons
+    that have nothing to do with the plant being dry: a hand dose before
+    the pot was ever registered, a clock that stepped while the wiring was
+    saved. Reading that emptiness as "never watered" is fail-OPEN, and
+    decision #5 says unknown state makes watering less likely, not more.
+    So the pot-keyed gate has the old hose-keyed one underneath it: 120 ml
+    went down this hose a minute ago, whoever it belonged to.
+    """
+    prime_the_line_by_hand(client, db)
+    make_pot(client)  # auto, outlet 3, default 6 h cooldown
+
+    soak(client, 8)  # bone dry, and the ladder wants to water
+
+    assert len(commands(db)) == 1
+
+
+def test_a_dose_the_pot_cannot_claim_still_spends_its_daily_cap(client, db):
+    """The same, for the millilitres. With the cooldown switched off, the
+    cap is the only gate left, and 120 unattributable millilitres plus a
+    100 ml dose is over an allowance of 150."""
+    prime_the_line_by_hand(client, db)
+    make_pot(client, cooldown_h=0, daily_cap_ml=150)
+
+    soak(client, 8)
+
+    assert len(commands(db)) == 1
+
+
+def test_a_backwards_clock_step_at_a_remap_does_not_reopen_the_cooldown(
+    client, db, monkeypatch
+):
+    """The gates read pot_mappings now, so a corrupt window is a wet pot.
+
+    A container that starts before NTP has synced runs on a clock that
+    steps backwards a moment later. Save the wiring, take the step, move
+    the hose: the window that closes is stamped before it opened, matches
+    nothing, and the dose inside it stops belonging to the pot. The hose
+    floor cannot catch this one — the pot is on a different hose now, and
+    that hose has no history of its own.
+
+    Nor is `to_ts = max(now, from_ts)` enough. The pot was wired ten
+    minutes before it was watered, so a window clamped only to its own
+    start still ends before the dose it holds.
+    """
+    basil = make_pot(client)  # auto, outlet 3, default 6 h cooldown
+    soak(client, 5)
+    report(client, extra="ack=1 flow_ml=100")
+    with sqlite3.connect(db) as con:
+        # basil was wired ten minutes before the pump ran, not in the same
+        # second: the dose sits strictly inside its window.
+        con.execute(
+            "UPDATE pot_mappings SET from_ts = from_ts - 600 WHERE pot_id = ?",
+            (basil,),
+        )
+
+    monkeypatch.setattr(  # NTP corrects the host two hours backwards
+        butler,
+        "time",
+        types.SimpleNamespace(
+            time=lambda: time.time() - 7200, localtime=time.localtime
+        ),
+    )
+    post(client, "/pot", f"id={basil} outlet=4")
+    monkeypatch.undo()
+
+    soak(client, 8)  # bone dry, minutes into a six-hour cooldown
+
+    assert len(commands(db)) == 1

@@ -68,6 +68,8 @@ import contextlib
 import hmac
 import http.client
 import os
+import secrets
+import shutil
 import sqlite3
 import sys
 import time
@@ -144,8 +146,171 @@ class Alert(NamedTuple):
     record: Callable | None = None
 
 
+SCHEMA_SQL = (Path(__file__).parent / "schema.sql").read_text()
+
+
 def hhmm(ts: int) -> str:
     return time.strftime("%H:%M", time.localtime(ts))
+
+
+def new_pot_id() -> str:
+    """A pot's identity, in the plan tool's own style: `pot-3f9a21`.
+
+    Random rather than sequential so it can be minted anywhere and never
+    encodes an order that means nothing.
+    """
+    return "pot-" + secrets.token_hex(3)
+
+
+# The columns the old pots table carried, in its own order, so the rebuild
+# reads a 0.7.0 database without guessing.
+_OLD_POT_COLUMNS = (
+    "name",
+    "controller",
+    "channel",
+    "outlet",
+    "plant_type",
+    "plant_size",
+    "pot_size",
+    "soil",
+    "dry_raw",
+    "wet_raw",
+    "target_low_pct",
+    "target_high_pct",
+    "dose_ml",
+    "mode",
+    "cooldown_h",
+    "daily_cap_ml",
+    "enabled",
+)
+
+
+def _pots_ddl() -> list[str]:
+    """The CREATE for `pots` and for `pots_now`, taken from schema.sql itself.
+
+    The rebuild drops both and has to put them back inside its own
+    transaction, where executescript() cannot go (it commits first). Rather
+    than keep a second copy of the DDL here — to drift from the schema file
+    the day a column is added — let sqlite parse schema.sql in a scratch
+    database and hand back exactly what it made.
+    """
+    scratch = sqlite3.connect(":memory:")
+    scratch.executescript(SCHEMA_SQL)
+    ddl = [
+        sql
+        for (sql,) in scratch.execute(
+            "SELECT sql FROM sqlite_master WHERE name IN ('pots', 'pots_now') "
+            "ORDER BY type"  # 'table' before 'view': the view reads the table
+        )
+    ]
+    scratch.close()
+    return ddl
+
+
+def migrate(con: sqlite3.Connection, db_path: str) -> bool:
+    """The one-time rebuild of `pots`, run at startup. Returns True if it ran.
+
+    `schema.sql` is additive by rule and cannot retype a primary key, which
+    is what turning the integer id into `pot-xxxxxx` needs. This is that
+    exception, taken once and deliberately: copy into the new shape, move
+    the wiring into pot_mappings with from_ts 0 so no history is orphaned,
+    then swap. Idempotent — an already-migrated database is recognised by
+    the pots table having no `controller` column.
+    """
+    cols = [r[1] for r in con.execute("PRAGMA table_info(pots)")]
+    if not cols or "controller" not in cols:
+        return False  # fresh database, or already rebuilt
+    backup = None
+    if db_path != ":memory:":
+        # The live database is WAL, so recent commits sit in the -wal file
+        # and a plain copy of the main file would back up everything except
+        # what is most at risk. Checkpoint first, and refuse the whole
+        # rebuild if anything is holding the log open: a deferred migration
+        # is recoverable, a DROP behind a blank backup is not.
+        busy, *_ = con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if busy:
+            raise sqlite3.OperationalError(
+                "cannot checkpoint the WAL before rebuilding pots: another "
+                "connection is holding it open, and the backup would be short"
+            )
+        backup = db_path + ".pre-identity.bak"
+        # Created exclusively, and kept if it is already there. A backup is
+        # only ever written while `pots` still has its `controller` column,
+        # and a rebuild that dies rolls back to exactly that shape, so an
+        # existing one is always a good pre-identity copy. Reaching here a
+        # second time is a retry after a killed rebuild — or a container
+        # start that overlapped another, which would otherwise copy an
+        # ALREADY-REBUILT file over the only copy of the garden. Bailing
+        # out instead of keeping would lose the other way: the retry after
+        # a kill has to be able to finish.
+        try:
+            with open(backup, "xb") as copy, open(db_path, "rb") as live:
+                shutil.copyfileobj(live, copy)
+        except FileExistsError:
+            print(
+                f"a backup is already at {backup}: keeping it, not rewriting it",
+                file=sys.stderr,
+            )
+        except BaseException:
+            # A half-written backup would be kept by every later run.
+            with contextlib.suppress(OSError):
+                os.unlink(backup)
+            raise
+    rows = con.execute(
+        f"SELECT {', '.join(_OLD_POT_COLUMNS)} FROM pots ORDER BY id"
+    ).fetchall()
+    # Everything the new shape needs except `pots` and its view — the
+    # pot_mappings table and every index — arrives here, before the rebuild
+    # opens its transaction, because executescript() commits and would
+    # otherwise split it in two.
+    con.executescript(SCHEMA_SQL)
+    con.execute("BEGIN IMMEDIATE")
+    with con:
+        # The guard again, this time with the write lock held. The one at
+        # the top of this function is read outside any lock, so two
+        # container starts on the same /data — Container Manager can leave
+        # two overlapping briefly — both pass it, and the one that waits
+        # here for the lock would wake up and rebuild the winner's fresh
+        # table a second time from the rows it read before, minting new
+        # ids and orphaning the winner's pot_mappings rows against ids
+        # that no longer exist.
+        if "controller" not in [r[1] for r in con.execute("PRAGMA table_info(pots)")]:
+            return False
+        # One transaction, DDL included (sqlite rolls that back like any
+        # other statement). A container killed mid-rebuild — a NAS reboot, an
+        # OOM kill, a power cut — must come back with the old table intact
+        # and retry: an empty `pots` in the NEW shape would read to the guard
+        # above as "already migrated", and the garden would be gone for good.
+        con.execute("DROP VIEW IF EXISTS pots_now")
+        con.execute("DROP TABLE pots")
+        for ddl in _pots_ddl():
+            con.execute(ddl)
+        for row in rows:
+            old = dict(zip(_OLD_POT_COLUMNS, row))
+            pot_id = new_pot_id()
+            keys = [k for k in old if k not in ("controller", "channel", "outlet")]
+            con.execute(
+                f"INSERT INTO pots (id, {', '.join(keys)}) "
+                f"VALUES (?, {', '.join('?' * len(keys))})",
+                [pot_id, *(old[k] for k in keys)],
+            )
+            if any(old[k] is not None for k in ("controller", "channel", "outlet")):
+                con.execute(
+                    "INSERT INTO pot_mappings "
+                    "(pot_id, controller, channel, outlet, from_ts, to_ts) "
+                    "VALUES (?, ?, ?, ?, 0, NULL)",
+                    (pot_id, old["controller"], old["channel"], old["outlet"]),
+                )
+    # Say so: this runs once, unattended, and it rewrites every pot id the
+    # app and the operator were using. A silent irreversible step is one
+    # nobody can audit afterwards, and nobody would find the backup.
+    print(
+        f"rebuilt {len(rows)} pots onto random ids and moved their wiring "
+        "into pot_mappings"
+        + (f"; the database as it was is at {backup}" if backup else ""),
+        file=sys.stderr,
+    )
+    return True
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -394,7 +559,8 @@ POT_INT_FIELDS = {  # half-open bounds, like every other field
     "daily_cap_ml": (0, 100_001),
     "enabled": (0, 2),
 }
-POT_TEXT_FIELDS = ("controller", "plant_type", "plant_size", "pot_size", "soil")
+POT_TEXT_FIELDS = ("plant_type", "plant_size", "pot_size", "soil", "species")
+POT_MAP_FIELDS = ("controller", "channel", "outlet")  # pot_mappings, not pots
 POT_MODES = ("manual", "learning", "auto")
 LAST_DOSE_KEYS = (
     "id",
@@ -407,9 +573,10 @@ LAST_DOSE_KEYS = (
     "acked_ts",
     "verdict",
 )
-POT_COLUMNS = (
+POT_COLUMNS = (  # the pots_now view's shape: pot columns plus the open mapping
     "id",
     "name",
+    "species",
     "controller",
     "channel",
     "outlet",
@@ -429,16 +596,110 @@ POT_COLUMNS = (
 )
 
 
-def parse_pot(text: str) -> dict:
-    """The `POST /pot` body: `name=<pot>` plus whatever fields to set.
+def _handed_to_pot(ends: str) -> str:
+    """A FROM clause taking one parameter, the pot id: the commands this pot
+    was actually given.
 
-    A partial upsert — only the keys given change, so recalibration is
-    `name=basil dry_raw=13000 wet_raw=4200` and nothing else moves. Values
-    are single k=v tokens, so multi-word text uses underscores. Unknown
-    keys are ignored, for the same reason as everywhere else.
+    A command names a hose, not a pot, so what makes it this pot's is that
+    this pot held that hose when the board was handed it — which is what
+    pot_mappings records. A closed window keeps its doses, so moving a hose
+    takes the pot's history with it instead of leaving it for whoever
+    arrives on that hose next. Only handed commands can match: an unsent
+    one has a NULL sent_ts, and NULL >= from_ts is never true.
+    """
+    return (
+        "commands c JOIN pot_mappings m "
+        "ON m.controller = c.controller AND m.outlet = c.outlet AND m.pot_id = ? "
+        f"AND c.sent_ts >= m.from_ts AND (m.to_ts IS NULL OR c.sent_ts {ends} m.to_ts)"
+    )
+
+
+# Timestamps are whole seconds, so a dose handed in the very second a hose
+# was remapped is genuinely ambiguous, and the two readers want opposite
+# answers to it. For the record — whose dose was that, what is this verdict
+# about — exactly one pot must own it, and the window is half-open: it goes
+# to the pot that arrived. For the gates, both pots hold the cooldown and
+# spend the cap, because two pots waiting a turn they need not wait errs
+# dry, while neither of them waiting waters one of them twice.
+HANDED_TO_POT = _handed_to_pot("<")
+WATERED_THE_POT = _handed_to_pot("<=")
+
+
+def window_edge(con: sqlite3.Connection, pot_id: str, now: int) -> int:
+    """Where a pot's open mapping window closes and its next one opens.
+
+    `now`, except that the boundary is never allowed to move backwards
+    past what the database has already recorded. A window that ends before
+    it began, or before a dose it holds, matches nothing at all: the join
+    wants from_ts <= sent_ts <= to_ts, and the pot silently stops owning
+    that dose's cooldown and daily cap. Fixing the clock afterwards does
+    not rewrite the row, so unlike a clock that is merely wrong this is
+    permanent — and pot_mappings is what the watering gates read.
+
+    The server clock does step backwards: a container that starts before
+    the NAS has synced runs minutes or hours off until NTP corrects it,
+    and a wiring save on either side of that correction is ordinary. So
+    the floor is the window's own start and the newest dose that went down
+    its hose inside it. With the clock behaving, all three are `now`.
+    """
+    row = con.execute(
+        "SELECT from_ts, controller, outlet FROM pot_mappings "
+        "WHERE pot_id = ? AND to_ts IS NULL",
+        (pot_id,),
+    ).fetchone()
+    if row is None:
+        return now
+    from_ts, controller, outlet = row
+    (dosed,) = con.execute(
+        "SELECT COALESCE(MAX(sent_ts), 0) FROM commands "
+        "WHERE controller IS ? AND outlet IS ? AND sent_ts >= ?",
+        (controller, outlet, from_ts),
+    ).fetchone()
+    return max(now, from_ts, dosed)
+
+
+def _hose_since(pot: str, controller: str, outlet: str) -> str:
+    """A scalar SQL expression: when this pot's HOSE last changed.
+
+    A dose belongs to a pot and travels with it, but a proposal is an offer
+    to open a hose, so it counts only while this pot is still the one on
+    that hose. The open mapping window is the wrong fence for that: a
+    correction to the sensor CHANNEL closes it and opens another without
+    the hose having moved anywhere, and a pending proposal would silently
+    leave the card while its 'proposed' row went on holding the hose slot.
+
+    So: the start of the contiguous run of this pot's windows that share
+    its current (controller, outlet). Windows are contiguous by
+    construction — a remap closes the open row and opens the next in the
+    same second — so that start is the last time a window of this pot
+    named a DIFFERENT hose, and the pot's first window when none ever did.
+    The three arguments are SQL expressions naming the pot and its current
+    hose, never values off the wire.
+    """
+    return (
+        "COALESCE("
+        f"(SELECT MAX(w.to_ts) FROM pot_mappings w WHERE w.pot_id = {pot} "
+        f"AND (w.controller IS NOT {controller} OR w.outlet IS NOT {outlet})), "
+        f"(SELECT MIN(w.from_ts) FROM pot_mappings w WHERE w.pot_id = {pot}), "
+        "0)"
+    )
+
+
+def parse_pot(text: str) -> dict:
+    """The `POST /pot` body: which pot, plus whatever fields to set.
+
+    An `id=` is an EDIT of that pot — name included, so renaming is an
+    ordinary field edit and no history is orphaned by it. A bare `name=`
+    is a create, and mints an id.
+
+    A partial upsert either way — only the keys given change, so
+    recalibration is `id=pot-3f9a21 dry_raw=13000 wet_raw=4200` and
+    nothing else moves. Values are single k=v tokens, so multi-word text
+    uses underscores. Unknown keys are ignored, for the same reason as
+    everywhere else.
     """
     fields: dict = {}
-    known = {"name", "mode", *POT_TEXT_FIELDS, *POT_INT_FIELDS}
+    known = {"id", "name", "mode", "controller", *POT_TEXT_FIELDS, *POT_INT_FIELDS}
     for token in text.split():
         key, sep, value = token.partition("=")
         if not sep or not key:
@@ -458,8 +719,8 @@ def parse_pot(text: str) -> dict:
             fields[key] = value
         else:
             fields[key] = value
-    if "name" not in fields:
-        raise ValueError("no name= in the request")
+    if "id" not in fields and "name" not in fields:
+        raise ValueError("no id= or name= in the request")
     return fields
 
 
@@ -655,10 +916,13 @@ def create_app(
             "refusing to store readings in the container layer"
         )
     db.parent.mkdir(parents=True, exist_ok=True)
-    schema = (Path(__file__).parent / "schema.sql").read_text()
     with sqlite3.connect(db) as bootstrap:
         bootstrap.execute("PRAGMA journal_mode=WAL")
-        bootstrap.executescript(schema)
+        bootstrap.executescript(SCHEMA_SQL)
+        # After the script, never before: a genuinely fresh database is
+        # already in the new shape, so migrate() sees no `controller`
+        # column on pots and returns immediately.
+        migrate(bootstrap, str(db))
 
     def connect() -> sqlite3.Connection:
         con = sqlite3.connect(db, timeout=5)
@@ -682,8 +946,8 @@ def create_app(
         if in_quiet(time.localtime(now).tm_hour, *quiet_window):
             return
         candidates = con.execute(
-            "SELECT name, channel, outlet, dry_raw, wet_raw, target_low_pct, "
-            "dose_ml, mode, cooldown_h, daily_cap_ml FROM pots "
+            "SELECT id, channel, outlet, dry_raw, wet_raw, target_low_pct, "
+            "dose_ml, mode, cooldown_h, daily_cap_ml FROM pots_now "
             "WHERE enabled = 1 AND mode IN ('learning', 'auto') "
             "AND controller = ? AND channel IS NOT NULL AND outlet IS NOT NULL "
             "AND dry_raw IS NOT NULL AND wet_raw IS NOT NULL "
@@ -692,7 +956,7 @@ def create_app(
             (r.controller,),
         ).fetchall()
         for (
-            name,
+            pot_id,
             channel,
             outlet,
             dry,
@@ -723,6 +987,11 @@ def create_app(
             median_pct = moisture_pct(window[RULES_WINDOW // 2], dry, wet)
             if median_pct is None or median_pct >= low:
                 continue
+            # Keyed on the hose, and rightly so: this one asks whether the
+            # plumbing is busy, not what this pot has had. The two gates
+            # below ask about the pot, through its mapping windows — and
+            # then about the hose anyway, as the floor no attribution
+            # failure can dig under.
             open_cmd = con.execute(
                 "SELECT 1 FROM commands WHERE controller = ? AND outlet = ? "
                 "AND state IN ('proposed', 'queued', 'sent') LIMIT 1",
@@ -732,9 +1001,22 @@ def create_app(
                 continue
             # Cooldown counts from the last command the board ever HELD
             # (sent_ts set): an expired-unacked command may still have
-            # watered, so it cools the pot just like an acked one.
+            # watered, so it cools the pot just like an acked one. It
+            # follows the pot when its hose moves — the six hours belong to
+            # the plant, and a remap that reset them would water it twice.
             cooldown_s = (cool_h if cool_h is not None else DEFAULT_COOLDOWN_H) * 3600
             watered = con.execute(
+                f"SELECT 1 FROM {WATERED_THE_POT} "
+                "WHERE COALESCE(c.acked_ts, c.sent_ts) > ? LIMIT 1",
+                (pot_id, now - cooldown_s),
+            ).fetchone() or con.execute(
+                # ...and the hose underneath it. Attribution is a lookup and
+                # a lookup can come back empty for reasons that say nothing
+                # about the plant: a dose handed before the pot was ever
+                # registered, a clock that stepped while the wiring was
+                # saved. Water went down this hose either way, so the old
+                # hose-keyed gate stays as the floor — decision #5, unknown
+                # state waters LESS, never more.
                 "SELECT 1 FROM commands WHERE controller = ? AND outlet = ? "
                 "AND sent_ts IS NOT NULL AND COALESCE(acked_ts, sent_ts) > ? "
                 "LIMIT 1",
@@ -743,12 +1025,27 @@ def create_app(
             if watered:
                 continue
             cap = cap_ml if cap_ml is not None else DEFAULT_DAILY_CAP_DOSES * dose
+            # DISTINCT because a dose handed in the very second of a remap
+            # sits in the window that closed and the one that opened, and
+            # when the remap left the hose alone both of them are this
+            # pot's: the cooldown above only asks whether a row exists, but
+            # a SUM would spend one dose's millilitres twice.
             (spent,) = con.execute(
+                "SELECT COALESCE(SUM(spent), 0) FROM ("
+                "SELECT DISTINCT c.id, COALESCE(c.flow_ml, c.ml) AS spent "
+                f"FROM {WATERED_THE_POT} WHERE c.sent_ts > ?)",
+                (pot_id, now - 86400),
+            ).fetchone()
+            # The same floor as the cooldown's, for the same reason: what
+            # this HOSE poured in the last day, whoever it was attributed
+            # to. MAX rather than a sum, because an attributed dose is
+            # counted by both queries and must be spent once.
+            (hose_spent,) = con.execute(
                 "SELECT COALESCE(SUM(COALESCE(flow_ml, ml)), 0) FROM commands "
-                "WHERE controller = ? AND outlet = ? AND sent_ts IS NOT NULL "
-                "AND sent_ts > ?",
+                "WHERE controller = ? AND outlet = ? AND sent_ts > ?",
                 (r.controller, outlet, now - 86400),
             ).fetchone()
+            spent = max(spent, hose_spent)
             if spent + dose > cap:
                 continue
             state = "proposed"
@@ -916,29 +1213,50 @@ def create_app(
             )
         return value or interval
 
-    def upsert_pot(fields: dict) -> None:
+    def upsert_pot(fields: dict) -> tuple[str, str]:
         """Create or partially update one pot, refusing inconsistent merges.
 
-        Validation runs on the MERGED row (stored values plus this
-        request), so `dry_raw=5000` today and `wet_raw=5000` tomorrow is
-        refused just like both in one request. Column names come from the
-        parse_pot whitelist, never from the wire, so building SQL from
-        them is safe.
+        `id=` edits that pot, name included, so renaming is an ordinary
+        field edit. A bare `name=` creates and mints an id. Validation runs
+        on the MERGED row, stored values plus this request, so `dry_raw`
+        today and `wet_raw` tomorrow is refused just like both at once.
+        Column names come from the parse_pot whitelist, never the wire.
+
+        Mapping keys land in pot_mappings, not pots: a changed wiring
+        closes the open row and opens another, so past readings stay
+        attributed to the pot that was actually on that channel.
         """
-        name = fields["name"]
-        sets = {k: v for k, v in fields.items() if k != "name"}
+        pot_id = fields.get("id")
+        now = int(time.time())
         with connect() as con:
             con.execute("BEGIN IMMEDIATE")
-            row = con.execute(
-                f"SELECT {', '.join(POT_COLUMNS)} FROM pots WHERE name = ?",
-                (name,),
-            ).fetchone()
+            if pot_id is not None:
+                row = con.execute(
+                    f"SELECT {', '.join(POT_COLUMNS)} FROM pots_now WHERE id = ?",
+                    (pot_id,),
+                ).fetchone()
+                if row is None:
+                    # An edit of a pot that is not there is a bug in the
+                    # caller, not an invitation to create one under a name
+                    # nobody asked for.
+                    raise ValueError(f"no pot {pot_id}")
+            else:
+                row = con.execute(
+                    f"SELECT {', '.join(POT_COLUMNS)} FROM pots_now WHERE name = ?",
+                    (fields["name"],),
+                ).fetchone()
             current = (
                 dict(zip(POT_COLUMNS, row))
                 if row
-                else dict.fromkeys(POT_COLUMNS) | {"mode": "manual", "enabled": 1}
+                else dict.fromkeys(POT_COLUMNS)
+                | {"mode": "manual", "enabled": 1, "id": new_pot_id()}
             )
+            # The id is minted into `current` before the merge, so a create
+            # and an edit take one path from here on.
+            sets = {k: v for k, v in fields.items() if k != "id"}
             merged = current | sets
+            pot_id = current["id"]
+            name = merged["name"]
             if merged["dry_raw"] is not None and merged["dry_raw"] == merged["wet_raw"]:
                 raise ValueError("dry_raw and wet_raw must differ")
             if (
@@ -947,6 +1265,13 @@ def create_app(
                 and merged["target_low_pct"] >= merged["target_high_pct"]
             ):
                 raise ValueError("target_low_pct must be below target_high_pct")
+            clash = con.execute(
+                "SELECT id FROM pots WHERE name = ? AND id != ?", (name, pot_id)
+            ).fetchone()
+            if clash:
+                # The UNIQUE index would refuse this anyway, with a message
+                # nobody outside sqlite can read.
+                raise ValueError(f"the name {name} is taken by pot {clash[0]}")
             if merged["enabled"] and merged["controller"] is not None:
                 # Two enabled pots on one sensor or one hose is a config
                 # error that would misread or miswater — refuse loudly.
@@ -954,28 +1279,52 @@ def create_app(
                     if merged[col] is None:
                         continue
                     other = con.execute(
-                        f"SELECT name FROM pots WHERE controller = ? AND {col} = ? "
-                        "AND enabled = 1 AND name != ? LIMIT 1",
-                        (merged["controller"], merged[col], name),
+                        f"SELECT name FROM pots_now WHERE controller = ? AND {col} = ? "
+                        "AND enabled = 1 AND id != ? LIMIT 1",
+                        (merged["controller"], merged[col], pot_id),
                     ).fetchone()
                     if other:
                         raise ValueError(
                             f"{col} {merged[col]} on {merged['controller']} "
                             f"is taken by pot {other[0]}"
                         )
-            if row and sets:
+            pot_sets = {k: v for k, v in sets.items() if k not in POT_MAP_FIELDS}
+            if row and pot_sets:
                 con.execute(
-                    f"UPDATE pots SET {', '.join(k + ' = ?' for k in sets)} "
-                    "WHERE name = ?",
-                    [*sets.values(), name],
+                    f"UPDATE pots SET {', '.join(k + ' = ?' for k in pot_sets)} "
+                    "WHERE id = ?",
+                    [*pot_sets.values(), pot_id],
                 )
             elif not row:
-                keys = list(fields)
+                keys = [
+                    k for k in merged if k in POT_COLUMNS and k not in POT_MAP_FIELDS
+                ]
                 con.execute(
                     f"INSERT INTO pots ({', '.join(keys)}) "
                     f"VALUES ({', '.join('?' * len(keys))})",
-                    [fields[k] for k in keys],
+                    [merged[k] for k in keys],
                 )
+            if any(k in sets for k in POT_MAP_FIELDS):
+                wiring = tuple(merged[k] for k in POT_MAP_FIELDS)
+                # Only when the wiring actually differs: otherwise saving an
+                # unrelated field would fragment the history into a row per
+                # save, and every one of those windows would be a lie.
+                if wiring != tuple(current[k] for k in POT_MAP_FIELDS):
+                    # One second for both rows, so the windows stay
+                    # contiguous — the attribution join assumes it.
+                    edge = window_edge(con, pot_id, now)
+                    con.execute(
+                        "UPDATE pot_mappings SET to_ts = ? "
+                        "WHERE pot_id = ? AND to_ts IS NULL",
+                        (edge, pot_id),
+                    )
+                    con.execute(
+                        "INSERT INTO pot_mappings "
+                        "(pot_id, controller, channel, outlet, from_ts, to_ts) "
+                        "VALUES (?, ?, ?, ?, ?, NULL)",
+                        (pot_id, *wiring, edge),
+                    )
+        return pot_id, name
 
     def approve(cmd_id: int) -> tuple | None:
         """proposed -> queued, slot permitting; returns the blocker if busy.
@@ -1169,7 +1518,7 @@ def create_app(
         # dead-man. Same threshold and observation window as the silent
         # rule; a controller that is itself silent already pages there.
         for name, controller, channel in con.execute(
-            "SELECT name, controller, channel FROM pots WHERE enabled = 1 "
+            "SELECT name, controller, channel FROM pots_now WHERE enabled = 1 "
             "AND controller IS NOT NULL AND channel IS NOT NULL ORDER BY name"
         ):
             pulse = heartbeat.get(controller)
@@ -1350,10 +1699,16 @@ def create_app(
             if acked_ts is not None and now < judge_at:
                 continue  # still soaking in; an expiry needs no wait
             key = f"dose:{cmd_id}"
+            # Whose dose this was: the pot on that hose when the board was
+            # handed it, not whoever hangs there now. After a remap the
+            # current occupant would put the wrong name on the page and
+            # have the rise judged against its own, undosed sensor.
             pot = con.execute(
-                "SELECT name, channel, dry_raw, wet_raw FROM pots "
-                "WHERE enabled = 1 AND controller = ? AND outlet = ?",
-                (controller, outlet),
+                "SELECT p.name, m.channel, p.dry_raw, p.wet_raw "
+                "FROM pot_mappings m JOIN pots p ON p.id = m.pot_id "
+                "WHERE m.controller = ? AND m.outlet = ? AND p.enabled = 1 "
+                "AND ? >= m.from_ts AND (m.to_ts IS NULL OR ? < m.to_ts)",
+                (controller, outlet, sent_ts, sent_ts),
             ).fetchone()
             name = pot[0] if pot else f"outlet {outlet}"
             symptoms: list[str] = []
@@ -1458,10 +1813,17 @@ def create_app(
             wet,
             low,
         ) in con.execute(
+            # The pot that is on the hose now AND was already on it when the
+            # proposal was made: an offer to open a hose is not something
+            # the next pot along inherits, and /pots stops showing it too.
+            # Since it was on the HOSE, not since its wiring last changed —
+            # correcting a sensor channel must not mute the nudge.
             "SELECT c.controller, c.outlet, c.id, c.ml, c.created_ts, p.name, "
-            "p.channel, p.dry_raw, p.wet_raw, p.target_low_pct FROM commands c "
-            "JOIN pots p ON p.controller = c.controller "
-            "AND p.outlet = c.outlet AND p.enabled = 1 "
+            "m.channel, p.dry_raw, p.wet_raw, p.target_low_pct FROM commands c "
+            "JOIN pot_mappings m ON m.controller = c.controller "
+            "AND m.outlet = c.outlet AND m.to_ts IS NULL "
+            f"AND c.created_ts >= {_hose_since('m.pot_id', 'm.controller', 'm.outlet')} "
+            "JOIN pots p ON p.id = m.pot_id AND p.enabled = 1 "
             "WHERE c.state = 'proposed' AND c.created_ts >= ? ORDER BY c.id",
             (now - PROPOSAL_TTL_S,),
         ):
@@ -1702,12 +2064,12 @@ def create_app(
         except (UnicodeDecodeError, ValueError) as why:
             return PlainTextResponse(f"refused: {why}\n", status_code=400)
         try:
-            await run_in_threadpool(upsert_pot, parsed)
+            pot_id, name = await run_in_threadpool(upsert_pot, parsed)
         except ValueError as why:
             return PlainTextResponse(f"refused: {why}\n", status_code=400)
         except sqlite3.OperationalError as why:
             return PlainTextResponse(f"try again: {why}\n", status_code=503)
-        return PlainTextResponse(f"pot={parsed['name']}\n")
+        return PlainTextResponse(f"pot={pot_id} name={name}\n")
 
     @app.post("/approve")
     async def approve_proposal(request: Request):
@@ -1757,7 +2119,7 @@ def create_app(
             with connect() as con:
                 garden = []
                 for row in con.execute(
-                    f"SELECT {', '.join(POT_COLUMNS)} FROM pots ORDER BY name"
+                    f"SELECT {', '.join(POT_COLUMNS)} FROM pots_now ORDER BY name"
                 ):
                     entry = dict(zip(POT_COLUMNS, row))
                     entry["raw"] = entry["read_ts"] = entry["pct"] = None
@@ -1775,37 +2137,50 @@ def create_app(
                             )
                     entry["proposal"] = entry["last_dose"] = None
                     if entry["controller"] is not None and entry["outlet"] is not None:
+                        # An offer to open a hose, so unlike the dose below
+                        # it does NOT travel with the pot: it counts only
+                        # while this pot is still the one on that hose, and
+                        # a proposal older than this pot's arrival there was
+                        # sized for whoever hung there before. Fenced on the
+                        # hose, not on the open window — see _hose_since.
                         prop = con.execute(
                             "SELECT id, ml, cap_s, created_ts FROM commands "
                             "WHERE controller = ? AND outlet = ? "
                             "AND state = 'proposed' AND created_ts >= ? "
+                            f"AND created_ts >= {_hose_since('?', '?', '?')} "
                             "ORDER BY id LIMIT 1",
                             (
                                 entry["controller"],
                                 entry["outlet"],
                                 int(time.time()) - PROPOSAL_TTL_S,
+                                entry["id"],
+                                entry["controller"],
+                                entry["outlet"],
+                                entry["id"],
                             ),
                         ).fetchone()
                         if prop:
                             entry["proposal"] = dict(
                                 zip(("id", "ml", "cap_s", "created_ts"), prop)
                             )
-                        # The newest dose handed to the board on this hose,
-                        # with its human verdict: the id POST /verdict needs
-                        # was otherwise visible only in the log. One row on
-                        # the commands_by_outlet index.
-                        dose = con.execute(
-                            "SELECT c.id, c.ml, c.cap_s, c.flow_ml, c.state, "
-                            "c.source, c.sent_ts, c.acked_ts, v.verdict "
-                            "FROM commands c "
-                            "LEFT JOIN verdicts v ON v.command_id = c.id "
-                            "WHERE c.controller = ? AND c.outlet = ? "
-                            "AND c.kind = 'water' AND c.sent_ts IS NOT NULL "
-                            "ORDER BY c.sent_ts DESC, c.id DESC LIMIT 1",
-                            (entry["controller"], entry["outlet"]),
-                        ).fetchone()
-                        if dose:
-                            entry["last_dose"] = dict(zip(LAST_DOSE_KEYS, dose))
+                    # The newest dose this pot was ever handed, with its
+                    # human verdict: the id POST /verdict needs was
+                    # otherwise visible only in the log. Through the pot's
+                    # own windows, so moving a hose takes the history with
+                    # it instead of filing it under the next pot along —
+                    # which would judge one pot's soil against another
+                    # pot's dose, in the table the learning log is made of.
+                    dose = con.execute(
+                        f"SELECT c.id, c.ml, c.cap_s, c.flow_ml, c.state, "
+                        f"c.source, c.sent_ts, c.acked_ts, v.verdict "
+                        f"FROM {HANDED_TO_POT} "
+                        "LEFT JOIN verdicts v ON v.command_id = c.id "
+                        "WHERE c.kind = 'water' "
+                        "ORDER BY c.sent_ts DESC, c.id DESC LIMIT 1",
+                        (entry["id"],),
+                    ).fetchone()
+                    if dose:
+                        entry["last_dose"] = dict(zip(LAST_DOSE_KEYS, dose))
                     garden.append(entry)
         except sqlite3.OperationalError as why:
             return PlainTextResponse(f"try again: {why}\n", status_code=503)

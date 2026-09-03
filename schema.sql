@@ -2,6 +2,13 @@
 -- CREATE IF NOT EXISTS lines with the pitch that needs them (no migrations
 -- framework, per the plan's no-gos). Raw counts are kept forever; percentages
 -- are derived at read time and never stored.
+--
+-- One exception exists, and only one: butler.migrate() rebuilds `pots` at
+-- startup to retype its primary key and move the wiring into pot_mappings,
+-- which no CREATE IF NOT EXISTS can do. It runs once per database, in one
+-- transaction, and leaves <db>.pre-identity.bak behind. Anything else that
+-- needs a shape change on a live database is a new table, not a second one
+-- of those.
 
 CREATE TABLE IF NOT EXISTS readings (
   ts         INTEGER NOT NULL,  -- server arrival time, unix seconds
@@ -53,19 +60,22 @@ CREATE TABLE IF NOT EXISTS controllers (
   next_s     INTEGER
 );
 
--- Pots, plants and calibration (cycle 2). One row per pot: the channel ->
--- outlet -> pot -> plant mapping, the two calibration numbers, the
--- Planta-style descriptive fields, and the knobs the watering rules will
--- read later. One table until that hurts. Percentages are derived at read
--- time from (dry_raw, wet_raw) and never stored, so recalibrating
--- reinterprets history instead of losing it.
+-- Pots, plants and calibration (cycle 2). One row per pot: the two
+-- calibration numbers, the Planta-style descriptive fields, and the knobs
+-- the watering rules read. Percentages are derived at read time from
+-- (dry_raw, wet_raw) and never stored, so recalibrating reinterprets
+-- history instead of losing it.
+
+-- The id is a random `pot-xxxxxx`, stable for the life of the pot, and the
+-- only thing anything else keys on; the name is a nickname and may be
+-- edited. The physical wiring is NOT here: it lives in pot_mappings with a
+-- validity window, so remapping reinterprets history instead of misfiling
+-- it, exactly as recalibration reinterprets percentages.
 
 CREATE TABLE IF NOT EXISTS pots (
-  id              INTEGER PRIMARY KEY,
-  name            TEXT    NOT NULL UNIQUE,
-  controller      TEXT,     -- where its sensor reports from
-  channel         INTEGER,  -- chN in that controller's reports
-  outlet          INTEGER,  -- flat outlet index its hose hangs on
+  id              TEXT    PRIMARY KEY,      -- pot-3f9a21, minted once
+  name            TEXT    NOT NULL UNIQUE,  -- nickname, editable
+  species         TEXT,                     -- what the care lookup keys on
   plant_type      TEXT,     -- descriptive, Planta-style
   plant_size      TEXT,
   pot_size        TEXT,
@@ -80,6 +90,41 @@ CREATE TABLE IF NOT EXISTS pots (
   daily_cap_ml    INTEGER,
   enabled         INTEGER NOT NULL DEFAULT 1
 );
+
+-- Where a pot was wired, and when. Exactly one open row per pot (to_ts IS
+-- NULL) is its mapping now; a remap closes the open row and opens another.
+-- from_ts 0 means "since before this table existed", which is what the
+-- rebuild writes, so the whole of history stays attributed.
+
+CREATE TABLE IF NOT EXISTS pot_mappings (
+  pot_id     TEXT    NOT NULL,
+  controller TEXT,     -- where its sensor reports from
+  channel    INTEGER,  -- chN in that controller's reports
+  outlet     INTEGER,  -- flat outlet index its hose hangs on
+  from_ts    INTEGER NOT NULL,
+  to_ts      INTEGER   -- NULL while this is the current wiring
+);
+
+CREATE INDEX IF NOT EXISTS pot_mappings_open
+  ON pot_mappings (pot_id, to_ts);
+
+CREATE INDEX IF NOT EXISTS pot_mappings_by_channel
+  ON pot_mappings (controller, channel, from_ts);
+
+CREATE INDEX IF NOT EXISTS pot_mappings_by_outlet
+  ON pot_mappings (controller, outlet, from_ts);
+
+-- Every reader that wants "the pot as it is wired right now" reads this and
+-- gets the column shape the pots table used to have.
+
+CREATE VIEW IF NOT EXISTS pots_now AS
+SELECT p.id, p.name, p.species,
+       m.controller, m.channel, m.outlet,
+       p.plant_type, p.plant_size, p.pot_size, p.soil,
+       p.dry_raw, p.wet_raw, p.target_low_pct, p.target_high_pct,
+       p.dose_ml, p.mode, p.cooldown_h, p.daily_cap_ml, p.enabled
+  FROM pots p
+  LEFT JOIN pot_mappings m ON m.pot_id = p.id AND m.to_ts IS NULL;
 
 -- Rules that water (cycle 2). Proposals live in the commands table as
 -- state 'proposed' (source 'rules'); verdicts are the learning log — one

@@ -29,10 +29,12 @@ watering.
   answers `next=` plus at most one `cmd=` line), `POST /command` (queue `water=<outlet>
   ml= [cap_s=]` or `stop=1`, one slot per controller, 409 when busy; a missing cap_s is sized
   by `cap_for`, the one owner of FLOW_FLOOR_ML_S), `POST /interval`
-  (per-controller `next=` override, 0 clears), `POST /pot` (partial upsert by name: mapping,
-  calibration, Planta-style fields, rules knobs; refuses inconsistent merges and channel/outlet
-  collisions), `GET /pots` (the garden with latest raw, derived %, any open proposal and the last handed
-  dose with its verdict), `GET /history` (`c= ch= hours= bucket_s=`: bucketed raw counts with
+  (per-controller `next=` override, 0 clears), `POST /pot` (partial upsert keyed on `id=`, the
+  `pot-xxxxxx` a bare `name=` create mints and every answer carries; mapping, calibration,
+  Planta-style fields, rules knobs; a `name=` save is a CREATE when that name is free, so a
+  client that keys on the name forks the pot the day it is renamed; refuses inconsistent merges
+  and channel/outlet collisions), `GET /pots` (the garden with latest raw, derived %, any open
+  proposal and the last handed dose with its verdict), `GET /history` (`c= ch= hours= bucket_s=`: bucketed raw counts with
   lo/hi/n and the server's `since`/`to`, `since` on a bucket boundary, at most 2016 buckets — the chart's wire),
   `POST /approve` (proposed -> queued, slot permitting), `POST /verdict` (ok | too_much |
   too_little per executed dose), `GET /health` (count, last ts, the default interval, per-controller
@@ -59,18 +61,28 @@ watering.
   next report's `ack=<id> flow_ml=`; a no-ack report or the TTL expires it. Expired is gone —
   ask again. The commands table is never pruned: it doubles as the watering history.
 - `schema.sql` — additive-only DDL: `readings`, `commands`, `controllers`, `pots`,
-  `verdicts` + indexes. Proposals are commands in state 'proposed'; the verdict log is the
-  dataset adaptive dosing will one day fit on.
+  `pot_mappings`, the `pots_now` view, `verdicts`, `status`, `alerts` + indexes. Proposals are
+  commands in state 'proposed'; the verdict log is the dataset adaptive dosing will one day fit
+  on. A pot is a `pot-xxxxxx` id and a nickname; its wiring (controller, channel, outlet) is NOT
+  in `pots` but in `pot_mappings`, one row per period with a half-open [from_ts, to_ts) window,
+  and every reader asks the `pots_now` view for the pot as it is wired right now. `from_ts` 0
+  means "since before that table existed". The one exception to additive-only is
+  `butler.migrate()`: a one-time rebuild that retypes the old integer `pots.id` and moves the
+  wiring out, run at startup, idempotent, inside a single transaction, leaving the database as
+  it was at `<db>.pre-identity.bak` and one line on stderr saying so.
   Moisture % is derived at read time from each pot's (dry_raw, wet_raw), never stored:
-  recalibrating reinterprets history instead of losing it.
+  recalibrating reinterprets history instead of losing it. A dose is attributed the same way,
+  through the windows: whose dose it was, whose cooldown and daily cap it spends, and which pot
+  a dose alert names all follow the pot, not the hose.
   `Dockerfile` — python-slim, port 9380, `/data` volume. `tests/` — the endpoints' contracts,
   `uv run pytest`.
 - `fake_device.py` — stdlib board simulator: reports on the `next=` beat, executes the one
   command a response carries, acks it on the following report. `python fake_device.py --token
   dev --cycles 3` against a local uvicorn or the NAS.
 - Pitches 1-4 (through the alerts) are deployed (2026-09-01; 0.7.0 with `last_dose`, `next_default`,
-  `/history` and the optional `cap_s` on 2026-09-02): container `plantbutler` on the NAS, port
-  9380, image `plantbutler-backend:0.7.0` shipped via `docker save | ssh docker load` over the tailnet, database on `/volume1/docker/plantbutler/data`, secrets in `deploy.env` beside it
+  `/history` and the optional `cap_s` on 2026-09-02; 0.8.0 with pot identity, `species`,
+  `pot_mappings` and the one-time rebuild on 2026-09-03): container `plantbutler` on the NAS, port
+  9380, image `plantbutler-backend:0.8.0` shipped via `docker save | ssh docker load` over the tailnet, database on `/volume1/docker/plantbutler/data`, secrets in `deploy.env` beside it
   (600, not in git: the token, the ntfy topic, the healthchecks.io ping URL),
   `-e TZ=Europe/Zurich` so BUTLER_QUIET means local night. The rules run dark until the
   firmware sends `float=`/`pos=`; the alerts are live — the dead-man feeds healthchecks
@@ -116,7 +128,9 @@ Tables (`schema.sql`): `readings(ts, controller, channel, raw)`; `pots(id, name,
 channel, outlet, plant_type, plant_size, pot_size, soil, dry_raw, wet_raw, target_low_pct,
 target_high_pct, dose_ml, mode, cooldown_h, daily_cap_ml, enabled)` (`mode`:
 manual | learning | auto) — mapping, calibration, thresholds and the descriptive
-fields (Planta-style: what is potted, how big, in what) in one table until that hurts; `commands(id, created_ts,
+fields (Planta-style: what is potted, how big, in what) in one table until that hurts (it did:
+since 2026-09-03 `pots.id` is a `pot-xxxxxx` and the three mapping columns live in
+`pot_mappings` with a window — read the current shape above, not this line); `commands(id, created_ts,
 outlet, ml, cap_s, state proposed→queued→sent→acked/expired/failed, source, result, verdict)` — the command log is
 the watering history; `events(ts, kind, detail)`. Percentages are derived at read time, never
 stored. Air temperature and light ride the same readings table as extra channels (the sensor kit
@@ -131,6 +145,9 @@ proposal to approve and verdict at the pot. The flip to auto is a human act, per
 
 Stack (chosen 2026-08-31): a `uv` project, FastAPI + uvicorn, standard-library `sqlite3`, one
 `schema.sql`. NAS access exists: SSH with key auth (host alias in ~/.ssh/config on the laptop), and
-passwordless sudo scoped to the docker binary only. Jacopo's standing rule: announce and ask
-before EVERY operation on the NAS that changes, installs or writes anything; reading is free.
+passwordless sudo scoped to the docker binary only. Jacopo's standing rule, as of 2026-09-03:
+backend deployment is autonomous — build the image, ship it, swap the container, run one-off
+sqlite3 work on its own database, read logs, verify, and say afterwards what was done. Everything
+else on the NAS still needs an announced ask before it runs: package installs, DSM settings,
+other containers, writes anywhere but `/volume1/docker/plantbutler`. Reading is free.
 The token and the NAS address never enter the repository.

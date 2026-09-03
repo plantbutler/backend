@@ -107,6 +107,7 @@ def make_pot(client, **over):
     body = " ".join(f"{k}={v}" for k, v in fields.items())
     answer = post(client, "/pot", body)
     assert answer.status_code == 200, answer.text
+    return answer.text.split()[0].removeprefix("pot=")
 
 
 def run_sql(db, sql, *params):
@@ -165,6 +166,14 @@ def plant_dose(
     sent_ts = now - sent_ago
     acked_ts = None if acked_ago is None else now - acked_ago
     with sqlite3.connect(db) as con:
+        # A pot is wired before it is watered. make_pot stamps its mapping
+        # window milliseconds ago and the dose is planted well in the past,
+        # so the window has to move back with it or the dose belongs to no
+        # pot at all and the judgement has nothing to read.
+        con.execute(
+            "UPDATE pot_mappings SET from_ts = ? WHERE to_ts IS NULL AND from_ts > ?",
+            (sent_ts - 10, sent_ts - 10),
+        )
         con.execute(
             "INSERT INTO commands (created_ts, controller, kind, outlet, ml, "
             "cap_s, state, source, sent_ts, acked_ts, flow_ml) "
@@ -474,6 +483,23 @@ def test_a_dose_with_no_moisture_rise_alerts_at_default_priority(app, client, db
     assert dose_rows(db) == [("dose:1", "failed")]
 
 
+def test_a_dose_is_judged_for_the_pot_that_got_it(app, client, db, sent):
+    """The hoses are swapped after the dose. The page must still name the
+    pot that was watered and read that pot's own sensor, or it reports a
+    failure against a plant that was never dosed."""
+    basil = make_pot(client)  # channel 0, outlet 3
+    plant_dose(db, flow_ml=95, after_raw=DRY + 100)  # basil did not drink it
+    post(client, "/pot", f"id={basil} channel=1 outlet=4")
+    post(client, "/pot", "name=mint controller=b1 channel=0 outlet=3")
+
+    tick(app, int(time.time()))
+
+    assert [a.key for a in sent] == ["dose:1"]
+    assert "basil" in sent[0].message
+    assert "mint" not in sent[0].message
+    assert "moisture went" in sent[0].message  # judged on basil's own window
+
+
 def test_a_dose_short_on_the_meter_alerts_high(app, client, db, sent):
     make_pot(client)
     plant_dose(db, flow_ml=12, after_raw=WET)
@@ -596,6 +622,59 @@ def test_a_waiting_proposal_nudges_once_a_day_keyed_on_the_hose(app, client, db,
         )
     tick(app, now)
     assert len(sent) == 2
+
+
+def rewind(db, seconds):
+    """Everything so far moves that far into the past, so that a remap in
+    the next line does not land in the same second as the proposal."""
+    with sqlite3.connect(db) as con:
+        con.execute(
+            "UPDATE commands SET created_ts = created_ts - ?, "
+            "sent_ts = sent_ts - ?, acked_ts = acked_ts - ?",
+            (seconds,) * 3,
+        )
+        con.execute(
+            "UPDATE pot_mappings SET from_ts = from_ts - ?, to_ts = to_ts - ?",
+            (seconds, seconds),
+        )
+
+
+def test_a_channel_correction_does_not_mute_the_proposal_nudge(app, client, db, sent):
+    """The nudge is about a hose, and correcting a miswired SENSOR channel
+    does not move the hose. It opens a new mapping window all the same, so
+    a nudge fenced on that window goes quiet exactly when it is needed:
+    during setup, which is when channels get corrected and proposals are
+    sitting on the card waiting for a human."""
+    basil = make_pot(client, mode="learning")
+    for _ in range(5):
+        report(client)
+    assert run_sql(db, "SELECT id, state FROM commands") == [(1, "proposed")]
+    rewind(db, 600)  # ten minutes later, the channel is corrected
+
+    post(client, "/pot", f"id={basil} channel=1")
+
+    tick(app, int(time.time()))
+    assert [a.key for a in sent] == ["proposal:b1:3"]
+    assert "basil" in sent[0].message and "proposal 1" in sent[0].message
+
+
+def test_the_nudge_is_not_inherited_by_the_next_pot_on_the_hose(app, client, db, sent):
+    """The hoses are swapped while basil's offer is still standing. It was
+    sized for basil's dryness and only basil's card shows it, so mint must
+    not be nudged about it. Keyed on the hose alone the phone reads "mint
+    looks dry (None%, target None%): proposal 1 for 100 ml" — a pot that
+    never had that proposal, and a card that shows none to approve."""
+    basil = make_pot(client, mode="learning")
+    for _ in range(5):
+        report(client)
+    assert run_sql(db, "SELECT id, state FROM commands") == [(1, "proposed")]
+    rewind(db, 3600)  # an hour later, the hoses are swapped
+
+    post(client, "/pot", f"id={basil} channel=1 outlet=4")
+    post(client, "/pot", "name=mint controller=b1 channel=0 outlet=3")
+
+    tick(app, int(time.time()))
+    assert [a.key for a in sent if a.key.startswith("proposal:")] == []
 
 
 # --------------------------------------------------------------------------- #
