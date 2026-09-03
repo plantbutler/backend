@@ -624,6 +624,40 @@ def test_a_waiting_proposal_nudges_once_a_day_keyed_on_the_hose(app, client, db,
     assert len(sent) == 2
 
 
+def rewind(db, seconds):
+    """Everything so far moves that far into the past, so that a remap in
+    the next line does not land in the same second as the proposal."""
+    with sqlite3.connect(db) as con:
+        con.execute(
+            "UPDATE commands SET created_ts = created_ts - ?, "
+            "sent_ts = sent_ts - ?, acked_ts = acked_ts - ?",
+            (seconds,) * 3,
+        )
+        con.execute(
+            "UPDATE pot_mappings SET from_ts = from_ts - ?, to_ts = to_ts - ?",
+            (seconds, seconds),
+        )
+
+
+def test_a_channel_correction_does_not_mute_the_proposal_nudge(app, client, db, sent):
+    """The nudge is about a hose, and correcting a miswired SENSOR channel
+    does not move the hose. It opens a new mapping window all the same, so
+    a nudge fenced on that window goes quiet exactly when it is needed:
+    during setup, which is when channels get corrected and proposals are
+    sitting on the card waiting for a human."""
+    basil = make_pot(client, mode="learning")
+    for _ in range(5):
+        report(client)
+    assert run_sql(db, "SELECT id, state FROM commands") == [(1, "proposed")]
+    rewind(db, 600)  # ten minutes later, the channel is corrected
+
+    post(client, "/pot", f"id={basil} channel=1")
+
+    tick(app, int(time.time()))
+    assert [a.key for a in sent] == ["proposal:b1:3"]
+    assert "basil" in sent[0].message and "proposal 1" in sent[0].message
+
+
 # --------------------------------------------------------------------------- #
 # The tick: send-then-record, the dead-man, the probes
 # --------------------------------------------------------------------------- #

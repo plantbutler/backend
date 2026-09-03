@@ -520,3 +520,19 @@ def test_the_daily_cap_stays_with_the_pot_when_its_hose_moves(client, db):
 
     soak(client, 6)  # 100 + 100 > 150 wherever the hose hangs
     assert len(commands(db)) == 1
+
+
+def test_a_proposal_survives_a_correction_that_leaves_the_hose_alone(client, db):
+    """A proposal is about a HOSE, and fixing a miswired sensor channel does
+    not move the hose. It opens a new mapping window all the same, and if
+    the offer is bound to that window it silently leaves the card — while
+    its 'proposed' row goes on holding the hose slot, so nothing can be
+    approved and nothing else can be proposed until it times out.
+    """
+    basil = make_pot(client, mode="learning")
+    soak(client, 5)  # proposal 1, for basil, on outlet 3
+    rewind(db, 600)  # ten minutes later the sensor channel is corrected
+
+    post(client, "/pot", f"id={basil} channel=1")
+
+    assert cards(client)["basil"]["proposal"]["id"] == 1

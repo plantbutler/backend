@@ -594,6 +594,33 @@ HANDED_TO_POT = _handed_to_pot("<")
 WATERED_THE_POT = _handed_to_pot("<=")
 
 
+def _hose_since(pot: str, controller: str, outlet: str) -> str:
+    """A scalar SQL expression: when this pot's HOSE last changed.
+
+    A dose belongs to a pot and travels with it, but a proposal is an offer
+    to open a hose, so it counts only while this pot is still the one on
+    that hose. The open mapping window is the wrong fence for that: a
+    correction to the sensor CHANNEL closes it and opens another without
+    the hose having moved anywhere, and a pending proposal would silently
+    leave the card while its 'proposed' row went on holding the hose slot.
+
+    So: the start of the contiguous run of this pot's windows that share
+    its current (controller, outlet). Windows are contiguous by
+    construction — a remap closes the open row and opens the next in the
+    same second — so that start is the last time a window of this pot
+    named a DIFFERENT hose, and the pot's first window when none ever did.
+    The three arguments are SQL expressions naming the pot and its current
+    hose, never values off the wire.
+    """
+    return (
+        "COALESCE("
+        f"(SELECT MAX(w.to_ts) FROM pot_mappings w WHERE w.pot_id = {pot} "
+        f"AND (w.controller IS NOT {controller} OR w.outlet IS NOT {outlet})), "
+        f"(SELECT MIN(w.from_ts) FROM pot_mappings w WHERE w.pot_id = {pot}), "
+        "0)"
+    )
+
+
 def parse_pot(text: str) -> dict:
     """The `POST /pot` body: which pot, plus whatever fields to set.
 
@@ -1692,11 +1719,13 @@ def create_app(
             # The pot that is on the hose now AND was already on it when the
             # proposal was made: an offer to open a hose is not something
             # the next pot along inherits, and /pots stops showing it too.
+            # Since it was on the HOSE, not since its wiring last changed —
+            # correcting a sensor channel must not mute the nudge.
             "SELECT c.controller, c.outlet, c.id, c.ml, c.created_ts, p.name, "
             "m.channel, p.dry_raw, p.wet_raw, p.target_low_pct FROM commands c "
             "JOIN pot_mappings m ON m.controller = c.controller "
             "AND m.outlet = c.outlet AND m.to_ts IS NULL "
-            "AND c.created_ts >= m.from_ts "
+            f"AND c.created_ts >= {_hose_since('m.pot_id', 'm.controller', 'm.outlet')} "
             "JOIN pots p ON p.id = m.pot_id AND p.enabled = 1 "
             "WHERE c.state = 'proposed' AND c.created_ts >= ? ORDER BY c.id",
             (now - PROPOSAL_TTL_S,),
@@ -2014,19 +2043,22 @@ def create_app(
                         # An offer to open a hose, so unlike the dose below
                         # it does NOT travel with the pot: it counts only
                         # while this pot is still the one on that hose, and
-                        # a proposal older than the open window was sized
-                        # for whoever hung there before.
+                        # a proposal older than this pot's arrival there was
+                        # sized for whoever hung there before. Fenced on the
+                        # hose, not on the open window — see _hose_since.
                         prop = con.execute(
                             "SELECT id, ml, cap_s, created_ts FROM commands "
                             "WHERE controller = ? AND outlet = ? "
                             "AND state = 'proposed' AND created_ts >= ? "
-                            "AND created_ts >= COALESCE((SELECT from_ts "
-                            "  FROM pot_mappings WHERE pot_id = ? AND to_ts IS NULL), 0) "
+                            f"AND created_ts >= {_hose_since('?', '?', '?')} "
                             "ORDER BY id LIMIT 1",
                             (
                                 entry["controller"],
                                 entry["outlet"],
                                 int(time.time()) - PROPOSAL_TTL_S,
+                                entry["id"],
+                                entry["controller"],
+                                entry["outlet"],
                                 entry["id"],
                             ),
                         ).fetchone()
