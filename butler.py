@@ -476,6 +476,7 @@ POT_INT_FIELDS = {  # half-open bounds, like every other field
     "enabled": (0, 2),
 }
 POT_TEXT_FIELDS = ("controller", "plant_type", "plant_size", "pot_size", "soil")
+POT_MAP_FIELDS = ("controller", "channel", "outlet")  # pot_mappings, not pots
 POT_MODES = ("manual", "learning", "auto")
 LAST_DOSE_KEYS = (
     "id",
@@ -488,9 +489,10 @@ LAST_DOSE_KEYS = (
     "acked_ts",
     "verdict",
 )
-POT_COLUMNS = (
+POT_COLUMNS = (  # the pots_now view's shape: pot columns plus the open mapping
     "id",
     "name",
+    "species",
     "controller",
     "channel",
     "outlet",
@@ -767,7 +769,7 @@ def create_app(
             return
         candidates = con.execute(
             "SELECT name, channel, outlet, dry_raw, wet_raw, target_low_pct, "
-            "dose_ml, mode, cooldown_h, daily_cap_ml FROM pots "
+            "dose_ml, mode, cooldown_h, daily_cap_ml FROM pots_now "
             "WHERE enabled = 1 AND mode IN ('learning', 'auto') "
             "AND controller = ? AND channel IS NOT NULL AND outlet IS NOT NULL "
             "AND dry_raw IS NOT NULL AND wet_raw IS NOT NULL "
@@ -1008,21 +1010,28 @@ def create_app(
         refused just like both in one request. Column names come from the
         parse_pot whitelist, never from the wire, so building SQL from
         them is safe.
+
+        Mapping keys land in pot_mappings, not pots: a changed wiring
+        closes the open row and opens another, so past readings stay
+        attributed to the pot that was actually on that channel.
         """
         name = fields["name"]
+        now = int(time.time())
         sets = {k: v for k, v in fields.items() if k != "name"}
         with connect() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
-                f"SELECT {', '.join(POT_COLUMNS)} FROM pots WHERE name = ?",
+                f"SELECT {', '.join(POT_COLUMNS)} FROM pots_now WHERE name = ?",
                 (name,),
             ).fetchone()
             current = (
                 dict(zip(POT_COLUMNS, row))
                 if row
-                else dict.fromkeys(POT_COLUMNS) | {"mode": "manual", "enabled": 1}
+                else dict.fromkeys(POT_COLUMNS)
+                | {"mode": "manual", "enabled": 1, "id": new_pot_id()}
             )
-            merged = current | sets
+            merged = current | sets | {"name": name}
+            pot_id = current["id"]
             if merged["dry_raw"] is not None and merged["dry_raw"] == merged["wet_raw"]:
                 raise ValueError("dry_raw and wet_raw must differ")
             if (
@@ -1038,28 +1047,48 @@ def create_app(
                     if merged[col] is None:
                         continue
                     other = con.execute(
-                        f"SELECT name FROM pots WHERE controller = ? AND {col} = ? "
-                        "AND enabled = 1 AND name != ? LIMIT 1",
-                        (merged["controller"], merged[col], name),
+                        f"SELECT name FROM pots_now WHERE controller = ? AND {col} = ? "
+                        "AND enabled = 1 AND id != ? LIMIT 1",
+                        (merged["controller"], merged[col], pot_id),
                     ).fetchone()
                     if other:
                         raise ValueError(
                             f"{col} {merged[col]} on {merged['controller']} "
                             f"is taken by pot {other[0]}"
                         )
-            if row and sets:
+            pot_sets = {k: v for k, v in sets.items() if k not in POT_MAP_FIELDS}
+            if row and pot_sets:
                 con.execute(
-                    f"UPDATE pots SET {', '.join(k + ' = ?' for k in sets)} "
-                    "WHERE name = ?",
-                    [*sets.values(), name],
+                    f"UPDATE pots SET {', '.join(k + ' = ?' for k in pot_sets)} "
+                    "WHERE id = ?",
+                    [*pot_sets.values(), pot_id],
                 )
             elif not row:
-                keys = list(fields)
+                keys = [
+                    k for k in merged if k in POT_COLUMNS and k not in POT_MAP_FIELDS
+                ]
                 con.execute(
                     f"INSERT INTO pots ({', '.join(keys)}) "
                     f"VALUES ({', '.join('?' * len(keys))})",
-                    [fields[k] for k in keys],
+                    [merged[k] for k in keys],
                 )
+            if any(k in sets for k in POT_MAP_FIELDS):
+                wiring = tuple(merged[k] for k in POT_MAP_FIELDS)
+                # Only when the wiring actually differs: otherwise saving an
+                # unrelated field would fragment the history into a row per
+                # save, and every one of those windows would be a lie.
+                if wiring != tuple(current[k] for k in POT_MAP_FIELDS):
+                    con.execute(
+                        "UPDATE pot_mappings SET to_ts = ? "
+                        "WHERE pot_id = ? AND to_ts IS NULL",
+                        (now, pot_id),
+                    )
+                    con.execute(
+                        "INSERT INTO pot_mappings "
+                        "(pot_id, controller, channel, outlet, from_ts, to_ts) "
+                        "VALUES (?, ?, ?, ?, ?, NULL)",
+                        (pot_id, *wiring, now),
+                    )
 
     def approve(cmd_id: int) -> tuple | None:
         """proposed -> queued, slot permitting; returns the blocker if busy.
@@ -1253,7 +1282,7 @@ def create_app(
         # dead-man. Same threshold and observation window as the silent
         # rule; a controller that is itself silent already pages there.
         for name, controller, channel in con.execute(
-            "SELECT name, controller, channel FROM pots WHERE enabled = 1 "
+            "SELECT name, controller, channel FROM pots_now WHERE enabled = 1 "
             "AND controller IS NOT NULL AND channel IS NOT NULL ORDER BY name"
         ):
             pulse = heartbeat.get(controller)
@@ -1435,7 +1464,7 @@ def create_app(
                 continue  # still soaking in; an expiry needs no wait
             key = f"dose:{cmd_id}"
             pot = con.execute(
-                "SELECT name, channel, dry_raw, wet_raw FROM pots "
+                "SELECT name, channel, dry_raw, wet_raw FROM pots_now "
                 "WHERE enabled = 1 AND controller = ? AND outlet = ?",
                 (controller, outlet),
             ).fetchone()
@@ -1544,7 +1573,7 @@ def create_app(
         ) in con.execute(
             "SELECT c.controller, c.outlet, c.id, c.ml, c.created_ts, p.name, "
             "p.channel, p.dry_raw, p.wet_raw, p.target_low_pct FROM commands c "
-            "JOIN pots p ON p.controller = c.controller "
+            "JOIN pots_now p ON p.controller = c.controller "
             "AND p.outlet = c.outlet AND p.enabled = 1 "
             "WHERE c.state = 'proposed' AND c.created_ts >= ? ORDER BY c.id",
             (now - PROPOSAL_TTL_S,),
@@ -1841,7 +1870,7 @@ def create_app(
             with connect() as con:
                 garden = []
                 for row in con.execute(
-                    f"SELECT {', '.join(POT_COLUMNS)} FROM pots ORDER BY name"
+                    f"SELECT {', '.join(POT_COLUMNS)} FROM pots_now ORDER BY name"
                 ):
                     entry = dict(zip(POT_COLUMNS, row))
                     entry["raw"] = entry["read_ts"] = entry["pct"] = None
