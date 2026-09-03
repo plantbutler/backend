@@ -182,6 +182,62 @@ def test_a_disabled_pot_frees_its_channel_and_hose(client):
     )
 
 
+def test_a_disabled_pot_lets_go_of_the_hose_it_no_longer_holds(client, db):
+    """Disabling a pot does not unplug it, so its mapping window stayed open
+    and the next pot on that hose opened a second one. Two open windows on
+    one hose make a dose belong to two pots at once — and worse, to a
+    different one depending on which query you ask. The newcomer displaces
+    the disabled pot, which is what physically happened."""
+    basil = pot_id(pot(client, "name=basil controller=butler1 channel=0 outlet=3"))
+    pot(client, "name=basil enabled=0")
+    assert mappings(db, basil) == [(0, 3, None)], "still open while nobody else wants it"
+
+    mint = pot_id(pot(client, "name=mint controller=butler1 channel=0 outlet=3"))
+    assert [row[2] is None for row in mappings(db, basil)] == [False], "basil let go"
+    assert mappings(db, mint) == [(0, 3, None)], "mint holds it now"
+
+
+def test_a_disabled_pot_may_not_park_on_a_working_pots_hose(client, db):
+    """The other direction of the same error: the collision check used to be
+    skipped whenever the pot being saved was disabled, which let a disabled
+    pot open a second window on an enabled pot's hose."""
+    pot(client, "name=basil controller=butler1 channel=0 outlet=3")
+
+    answer = pot(client, "name=mint controller=butler1 outlet=3 enabled=0")
+    assert answer.status_code == 400
+    assert "taken by pot basil" in answer.text
+
+
+def test_a_displaced_window_keeps_the_doses_it_held(client, db):
+    """Displacement closes a window; it must not erase one. The disabled pot
+    keeps everything it was handed while it did hold the hose."""
+    import time
+
+    now = int(time.time())
+    basil = pot_id(pot(client, "name=basil controller=butler1 channel=0 outlet=3"))
+    with sqlite3.connect(db) as con:
+        # Backdate the window so it has a duration to hold a dose inside:
+        # created and displaced in the same second, it would have none, and
+        # a dose on that second goes to the pot that arrived, by the
+        # half-open rule the attribution join is built on.
+        con.execute(
+            "UPDATE pot_mappings SET from_ts = ? WHERE pot_id = ?", (now - 1000, basil)
+        )
+        con.execute(
+            "INSERT INTO commands (id, created_ts, controller, kind, outlet, ml, "
+            "cap_s, state, source, sent_ts, acked_ts, flow_ml) VALUES "
+            "(1, ?, 'butler1', 'water', 3, 100, 30, 'acked', 'manual', ?, ?, 98)",
+            (now - 510, now - 500, now - 490),
+        )
+    pot(client, "name=basil enabled=0")
+    mint = pot_id(pot(client, "name=mint controller=butler1 channel=0 outlet=3"))
+
+    mine = client.get(f"/doses?pot={basil}").json()["doses"]
+    assert [r["id"] for r in mine] == [1], "the dose stays with the pot that held the hose"
+    theirs = client.get(f"/doses?pot={mint}").json()["doses"]
+    assert theirs == [], "and the newcomer does not inherit it"
+
+
 def test_different_controllers_do_not_collide(client):
     pot(client, "name=basil controller=butler1 channel=0")
     assert pot(client, "name=mint controller=butler2 channel=0").status_code == 200

@@ -36,6 +36,15 @@ watering.
   and channel/outlet collisions), `GET /pots` (the garden with latest raw, derived %, any open
   proposal and the last handed dose with its verdict), `GET /history` (`c= ch= hours= bucket_s=`: bucketed raw counts with
   lo/hi/n and the server's `since`/`to`, `since` on a bucket boundary, at most 2016 buckets — the chart's wire),
+  `GET /doses` (`pot= limit= before= before_id=`: the watering history, newest first — what was
+  asked, what the meter counted, how it ended, the verdict, and the pot attributed through its own
+  mapping windows. Proposals are left out (offers, not water) and so are stops (no outlet, no
+  millilitres, never attributable); the expired, unacked and short-flowing rows are not, since they
+  are what the list is for. Without `pot=` the whole garden, and a dose no window claims carries a
+  null pot rather than vanishing; with `pot=` only handed doses can appear, because a dose belongs
+  to a pot from the moment the board is given it. `before=`/`before_id=` are the last row you have,
+  both together because several doses can share a second and a timestamp-only cursor would skip or
+  repeat them — the table is never pruned, so the older history has to stay reachable),
   `POST /approve` (proposed -> queued, slot permitting), `POST /verdict` (ok | too_much |
   too_little per executed dose), `GET /health` (count, last ts, the default interval, per-controller
   heartbeat/knob/open command/safety fields, raised alerts).
@@ -60,6 +69,13 @@ watering.
 - The command slot: queued → handed exactly once in a report response (sent) → acked by the
   next report's `ack=<id> flow_ml=`; a no-ack report or the TTL expires it. Expired is gone —
   ask again. The commands table is never pruned: it doubles as the watering history.
+- One hose, one pot, and the mapping write enforces it: an enabled pot already on that
+  (controller, channel) or (controller, outlet) is refused — asked whatever the pot being saved
+  has for `enabled`, since a disabled pot parked on a working pot's hose opens a second window on
+  it just the same. A *disabled* pot holding the wiring is displaced instead: its open window
+  closes as the newcomer's opens, because disabling a pot does not unplug it and two open windows
+  make one dose belong to two pots at once — differently depending on which query you ask. A
+  displaced window keeps every dose it held.
 - `schema.sql` — additive-only DDL: `readings`, `commands`, `controllers`, `pots`,
   `pot_mappings`, the `pots_now` view, `verdicts`, `status`, `alerts` + indexes. Proposals are
   commands in state 'proposed'; the verdict log is the dataset adaptive dosing will one day fit
