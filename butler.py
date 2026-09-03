@@ -594,6 +594,39 @@ HANDED_TO_POT = _handed_to_pot("<")
 WATERED_THE_POT = _handed_to_pot("<=")
 
 
+def window_edge(con: sqlite3.Connection, pot_id: str, now: int) -> int:
+    """Where a pot's open mapping window closes and its next one opens.
+
+    `now`, except that the boundary is never allowed to move backwards
+    past what the database has already recorded. A window that ends before
+    it began, or before a dose it holds, matches nothing at all: the join
+    wants from_ts <= sent_ts <= to_ts, and the pot silently stops owning
+    that dose's cooldown and daily cap. Fixing the clock afterwards does
+    not rewrite the row, so unlike a clock that is merely wrong this is
+    permanent — and pot_mappings is what the watering gates read.
+
+    The server clock does step backwards: a container that starts before
+    the NAS has synced runs minutes or hours off until NTP corrects it,
+    and a wiring save on either side of that correction is ordinary. So
+    the floor is the window's own start and the newest dose that went down
+    its hose inside it. With the clock behaving, all three are `now`.
+    """
+    row = con.execute(
+        "SELECT from_ts, controller, outlet FROM pot_mappings "
+        "WHERE pot_id = ? AND to_ts IS NULL",
+        (pot_id,),
+    ).fetchone()
+    if row is None:
+        return now
+    from_ts, controller, outlet = row
+    (dosed,) = con.execute(
+        "SELECT COALESCE(MAX(sent_ts), 0) FROM commands "
+        "WHERE controller IS ? AND outlet IS ? AND sent_ts >= ?",
+        (controller, outlet, from_ts),
+    ).fetchone()
+    return max(now, from_ts, dosed)
+
+
 def _hose_since(pot: str, controller: str, outlet: str) -> str:
     """A scalar SQL expression: when this pot's HOSE last changed.
 
@@ -1246,16 +1279,19 @@ def create_app(
                 # unrelated field would fragment the history into a row per
                 # save, and every one of those windows would be a lie.
                 if wiring != tuple(current[k] for k in POT_MAP_FIELDS):
+                    # One second for both rows, so the windows stay
+                    # contiguous — the attribution join assumes it.
+                    edge = window_edge(con, pot_id, now)
                     con.execute(
                         "UPDATE pot_mappings SET to_ts = ? "
                         "WHERE pot_id = ? AND to_ts IS NULL",
-                        (now, pot_id),
+                        (edge, pot_id),
                     )
                     con.execute(
                         "INSERT INTO pot_mappings "
                         "(pot_id, controller, channel, outlet, from_ts, to_ts) "
                         "VALUES (?, ?, ?, ?, ?, NULL)",
-                        (pot_id, *wiring, now),
+                        (pot_id, *wiring, edge),
                     )
         return pot_id, name
 

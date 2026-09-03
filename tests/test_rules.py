@@ -2,10 +2,12 @@
 
 import sqlite3
 import time
+import types
 
 import pytest
 from fastapi.testclient import TestClient
 
+import butler
 from butler import create_app, in_quiet, parse_quiet, parse_report
 
 TOKEN = "test-token"
@@ -629,5 +631,47 @@ def test_a_dose_the_pot_cannot_claim_still_spends_its_daily_cap(client, db):
     make_pot(client, cooldown_h=0, daily_cap_ml=150)
 
     soak(client, 8)
+
+    assert len(commands(db)) == 1
+
+
+def test_a_backwards_clock_step_at_a_remap_does_not_reopen_the_cooldown(
+    client, db, monkeypatch
+):
+    """The gates read pot_mappings now, so a corrupt window is a wet pot.
+
+    A container that starts before NTP has synced runs on a clock that
+    steps backwards a moment later. Save the wiring, take the step, move
+    the hose: the window that closes is stamped before it opened, matches
+    nothing, and the dose inside it stops belonging to the pot. The hose
+    floor cannot catch this one — the pot is on a different hose now, and
+    that hose has no history of its own.
+
+    Nor is `to_ts = max(now, from_ts)` enough. The pot was wired ten
+    minutes before it was watered, so a window clamped only to its own
+    start still ends before the dose it holds.
+    """
+    basil = make_pot(client)  # auto, outlet 3, default 6 h cooldown
+    soak(client, 5)
+    report(client, extra="ack=1 flow_ml=100")
+    with sqlite3.connect(db) as con:
+        # basil was wired ten minutes before the pump ran, not in the same
+        # second: the dose sits strictly inside its window.
+        con.execute(
+            "UPDATE pot_mappings SET from_ts = from_ts - 600 WHERE pot_id = ?",
+            (basil,),
+        )
+
+    monkeypatch.setattr(  # NTP corrects the host two hours backwards
+        butler,
+        "time",
+        types.SimpleNamespace(
+            time=lambda: time.time() - 7200, localtime=time.localtime
+        ),
+    )
+    post(client, "/pot", f"id={basil} outlet=4")
+    monkeypatch.undo()
+
+    soak(client, 8)  # bone dry, minutes into a six-hour cooldown
 
     assert len(commands(db)) == 1

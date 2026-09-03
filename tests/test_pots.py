@@ -1,10 +1,13 @@
 """Pots, plants and calibration: mapping is an edit, % is derived, never stored."""
 
 import sqlite3
+import time
+import types
 
 import pytest
 from fastapi.testclient import TestClient
 
+import butler
 from butler import create_app, moisture_pct, parse_pot
 
 TOKEN = "test-token"
@@ -356,6 +359,53 @@ def test_a_freed_channel_can_be_taken_by_another_pot(client, db):
         == 200
     )
     assert len(mappings(db, basil)) == 2
+
+
+def step_the_clock(monkeypatch, seconds):
+    """Move the backend's idea of now, and nothing else's.
+
+    Patching the module butler reads rather than the stdlib's own `time`,
+    so a shifted clock stays inside the service under test.
+    """
+    monkeypatch.setattr(
+        butler,
+        "time",
+        types.SimpleNamespace(
+            time=lambda: time.time() + seconds, localtime=time.localtime
+        ),
+    )
+
+
+def test_a_clock_that_steps_back_cannot_invert_a_window(client, db, monkeypatch):
+    """A window that ends before it starts matches nothing, ever again.
+
+    The container comes up, the wiring is saved, and only then does NTP
+    correct the host clock backwards — a fresh Synology container is the
+    ordinary way to get there. The next remap closes the open row at a
+    moment before it opened, and every dose inside that window is orphaned
+    from the pot it belongs to. Unlike a clock that is merely wrong, this
+    is permanent: putting the clock right does not rewrite the row, and
+    pot_mappings is now what the watering gates read.
+
+    So the boundary is clamped. The window closes no earlier than it
+    opened, and the next one starts on that same clamped second, because
+    the whole attribution scheme assumes the windows are contiguous.
+    """
+    pid = pot_id(pot(client, "name=basil controller=butler1 channel=0 outlet=3"))
+    step_the_clock(monkeypatch, -7200)
+
+    assert pot(client, f"id={pid} outlet=4").status_code == 200
+
+    with sqlite3.connect(db) as con:
+        rows = con.execute(
+            "SELECT outlet, from_ts, to_ts FROM pot_mappings WHERE pot_id = ? "
+            "ORDER BY rowid",
+            (pid,),
+        ).fetchall()
+    closed, opened = rows
+    assert closed[2] >= closed[1], f"window closed before it opened: {closed}"
+    assert opened[1] == closed[2], f"windows left with a gap: {rows}"
+    assert opened[2] is None
 
 
 # --------------------------------------------------------------------------- #
