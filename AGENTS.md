@@ -80,8 +80,9 @@ watering.
   command a response carries, acks it on the following report. `python fake_device.py --token
   dev --cycles 3` against a local uvicorn or the NAS.
 - Pitches 1-4 (through the alerts) are deployed (2026-09-01; 0.7.0 with `last_dose`, `next_default`,
-  `/history` and the optional `cap_s` on 2026-09-02): container `plantbutler` on the NAS, port
-  9380, image `plantbutler-backend:0.7.0` shipped via `docker save | ssh docker load` over the tailnet, database on `/volume1/docker/plantbutler/data`, secrets in `deploy.env` beside it
+  `/history` and the optional `cap_s` on 2026-09-02; 0.8.0 with pot identity, `species`,
+  `pot_mappings` and the one-time rebuild on 2026-09-03): container `plantbutler` on the NAS, port
+  9380, image `plantbutler-backend:0.8.0` shipped via `docker save | ssh docker load` over the tailnet, database on `/volume1/docker/plantbutler/data`, secrets in `deploy.env` beside it
   (600, not in git: the token, the ntfy topic, the healthchecks.io ping URL),
   `-e TZ=Europe/Zurich` so BUTLER_QUIET means local night. The rules run dark until the
   firmware sends `float=`/`pos=`; the alerts are live — the dead-man feeds healthchecks
@@ -144,6 +145,9 @@ proposal to approve and verdict at the pot. The flip to auto is a human act, per
 
 Stack (chosen 2026-08-31): a `uv` project, FastAPI + uvicorn, standard-library `sqlite3`, one
 `schema.sql`. NAS access exists: SSH with key auth (host alias in ~/.ssh/config on the laptop), and
-passwordless sudo scoped to the docker binary only. Jacopo's standing rule: announce and ask
-before EVERY operation on the NAS that changes, installs or writes anything; reading is free.
+passwordless sudo scoped to the docker binary only. Jacopo's standing rule, as of 2026-09-03:
+backend deployment is autonomous — build the image, ship it, swap the container, run one-off
+sqlite3 work on its own database, read logs, verify, and say afterwards what was done. Everything
+else on the NAS still needs an announced ask before it runs: package installs, DSM settings,
+other containers, writes anywhere but `/volume1/docker/plantbutler`. Reading is free.
 The token and the NAS address never enter the repository.
