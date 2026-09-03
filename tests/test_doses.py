@@ -166,13 +166,60 @@ def test_limit_bounds_the_list_and_the_newest_survive(client, db):
 
 
 def test_an_overlapping_window_lists_a_dose_once(client, db):
-    """Two pots on one hose at one instant is a configuration error; it must
-    not double a dose in the garden list."""
+    """Two pots on one hose at one instant cannot be reached through the API
+    any more (see test_pots), but if a database ever held it the garden list
+    must not show the dose twice. Note what this does NOT promise: with the
+    windows overlapping, each pot's own list still claims the dose, because
+    each pot's window genuinely covers it. Which is why the fix is upstream,
+    in the mapping write, and not here."""
     now = int(time.time())
     pot(db, "pot-1", "basil", outlet=0, from_ts=0)
     pot(db, "pot-2", "mint", outlet=0, from_ts=0)
     dose(db, 1, now - 100, acked_ts=now - 90)
     assert [r["id"] for r in get(client)] == [1]
+
+
+def test_a_stop_is_not_a_dose(client, db):
+    """A stop has no outlet and no millilitres: it could never be
+    attributed, and listing it as an unattributable dose would bury the row
+    that actually matters."""
+    now = int(time.time())
+    pot(db, "pot-1", "basil")
+    dose(db, 1, now - 100, acked_ts=now - 90)
+    dose(db, 2, now - 50, kind="stop", outlet=None, ml=None, acked_ts=now - 40)
+    assert [r["id"] for r in get(client)] == [1]
+    assert [r["id"] for r in get(client, pot="pot-1")] == [1]
+
+
+def test_the_cursor_pages_back_through_doses_that_share_a_second(client, db):
+    """The commands table is never pruned, so the older history has to be
+    reachable — and several doses can share a second, which a cursor on the
+    timestamp alone would skip or repeat."""
+    now = int(time.time())
+    pot(db, "pot-1", "basil")
+    for i in range(1, 6):  # ids 1..5, all handed out in the same second
+        dose(db, i, now - 100, acked_ts=now - 90)
+    first = get(client, pot="pot-1", limit=2)
+    assert [r["id"] for r in first] == [5, 4]
+    last = first[-1]
+    second = get(client, pot="pot-1", limit=2, before=last["sent_ts"], before_id=last["id"])
+    assert [r["id"] for r in second] == [3, 2]
+    third = get(client, pot="pot-1", limit=2, before=second[-1]["sent_ts"], before_id=second[-1]["id"])
+    assert [r["id"] for r in third] == [1]
+    # Nothing was skipped and nothing came twice.
+    assert [r["id"] for r in first + second + third] == [5, 4, 3, 2, 1]
+
+
+def test_the_cursor_crosses_a_second_boundary_too(client, db):
+    now = int(time.time())
+    pot(db, "pot-1", "basil")
+    dose(db, 1, now - 300, acked_ts=now - 290)
+    dose(db, 2, now - 200, acked_ts=now - 190)
+    dose(db, 3, now - 100, acked_ts=now - 90)
+    page = get(client, pot="pot-1", limit=1)
+    assert [r["id"] for r in page] == [3]
+    rest = get(client, pot="pot-1", before=page[0]["sent_ts"], before_id=page[0]["id"])
+    assert [r["id"] for r in rest] == [2, 1]
 
 
 def test_doses_needs_no_token(client, db):
@@ -187,8 +234,21 @@ def test_the_answer_carries_the_servers_clock(client, db):
 
 
 def test_parse_doses_refuses_what_it_should():
-    assert parse_doses(QueryParams("")) == (None, 50)
-    assert parse_doses(QueryParams("pot=pot-1&limit=10")) == ("pot-1", 10)
-    for bad in ("pot=a&pot=b", "limit=1&limit=2", "pot=", "limit=0", "limit=201", "limit=x", "limit=-1"):
+    assert parse_doses(QueryParams("")) == (None, 50, None, 0)
+    assert parse_doses(QueryParams("pot=pot-1&limit=10")) == ("pot-1", 10, None, 0)
+    assert parse_doses(QueryParams("before=900&before_id=7")) == (None, 50, 900, 7)
+    for bad in (
+        "pot=a&pot=b",
+        "limit=1&limit=2",
+        "pot=",
+        "limit=0",
+        "limit=201",
+        "limit=x",
+        "limit=-1",
+        "before=x",
+        "before=-1",
+        "before=1&before=2",
+        "before_id=7",  # a cursor id without the timestamp it belongs to
+    ):
         with pytest.raises(ValueError):
             parse_doses(QueryParams(bad))

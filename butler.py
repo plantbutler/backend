@@ -516,23 +516,37 @@ def parse_interval(text: str) -> tuple[str, int]:
 HISTORY_MAX_BUCKETS = 168 * 3600 // 300
 
 
-def parse_doses(params: QueryParams) -> tuple[str | None, int]:
-    """`GET /doses?pot=<pot id>&limit=<1..200>`.
+def parse_doses(params: QueryParams) -> tuple[str | None, int, int | None, int]:
+    """`GET /doses?pot=<pot id>&limit=<1..200>&before=<ts>&before_id=<id>`.
 
-    No pot means the whole garden. Same query-parameter strictness as
-    /history, and the same plain-text refusal.
+    No pot means the whole garden. `before`/`before_id` are the last row a
+    caller already has: the page after it. Both together, because the list
+    is ordered on (when it was handed out, id) and several doses can share
+    a second — a cursor on the timestamp alone would skip or repeat them.
+    The commands table is never pruned, so without this the older history
+    would be permanently out of reach behind the newest `limit` rows.
+
+    Same query-parameter strictness as /history, and the same plain-text
+    refusal.
     """
-    values = params.getlist("pot")
-    if len(values) > 1:
-        raise ValueError("pot= given twice")
-    pot = values[0] if values else None
+
+    def one(key: str, default: str | None = None) -> str | None:
+        values = params.getlist(key)
+        if len(values) > 1:
+            raise ValueError(f"{key}= given twice")
+        return values[0] if values else default
+
+    pot = one("pot")
     if pot is not None and not pot:
         raise ValueError("pot= is empty")
-    limits = params.getlist("limit")
-    if len(limits) > 1:
-        raise ValueError("limit= given twice")
-    limit = _int_in(limits[0] if limits else "50", "limit", 1, DOSES_MAX + 1)
-    return pot, limit
+    limit = _int_in(one("limit", "50") or "", "limit", 1, DOSES_MAX + 1)
+    raw_before = one("before")
+    before = None if raw_before is None else _int_in(raw_before, "before", 0, 1 << 42)
+    raw_before_id = one("before_id")
+    if raw_before_id is not None and before is None:
+        raise ValueError("before_id= needs a before=")
+    before_id = _int_in(raw_before_id or "0", "before_id", 0, 1 << 42)
+    return pot, limit, before, before_id
 
 
 def parse_history(params: QueryParams) -> tuple[str, int, int, int]:
@@ -1308,9 +1322,12 @@ def create_app(
                 # The UNIQUE index would refuse this anyway, with a message
                 # nobody outside sqlite can read.
                 raise ValueError(f"the name {name} is taken by pot {clash[0]}")
-            if merged["enabled"] and merged["controller"] is not None:
-                # Two enabled pots on one sensor or one hose is a config
-                # error that would misread or miswater — refuse loudly.
+            if merged["controller"] is not None:
+                # Two pots on one sensor or one hose is a config error that
+                # would misread or miswater — refuse loudly. Asked whatever
+                # this pot's own enabled is: a disabled pot parked on a
+                # working pot's hose still puts two open windows on it, and
+                # then one dose belongs to two pots at once.
                 for col in ("channel", "outlet"):
                     if merged[col] is None:
                         continue
@@ -1354,6 +1371,29 @@ def create_app(
                         "WHERE pot_id = ? AND to_ts IS NULL",
                         (edge, pot_id),
                     )
+                    # One hose, one pot. An enabled pot on this wiring was
+                    # refused above; a disabled one is still holding an open
+                    # window, because disabling a pot does not unplug it.
+                    # Leaving that window open would make this dose belong
+                    # to both pots at once — and it does not merely list
+                    # twice, it answers a different owner depending on which
+                    # query you ask. The newcomer displaces it, which is
+                    # what physically happened. Each displaced window closes
+                    # on its own edge, so a backwards clock cannot invert it
+                    # or orphan a dose it already holds.
+                    displaced = con.execute(
+                        "SELECT DISTINCT m.pot_id FROM pot_mappings m "
+                        "JOIN pots p ON p.id = m.pot_id "
+                        "WHERE m.to_ts IS NULL AND m.pot_id != ? "
+                        "AND m.controller = ? AND (m.channel = ? OR m.outlet = ?)",
+                        (pot_id, *wiring),
+                    ).fetchall()
+                    for (other_id,) in displaced:
+                        con.execute(
+                            "UPDATE pot_mappings SET to_ts = ? "
+                            "WHERE pot_id = ? AND to_ts IS NULL",
+                            (window_edge(con, other_id, now), other_id),
+                        )
                     con.execute(
                         "INSERT INTO pot_mappings "
                         "(pot_id, controller, channel, outlet, from_ts, to_ts) "
@@ -2241,7 +2281,7 @@ def create_app(
         a dose belongs to a pot from the moment the board is given it.
         """
         try:
-            pot_id, limit = parse_doses(request.query_params)
+            pot_id, limit, before, before_id = parse_doses(request.query_params)
         except ValueError as why:
             return PlainTextResponse(f"refused: {why}\n", status_code=400)
         columns = (
@@ -2250,8 +2290,22 @@ def create_app(
         )
         # Newest first, by when the board was handed it; an unhanded one
         # sorts by when it was made, which is the only time it has.
+        # A stop is not a dose: it has no outlet and no millilitres, so it
+        # could never be attributed anyway, and listing it as an
+        # unattributable dose would make the row that matters — a dose no
+        # window claims — impossible to pick out. Same filter /pots uses
+        # for last_dose.
+        page = ""
+        cursor: tuple = ()
+        if before is not None:
+            # The cursor is the whole sort key, not just its timestamp.
+            page = (
+                "AND (COALESCE(c.sent_ts, c.created_ts) < ? "
+                "OR (COALESCE(c.sent_ts, c.created_ts) = ? AND c.id < ?)) "
+            )
+            cursor = (before, before, before_id)
         tail = (
-            "AND c.state != 'proposed' GROUP BY c.id "
+            f"AND c.kind = 'water' AND c.state != 'proposed' {page}GROUP BY c.id "
             "ORDER BY COALESCE(c.sent_ts, c.created_ts) DESC, c.id DESC LIMIT ?"
         )
         # GROUP BY c.id, not because a dose has many rows but because two
@@ -2268,7 +2322,7 @@ def create_app(
                 "LEFT JOIN verdicts v ON v.command_id = c.id "
                 f"WHERE 1 {tail}"
             )
-            args: tuple = (limit,)
+            args: tuple = (*cursor, limit)
         else:
             sql = (
                 f"SELECT {columns} FROM {HANDED_TO_POT} "
@@ -2276,7 +2330,7 @@ def create_app(
                 "LEFT JOIN verdicts v ON v.command_id = c.id "
                 f"WHERE 1 {tail}"
             )
-            args = (pot_id, limit)
+            args = (pot_id, *cursor, limit)
         try:
             with connect() as con:
                 rows = [dict(zip(DOSE_KEYS, row)) for row in con.execute(sql, args)]
