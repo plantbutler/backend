@@ -299,9 +299,25 @@ def test_remapping_closes_the_old_row_and_opens_a_new_one(client, db):
 def test_an_unchanged_mapping_opens_no_second_row(client, db):
     pid = pot_id(pot(client, "name=basil controller=butler1 channel=3"))
 
-    pot(client, f"id={pid} channel=3 soil=peat")
+    # Accepted AND silent about the mapping. Without the status assertion a
+    # refusal that wrote nothing at all would satisfy the row count below,
+    # which is the half of this test that is easy to lose.
+    assert pot(client, f"id={pid} channel=3 soil=peat").status_code == 200
 
     assert mappings(db, pid) == [(3, None, None)]
+    assert garden(client)[0]["soil"] == "peat"  # and the rest of it landed
+
+
+def test_a_remap_saves_the_rest_of_the_request_too(client, db):
+    """One POST /pot, two destinations: the wiring goes to pot_mappings and
+    every other field to pots. Neither half may swallow the other."""
+    pid = pot_id(pot(client, "name=basil controller=butler1 channel=3 outlet=1"))
+
+    assert pot(client, f"id={pid} channel=4 soil=peat dry_raw=12000").status_code == 200
+
+    (entry,) = garden(client)
+    assert (entry["channel"], entry["soil"], entry["dry_raw"]) == (4, "peat", 12000)
+    assert len(mappings(db, pid)) == 2
 
 
 def test_a_pot_that_was_never_wired_has_no_mapping_row(client, db):
