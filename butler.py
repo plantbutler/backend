@@ -68,6 +68,8 @@ import contextlib
 import hmac
 import http.client
 import os
+import secrets
+import shutil
 import sqlite3
 import sys
 import time
@@ -144,8 +146,87 @@ class Alert(NamedTuple):
     record: Callable | None = None
 
 
+SCHEMA_SQL = (Path(__file__).parent / "schema.sql").read_text()
+
+
 def hhmm(ts: int) -> str:
     return time.strftime("%H:%M", time.localtime(ts))
+
+
+def new_pot_id() -> str:
+    """A pot's identity, in the plan tool's own style: `pot-3f9a21`.
+
+    Random rather than sequential so it can be minted anywhere and never
+    encodes an order that means nothing.
+    """
+    return "pot-" + secrets.token_hex(3)
+
+
+# The columns the old pots table carried, in its own order, so the rebuild
+# reads a 0.7.0 database without guessing.
+_OLD_POT_COLUMNS = (
+    "name",
+    "controller",
+    "channel",
+    "outlet",
+    "plant_type",
+    "plant_size",
+    "pot_size",
+    "soil",
+    "dry_raw",
+    "wet_raw",
+    "target_low_pct",
+    "target_high_pct",
+    "dose_ml",
+    "mode",
+    "cooldown_h",
+    "daily_cap_ml",
+    "enabled",
+)
+
+
+def migrate(con: sqlite3.Connection, db_path: str) -> bool:
+    """The one-time rebuild of `pots`, run at startup. Returns True if it ran.
+
+    `schema.sql` is additive by rule and cannot retype a primary key, which
+    is what turning the integer id into `pot-xxxxxx` needs. This is that
+    exception, taken once and deliberately: copy into the new shape, move
+    the wiring into pot_mappings with from_ts 0 so no history is orphaned,
+    then swap. Idempotent — an already-migrated database is recognised by
+    the pots table having no `controller` column.
+    """
+    cols = [r[1] for r in con.execute("PRAGMA table_info(pots)")]
+    if not cols or "controller" not in cols:
+        return False  # fresh database, or already rebuilt
+    if db_path != ":memory:":
+        shutil.copyfile(db_path, db_path + ".pre-identity.bak")
+    rows = con.execute(
+        f"SELECT {', '.join(_OLD_POT_COLUMNS)} FROM pots ORDER BY id"
+    ).fetchall()
+    # No BEGIN here on purpose: sqlite3.executescript() commits any open
+    # transaction before it runs, so wrapping this in one would silently
+    # split it. The backup taken two lines up is the safety net instead.
+    con.execute("DROP VIEW IF EXISTS pots_now")
+    con.execute("DROP TABLE pots")
+    con.executescript(SCHEMA_SQL)
+    for row in rows:
+        old = dict(zip(_OLD_POT_COLUMNS, row))
+        pot_id = new_pot_id()
+        keys = [k for k in old if k not in ("controller", "channel", "outlet")]
+        con.execute(
+            f"INSERT INTO pots (id, {', '.join(keys)}) "
+            f"VALUES (?, {', '.join('?' * len(keys))})",
+            [pot_id, *(old[k] for k in keys)],
+        )
+        if any(old[k] is not None for k in ("controller", "channel", "outlet")):
+            con.execute(
+                "INSERT INTO pot_mappings "
+                "(pot_id, controller, channel, outlet, from_ts, to_ts) "
+                "VALUES (?, ?, ?, ?, 0, NULL)",
+                (pot_id, old["controller"], old["channel"], old["outlet"]),
+            )
+    con.commit()
+    return True
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -655,10 +736,13 @@ def create_app(
             "refusing to store readings in the container layer"
         )
     db.parent.mkdir(parents=True, exist_ok=True)
-    schema = (Path(__file__).parent / "schema.sql").read_text()
     with sqlite3.connect(db) as bootstrap:
         bootstrap.execute("PRAGMA journal_mode=WAL")
-        bootstrap.executescript(schema)
+        bootstrap.executescript(SCHEMA_SQL)
+        # After the script, never before: a genuinely fresh database is
+        # already in the new shape, so migrate() sees no `controller`
+        # column on pots and returns immediately.
+        migrate(bootstrap, str(db))
 
     def connect() -> sqlite3.Connection:
         con = sqlite3.connect(db, timeout=5)
