@@ -41,7 +41,8 @@ curl -s -X POST http://localhost:8000/interval \
 
 Tell it what hangs where. A bare `name=` creates a pot and mints its id; the answer carries
 both, and that id is what every later save keys on — the name is only a nickname and is edited
-like any other field. Whatever fields you feel like setting, in any order (repotting or swapping
+like any other field. A post without an `id=` is *always* a create: if that name is taken it is
+refused rather than quietly editing the pot that has it. Whatever fields you feel like setting, in any order (repotting or swapping
 a hose is an edit; recalibrating is two numbers):
 
 ```bash
@@ -52,15 +53,21 @@ curl -s -X POST http://localhost:8000/pot \
 curl -s -X POST http://localhost:8000/pot \
   -H 'X-Token: dev' --data-binary 'id=pot-3f9a21 dry_raw=12000 wet_raw=4000'
 curl -s http://localhost:8000/pots     # the garden, with latest raw and derived %
+curl -s 'http://localhost:8000/doses?pot=pot-3f9a21&limit=50'
+# -> {"doses": [...], "now": ...}: the watering history, newest first — what was asked, what
+#    the meter counted, how it ended, the verdict, and the pot it belonged to. Page back with
+#    before=<ts>&before_id=<id> from the last row you have.
 curl -s 'http://localhost:8000/history?c=butler1&ch=0&hours=24&bucket_s=300'
 # -> {"since": ..., "to": ..., "points": [{"ts", "raw", "lo", "hi", "n"}, ...]}: the chart's
 #    wire, raw counts bucketed on the server's clock; the app derives % from the pot's
 #    calibration, so recalibrating re-reads the whole curve
 ```
 
-Key a save on the name instead and it is a create the day somebody renames the pot: after
-`basil` becomes `genovese`, `name=basil dry_raw=...` makes a second pot, wired to nothing, and
-calibrates that one. The wiring you send does not live in the pot either — it goes to
+Key a save on the name instead and it goes wrong in one of two ways. While the name is still
+taken, `name=basil dry_raw=...` is refused — it is a create, and creating a second `basil` is not
+allowed. And once somebody renames the pot, the same line succeeds and does something worse: after
+`basil` becomes `genovese` the name is free, so that post makes a *second* pot, wired to nothing,
+and calibrates that one. The wiring you send does not live in the pot either — it goes to
 `pot_mappings` with a validity window, so moving a hose takes the pot's doses, cooldown and
 daily cap with it instead of leaving them for whatever hangs there next.
 

@@ -1291,10 +1291,12 @@ def create_app(
                     # nobody asked for.
                     raise ValueError(f"no pot {pot_id}")
             else:
-                row = con.execute(
-                    f"SELECT {', '.join(POT_COLUMNS)} FROM pots_now WHERE name = ?",
-                    (fields["name"],),
-                ).fetchone()
+                # No id is a create, always. Looking the name up here is what
+                # made a create silently edit whatever pot already answered to
+                # it — and the app's own check against that cannot see a pot
+                # added from another phone, or added while its list sat idle.
+                # The name clash below refuses it instead.
+                row = None
             current = (
                 dict(zip(POT_COLUMNS, row))
                 if row
@@ -1321,6 +1323,11 @@ def create_app(
             if clash:
                 # The UNIQUE index would refuse this anyway, with a message
                 # nobody outside sqlite can read.
+                if fields.get("id") is None:
+                    raise ValueError(
+                        f"the name {name} is taken by pot {clash[0]} "
+                        "— open it instead of creating one"
+                    )
                 raise ValueError(f"the name {name} is taken by pot {clash[0]}")
             if merged["controller"] is not None:
                 # Two pots on one sensor or one hose is a config error that

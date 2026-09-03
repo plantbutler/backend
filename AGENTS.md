@@ -29,11 +29,12 @@ watering.
   answers `next=` plus at most one `cmd=` line), `POST /command` (queue `water=<outlet>
   ml= [cap_s=]` or `stop=1`, one slot per controller, 409 when busy; a missing cap_s is sized
   by `cap_for`, the one owner of FLOW_FLOOR_ML_S), `POST /interval`
-  (per-controller `next=` override, 0 clears), `POST /pot` (partial upsert keyed on `id=`, the
+  (per-controller `next=` override, 0 clears), `POST /pot` (partial edit keyed on `id=`, the
   `pot-xxxxxx` a bare `name=` create mints and every answer carries; mapping, calibration,
-  Planta-style fields, rules knobs; a `name=` save is a CREATE when that name is free, so a
-  client that keys on the name forks the pot the day it is renamed; refuses inconsistent merges
-  and channel/outlet collisions), `GET /pots` (the garden with latest raw, derived %, any open
+  Planta-style fields, rules knobs. A post without an `id=` is always a CREATE: a taken name is
+  refused, not quietly edited, so a stale client cannot overwrite a pot it could not see. Which
+  also means a client that keys on the name forks the pot the day it is renamed and the old name
+  comes free. Refuses inconsistent merges and channel/outlet collisions), `GET /pots` (the garden with latest raw, derived %, any open
   proposal and the last handed dose with its verdict), `GET /history` (`c= ch= hours= bucket_s=`: bucketed raw counts with
   lo/hi/n and the server's `since`/`to`, `since` on a bucket boundary, at most 2016 buckets — the chart's wire),
   `GET /doses` (`pot= limit= before= before_id=`: the watering history, newest first — what was
