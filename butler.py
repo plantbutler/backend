@@ -185,6 +185,26 @@ _OLD_POT_COLUMNS = (
 )
 
 
+def _pots_ddl() -> list[str]:
+    """The CREATE for `pots` and for `pots_now`, taken from schema.sql itself.
+
+    The rebuild drops both and has to put them back inside its own
+    transaction, where executescript() cannot go (it commits first). Rather
+    than keep a second copy of the DDL here — to drift from the schema file
+    the day a column is added — let sqlite parse schema.sql in a scratch
+    database and hand back exactly what it made.
+    """
+    scratch = sqlite3.connect(":memory:")
+    scratch.executescript(SCHEMA_SQL)
+    return [
+        sql
+        for (sql,) in scratch.execute(
+            "SELECT sql FROM sqlite_master WHERE name IN ('pots', 'pots_now') "
+            "ORDER BY type"  # 'table' before 'view': the view reads the table
+        )
+    ]
+
+
 def migrate(con: sqlite3.Connection, db_path: str) -> bool:
     """The one-time rebuild of `pots`, run at startup. Returns True if it ran.
 
@@ -198,6 +218,7 @@ def migrate(con: sqlite3.Connection, db_path: str) -> bool:
     cols = [r[1] for r in con.execute("PRAGMA table_info(pots)")]
     if not cols or "controller" not in cols:
         return False  # fresh database, or already rebuilt
+    backup = None
     if db_path != ":memory:":
         # The live database is WAL, so recent commits sit in the -wal file
         # and a plain copy of the main file would back up everything except
@@ -210,33 +231,52 @@ def migrate(con: sqlite3.Connection, db_path: str) -> bool:
                 "cannot checkpoint the WAL before rebuilding pots: another "
                 "connection is holding it open, and the backup would be short"
             )
-        shutil.copyfile(db_path, db_path + ".pre-identity.bak")
+        backup = db_path + ".pre-identity.bak"
+        shutil.copyfile(db_path, backup)
     rows = con.execute(
         f"SELECT {', '.join(_OLD_POT_COLUMNS)} FROM pots ORDER BY id"
     ).fetchall()
-    # No BEGIN here on purpose: sqlite3.executescript() commits any open
-    # transaction before it runs, so wrapping this in one would silently
-    # split it. The backup taken two lines up is the safety net instead.
-    con.execute("DROP VIEW IF EXISTS pots_now")
-    con.execute("DROP TABLE pots")
+    # Everything the new shape needs except `pots` and its view — the
+    # pot_mappings table and every index — arrives here, before the rebuild
+    # opens its transaction, because executescript() commits and would
+    # otherwise split it in two.
     con.executescript(SCHEMA_SQL)
-    for row in rows:
-        old = dict(zip(_OLD_POT_COLUMNS, row))
-        pot_id = new_pot_id()
-        keys = [k for k in old if k not in ("controller", "channel", "outlet")]
-        con.execute(
-            f"INSERT INTO pots (id, {', '.join(keys)}) "
-            f"VALUES (?, {', '.join('?' * len(keys))})",
-            [pot_id, *(old[k] for k in keys)],
-        )
-        if any(old[k] is not None for k in ("controller", "channel", "outlet")):
+    con.execute("BEGIN IMMEDIATE")
+    with con:
+        # One transaction, DDL included (sqlite rolls that back like any
+        # other statement). A container killed mid-rebuild — a NAS reboot, an
+        # OOM kill, a power cut — must come back with the old table intact
+        # and retry: an empty `pots` in the NEW shape would read to the guard
+        # above as "already migrated", and the garden would be gone for good.
+        con.execute("DROP VIEW IF EXISTS pots_now")
+        con.execute("DROP TABLE pots")
+        for ddl in _pots_ddl():
+            con.execute(ddl)
+        for row in rows:
+            old = dict(zip(_OLD_POT_COLUMNS, row))
+            pot_id = new_pot_id()
+            keys = [k for k in old if k not in ("controller", "channel", "outlet")]
             con.execute(
-                "INSERT INTO pot_mappings "
-                "(pot_id, controller, channel, outlet, from_ts, to_ts) "
-                "VALUES (?, ?, ?, ?, 0, NULL)",
-                (pot_id, old["controller"], old["channel"], old["outlet"]),
+                f"INSERT INTO pots (id, {', '.join(keys)}) "
+                f"VALUES (?, {', '.join('?' * len(keys))})",
+                [pot_id, *(old[k] for k in keys)],
             )
-    con.commit()
+            if any(old[k] is not None for k in ("controller", "channel", "outlet")):
+                con.execute(
+                    "INSERT INTO pot_mappings "
+                    "(pot_id, controller, channel, outlet, from_ts, to_ts) "
+                    "VALUES (?, ?, ?, ?, 0, NULL)",
+                    (pot_id, old["controller"], old["channel"], old["outlet"]),
+                )
+    # Say so: this runs once, unattended, and it rewrites every pot id the
+    # app and the operator were using. A silent irreversible step is one
+    # nobody can audit afterwards, and nobody would find the backup.
+    print(
+        f"rebuilt {len(rows)} pots onto random ids and moved their wiring "
+        "into pot_mappings"
+        + (f"; the database as it was is at {backup}" if backup else ""),
+        file=sys.stderr,
+    )
     return True
 
 

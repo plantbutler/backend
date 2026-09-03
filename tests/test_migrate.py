@@ -2,6 +2,9 @@
 
 import sqlite3
 
+import pytest
+
+import butler
 from butler import migrate, new_pot_id
 
 OLD_POTS = """
@@ -128,3 +131,57 @@ def test_the_backup_carries_what_is_still_in_the_wal(tmp_path):
     assert backup.execute(
         "SELECT name, controller, channel FROM pots"
     ).fetchall() == [("basil", "butler1", 3)]
+
+
+def test_a_rebuild_killed_half_way_leaves_the_old_table_intact(tmp_path, monkeypatch):
+    """The whole rebuild is one transaction, or a killed container loses the garden.
+
+    The container is restarted by a NAS reboot, an OOM kill or a power cut
+    like any other. If the DROP commits on its own and the refill does not,
+    `pots` comes back empty AND in the new shape — which is exactly what
+    the idempotence guard reads as "already migrated", so the next start
+    does nothing and the loss is permanent and silent.
+    """
+    path, con = old_db(tmp_path)
+    real = butler.new_pot_id
+    minted = []
+
+    def killed_on_the_second_pot():
+        minted.append(1)
+        if len(minted) == 2:
+            raise RuntimeError("the container was killed mid-rebuild")
+        return real()
+
+    monkeypatch.setattr(butler, "new_pot_id", killed_on_the_second_pot)
+    with pytest.raises(RuntimeError):
+        migrate(con, path)
+
+    assert [r[1] for r in con.execute("PRAGMA table_info(pots)")][:3] == [
+        "id",
+        "name",
+        "controller",
+    ]
+    assert con.execute("SELECT COUNT(*) FROM pots").fetchone() == (2,)
+    assert con.execute("SELECT COUNT(*) FROM pot_mappings").fetchone() == (0,)
+
+    # And the next start simply retries, as if nothing had happened.
+    monkeypatch.setattr(butler, "new_pot_id", real)
+    assert migrate(con, path) is True
+    assert sorted(n for (n,) in con.execute("SELECT name FROM pots")) == [
+        "basil",
+        "unmapped",
+    ]
+
+
+def test_the_rebuild_says_what_it_did(tmp_path, capsys):
+    """An irreversible one-off that runs unannounced is one nobody can audit.
+
+    It rewrites every pot id, so the operator has to be told it happened,
+    how much it moved and where the copy of the old database is.
+    """
+    path, con = old_db(tmp_path)
+    migrate(con, path)
+
+    said = capsys.readouterr().err
+    assert "2 pots" in said
+    assert "old.db.pre-identity.bak" in said
