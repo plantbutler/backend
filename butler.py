@@ -516,6 +516,25 @@ def parse_interval(text: str) -> tuple[str, int]:
 HISTORY_MAX_BUCKETS = 168 * 3600 // 300
 
 
+def parse_doses(params: QueryParams) -> tuple[str | None, int]:
+    """`GET /doses?pot=<pot id>&limit=<1..200>`.
+
+    No pot means the whole garden. Same query-parameter strictness as
+    /history, and the same plain-text refusal.
+    """
+    values = params.getlist("pot")
+    if len(values) > 1:
+        raise ValueError("pot= given twice")
+    pot = values[0] if values else None
+    if pot is not None and not pot:
+        raise ValueError("pot= is empty")
+    limits = params.getlist("limit")
+    if len(limits) > 1:
+        raise ValueError("limit= given twice")
+    limit = _int_in(limits[0] if limits else "50", "limit", 1, DOSES_MAX + 1)
+    return pot, limit
+
+
 def parse_history(params: QueryParams) -> tuple[str, int, int, int]:
     """`GET /history?c=<controller>&ch=<channel>&hours=<1..168>&bucket_s=<60..3600>`.
 
@@ -573,6 +592,23 @@ LAST_DOSE_KEYS = (
     "acked_ts",
     "verdict",
 )
+DOSE_KEYS = (
+    "id",
+    "kind",
+    "ml",
+    "cap_s",
+    "flow_ml",
+    "state",
+    "source",
+    "created_ts",
+    "sent_ts",
+    "acked_ts",
+    "verdict",
+    "pot",
+    "pot_name",
+)
+DOSES_MAX = 200
+
 POT_COLUMNS = (  # the pots_now view's shape: pot columns plus the open mapping
     "id",
     "name",
@@ -2185,6 +2221,68 @@ def create_app(
         except sqlite3.OperationalError as why:
             return PlainTextResponse(f"try again: {why}\n", status_code=503)
         return JSONResponse({"pots": garden})
+
+    @app.get("/doses")
+    def doses(request: Request):
+        """The watering history: what was asked, what the meter counted,
+        how it ended and what the human made of it.
+
+        Attributed through the pot's own mapping windows, so a remapping
+        moves a pot's past with it instead of relabelling it with whoever
+        hangs on that hose now. Proposals are left out — they are offers
+        the rules made, not water that was poured; the rest stays, because
+        the row worth reading is the one that expired or flowed short, and
+        filtering those out would hide exactly what the list is for.
+
+        Without a pot the whole garden is listed, and a dose nobody can be
+        attributed (handed out on a hose no pot held, or never handed out
+        at all) carries a null pot rather than vanishing. With a pot only
+        its own doses can appear, and an unhanded one therefore cannot:
+        a dose belongs to a pot from the moment the board is given it.
+        """
+        try:
+            pot_id, limit = parse_doses(request.query_params)
+        except ValueError as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=400)
+        columns = (
+            "c.id, c.kind, c.ml, c.cap_s, c.flow_ml, c.state, c.source, "
+            "c.created_ts, c.sent_ts, c.acked_ts, v.verdict, p.id, p.name"
+        )
+        # Newest first, by when the board was handed it; an unhanded one
+        # sorts by when it was made, which is the only time it has.
+        tail = (
+            "AND c.state != 'proposed' GROUP BY c.id "
+            "ORDER BY COALESCE(c.sent_ts, c.created_ts) DESC, c.id DESC LIMIT ?"
+        )
+        # GROUP BY c.id, not because a dose has many rows but because two
+        # overlapping windows on one hose would list it twice. That is a
+        # configuration error either way; showing the dose once is the
+        # better of the two wrong answers.
+        if pot_id is None:
+            sql = (
+                f"SELECT {columns} FROM commands c "
+                "LEFT JOIN pot_mappings m ON m.controller = c.controller "
+                "AND m.outlet = c.outlet AND c.sent_ts >= m.from_ts "
+                "AND (m.to_ts IS NULL OR c.sent_ts < m.to_ts) "
+                "LEFT JOIN pots p ON p.id = m.pot_id "
+                "LEFT JOIN verdicts v ON v.command_id = c.id "
+                f"WHERE 1 {tail}"
+            )
+            args: tuple = (limit,)
+        else:
+            sql = (
+                f"SELECT {columns} FROM {HANDED_TO_POT} "
+                "JOIN pots p ON p.id = m.pot_id "
+                "LEFT JOIN verdicts v ON v.command_id = c.id "
+                f"WHERE 1 {tail}"
+            )
+            args = (pot_id, limit)
+        try:
+            with connect() as con:
+                rows = [dict(zip(DOSE_KEYS, row)) for row in con.execute(sql, args)]
+        except sqlite3.OperationalError as why:
+            return PlainTextResponse(f"try again: {why}\n", status_code=503)
+        return JSONResponse({"doses": rows, "now": int(time.time())})
 
     @app.get("/history")
     def history(request: Request):
