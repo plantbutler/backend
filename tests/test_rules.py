@@ -487,6 +487,29 @@ def test_a_dose_stays_with_the_pot_when_the_hoses_are_swapped(client, db):
     assert cards(client)["mint"]["last_dose"] is None  # mint was never watered
 
 
+def test_a_water_now_on_a_hose_the_pot_has_left_is_not_its_dose(client, db):
+    """The sentence the README owes the app's author, pinned.
+
+    `last_dose` is not "the newest command on that hose": basil is dosed
+    on outlet 3, then moves to outlet 4 while mint takes outlet 3, and the
+    water-now that goes down outlet 3 next is MINT's. A client written to
+    the older wording files basil's verdict against mint's soil — into the
+    log adaptive dosing will one day be fit on.
+    """
+    basil = make_pot(client)
+    soak(client, 5)
+    report(client, extra="ack=1 flow_ml=97")  # cmd 1: basil's, on outlet 3
+    rewind(db, 3600)  # an hour later the hoses are rearranged
+
+    post(client, "/pot", f"id={basil} channel=1 outlet=4")
+    post(client, "/pot", "name=mint controller=b1 channel=0 outlet=3")
+    post(client, "/command", "c=b1 water=3 ml=50 cap_s=5")
+    report(client, extra=f"ch1={DRY}")  # cmd 2 handed out, down outlet 3
+
+    assert cards(client)["basil"]["last_dose"]["id"] == 1
+    assert cards(client)["mint"]["last_dose"]["id"] == 2
+
+
 def test_a_proposal_is_not_inherited_by_the_next_pot_on_the_hose(client, db):
     """A proposal is an offer to open a hose, so it does not travel with the
     pot either — and the pot that arrives on that hose must not be offered

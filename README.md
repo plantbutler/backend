@@ -76,9 +76,11 @@ curl -s -X POST http://localhost:8000/verdict -H 'X-Token: dev' \
   --data-binary 'cmd=17 verdict=ok'               # or too_much / too_little
 ```
 
-Each pot in `GET /pots` also carries `last_dose`: the newest command handed to the board on
-that hose, with what the meter counted and the verdict so far. That is what the app judges
-from; a manual water-now on the same hose replaces it.
+Each pot in `GET /pots` also carries `last_dose`: the newest dose this POT was handed, with
+what the meter counted and the verdict so far. Whose dose a command was is resolved through
+the pot's mapping windows and not through whoever hangs on that hose today, so moving a hose
+takes the dose history with it. That is what the app judges from; a manual water-now replaces
+it only while the pot still holds the hose it was sent down.
 
 Or skip curl and let a fake board do the whole dance — report, receive, water, ack:
 
