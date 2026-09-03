@@ -658,6 +658,25 @@ def test_a_channel_correction_does_not_mute_the_proposal_nudge(app, client, db, 
     assert "basil" in sent[0].message and "proposal 1" in sent[0].message
 
 
+def test_the_nudge_is_not_inherited_by_the_next_pot_on_the_hose(app, client, db, sent):
+    """The hoses are swapped while basil's offer is still standing. It was
+    sized for basil's dryness and only basil's card shows it, so mint must
+    not be nudged about it. Keyed on the hose alone the phone reads "mint
+    looks dry (None%, target None%): proposal 1 for 100 ml" — a pot that
+    never had that proposal, and a card that shows none to approve."""
+    basil = make_pot(client, mode="learning")
+    for _ in range(5):
+        report(client)
+    assert run_sql(db, "SELECT id, state FROM commands") == [(1, "proposed")]
+    rewind(db, 3600)  # an hour later, the hoses are swapped
+
+    post(client, "/pot", f"id={basil} channel=1 outlet=4")
+    post(client, "/pot", "name=mint controller=b1 channel=0 outlet=3")
+
+    tick(app, int(time.time()))
+    assert [a.key for a in sent if a.key.startswith("proposal:")] == []
+
+
 # --------------------------------------------------------------------------- #
 # The tick: send-then-record, the dead-man, the probes
 # --------------------------------------------------------------------------- #
