@@ -63,6 +63,14 @@ def soak(client, n, raw=DRY, safe=True):
     return last
 
 
+def soak_both(client, n):
+    """Reports carrying ch0 and ch1, so a pot whose sensor channel is
+    corrected mid-test keeps reading a channel that is actually there: a
+    silent channel is skipped by the ladder before any gate is reached."""
+    for _ in range(n):
+        report(client, extra=f"ch1={DRY}")
+
+
 def commands(db):
     with sqlite3.connect(db) as con:
         return con.execute(
@@ -536,3 +544,35 @@ def test_a_proposal_survives_a_correction_that_leaves_the_hose_alone(client, db)
     post(client, "/pot", f"id={basil} channel=1")
 
     assert cards(client)["basil"]["proposal"]["id"] == 1
+
+
+def test_a_remap_in_the_second_of_a_dose_spends_the_cap_once(client, db):
+    """Both ends of the mapping window are inclusive on purpose, so a dose
+    handed in the very second of a remap is held by the pot that left AND
+    by the pot that arrived — two pots waiting errs dry.
+
+    When the remap leaves the hose alone, though — a miswired sensor
+    channel corrected — those two windows belong to the SAME pot, the dose
+    matches both, and the daily cap SUMs it twice. One 100 ml dose spends
+    200 of the allowance and the pot is refused for the rest of the day.
+    """
+    basil = make_pot(client, cooldown_h=0, daily_cap_ml=250)
+    soak_both(client, 5)  # cmd 1: 100 ml on outlet 3, handed out
+    rewind(db, 600)  # so the first window is a real one, not a single second
+
+    post(client, "/pot", f"id={basil} channel=1")  # the sensor was miswired
+    with sqlite3.connect(db) as con:
+        # Put the dose on the boundary the remap wrote as the old window's
+        # to_ts and the new one's from_ts: the one ambiguous second.
+        (edge,) = con.execute(
+            "SELECT from_ts FROM pot_mappings WHERE pot_id = ? AND to_ts IS NULL",
+            (basil,),
+        ).fetchone()
+        con.execute(
+            "UPDATE commands SET state = 'acked', sent_ts = ?, acked_ts = ?, "
+            "flow_ml = 100 WHERE id = 1",
+            (edge, edge),
+        )
+
+    soak_both(client, 6)  # 100 ml of 250 spent, so the next 100 ml fits
+    assert len(commands(db)) == 2

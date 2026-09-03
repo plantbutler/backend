@@ -947,9 +947,15 @@ def create_app(
             if watered:
                 continue
             cap = cap_ml if cap_ml is not None else DEFAULT_DAILY_CAP_DOSES * dose
+            # DISTINCT because a dose handed in the very second of a remap
+            # sits in the window that closed and the one that opened, and
+            # when the remap left the hose alone both of them are this
+            # pot's: the cooldown above only asks whether a row exists, but
+            # a SUM would spend one dose's millilitres twice.
             (spent,) = con.execute(
-                f"SELECT COALESCE(SUM(COALESCE(c.flow_ml, c.ml)), 0) "
-                f"FROM {WATERED_THE_POT} WHERE c.sent_ts > ?",
+                "SELECT COALESCE(SUM(spent), 0) FROM ("
+                "SELECT DISTINCT c.id, COALESCE(c.flow_ml, c.ml) AS spent "
+                f"FROM {WATERED_THE_POT} WHERE c.sent_ts > ?)",
                 (pot_id, now - 86400),
             ).fetchone()
             if spent + dose > cap:
