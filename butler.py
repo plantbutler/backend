@@ -196,13 +196,15 @@ def _pots_ddl() -> list[str]:
     """
     scratch = sqlite3.connect(":memory:")
     scratch.executescript(SCHEMA_SQL)
-    return [
+    ddl = [
         sql
         for (sql,) in scratch.execute(
             "SELECT sql FROM sqlite_master WHERE name IN ('pots', 'pots_now') "
             "ORDER BY type"  # 'table' before 'view': the view reads the table
         )
     ]
+    scratch.close()
+    return ddl
 
 
 def migrate(con: sqlite3.Connection, db_path: str) -> bool:
