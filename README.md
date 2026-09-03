@@ -39,21 +39,30 @@ curl -s -X POST http://localhost:8000/interval \
   -H 'X-Token: dev' --data-binary 'c=butler1 next=120'
 ```
 
-Tell it what hangs where — a pot is a name plus whatever fields you feel like setting
-(repotting or swapping a hose is an edit; recalibrating is two numbers):
+Tell it what hangs where. A bare `name=` creates a pot and mints its id; the answer carries
+both, and that id is what every later save keys on — the name is only a nickname and is edited
+like any other field. Whatever fields you feel like setting, in any order (repotting or swapping
+a hose is an edit; recalibrating is two numbers):
 
 ```bash
 curl -s -X POST http://localhost:8000/pot \
   -H 'X-Token: dev' \
   --data-binary 'name=basil controller=butler1 channel=0 outlet=3 plant_type=basil pot_size=14cm'
+# -> pot=pot-3f9a21 name=basil
 curl -s -X POST http://localhost:8000/pot \
-  -H 'X-Token: dev' --data-binary 'name=basil dry_raw=12000 wet_raw=4000'
+  -H 'X-Token: dev' --data-binary 'id=pot-3f9a21 dry_raw=12000 wet_raw=4000'
 curl -s http://localhost:8000/pots     # the garden, with latest raw and derived %
 curl -s 'http://localhost:8000/history?c=butler1&ch=0&hours=24&bucket_s=300'
 # -> {"since": ..., "to": ..., "points": [{"ts", "raw", "lo", "hi", "n"}, ...]}: the chart's
 #    wire, raw counts bucketed on the server's clock; the app derives % from the pot's
 #    calibration, so recalibrating re-reads the whole curve
 ```
+
+Key a save on the name instead and it is a create the day somebody renames the pot: after
+`basil` becomes `genovese`, `name=basil dry_raw=...` makes a second pot, wired to nothing, and
+calibrates that one. The wiring you send does not live in the pot either — it goes to
+`pot_mappings` with a validity window, so moving a hose takes the pot's doses, cooldown and
+daily cap with it instead of leaving them for whatever hangs there next.
 
 Once a pot is calibrated, has a target range and a dose, and is flipped to `mode=learning`
 or `mode=auto` (a human act, per pot), the rules water it — but only when the board's own

@@ -251,6 +251,24 @@ def test_a_pot_can_be_renamed_by_id(client):
     assert [e["id"] for e in garden(client)] == [pid]
 
 
+def test_a_save_by_name_after_a_rename_creates_a_second_pot(client):
+    """Which is why every edit keys on the id, and why the README says so.
+
+    A `name=` save is a create when that name is free, so a client that
+    remembered the nickname and missed the rename does not recalibrate the
+    pot — it forks it, and calibrates a pot nobody is watering.
+    """
+    pid = pot_id(pot(client, "name=basil controller=butler1 channel=0"))
+    pot(client, f"id={pid} name=genovese")
+
+    assert pot(client, "name=basil dry_raw=12000 wet_raw=4000").status_code == 200
+
+    entries = {e["name"]: e for e in garden(client)}
+    assert sorted(entries) == ["basil", "genovese"]
+    assert entries["genovese"]["dry_raw"] is None  # the real pot, uncalibrated
+    assert entries["basil"]["controller"] is None  # the fork, wired to nothing
+
+
 def test_renaming_onto_a_taken_name_is_refused(client):
     basil = pot_id(pot(client, "name=basil"))
     pot(client, "name=mint")

@@ -2,6 +2,13 @@
 -- CREATE IF NOT EXISTS lines with the pitch that needs them (no migrations
 -- framework, per the plan's no-gos). Raw counts are kept forever; percentages
 -- are derived at read time and never stored.
+--
+-- One exception exists, and only one: butler.migrate() rebuilds `pots` at
+-- startup to retype its primary key and move the wiring into pot_mappings,
+-- which no CREATE IF NOT EXISTS can do. It runs once per database, in one
+-- transaction, and leaves <db>.pre-identity.bak behind. Anything else that
+-- needs a shape change on a live database is a new table, not a second one
+-- of those.
 
 CREATE TABLE IF NOT EXISTS readings (
   ts         INTEGER NOT NULL,  -- server arrival time, unix seconds
