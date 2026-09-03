@@ -199,6 +199,17 @@ def migrate(con: sqlite3.Connection, db_path: str) -> bool:
     if not cols or "controller" not in cols:
         return False  # fresh database, or already rebuilt
     if db_path != ":memory:":
+        # The live database is WAL, so recent commits sit in the -wal file
+        # and a plain copy of the main file would back up everything except
+        # what is most at risk. Checkpoint first, and refuse the whole
+        # rebuild if anything is holding the log open: a deferred migration
+        # is recoverable, a DROP behind a blank backup is not.
+        busy, *_ = con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if busy:
+            raise sqlite3.OperationalError(
+                "cannot checkpoint the WAL before rebuilding pots: another "
+                "connection is holding it open, and the backup would be short"
+            )
         shutil.copyfile(db_path, db_path + ".pre-identity.bak")
     rows = con.execute(
         f"SELECT {', '.join(_OLD_POT_COLUMNS)} FROM pots ORDER BY id"
@@ -475,7 +486,7 @@ POT_INT_FIELDS = {  # half-open bounds, like every other field
     "daily_cap_ml": (0, 100_001),
     "enabled": (0, 2),
 }
-POT_TEXT_FIELDS = ("controller", "plant_type", "plant_size", "pot_size", "soil")
+POT_TEXT_FIELDS = ("plant_type", "plant_size", "pot_size", "soil", "species")
 POT_MAP_FIELDS = ("controller", "channel", "outlet")  # pot_mappings, not pots
 POT_MODES = ("manual", "learning", "auto")
 LAST_DOSE_KEYS = (
@@ -513,15 +524,20 @@ POT_COLUMNS = (  # the pots_now view's shape: pot columns plus the open mapping
 
 
 def parse_pot(text: str) -> dict:
-    """The `POST /pot` body: `name=<pot>` plus whatever fields to set.
+    """The `POST /pot` body: which pot, plus whatever fields to set.
 
-    A partial upsert — only the keys given change, so recalibration is
-    `name=basil dry_raw=13000 wet_raw=4200` and nothing else moves. Values
-    are single k=v tokens, so multi-word text uses underscores. Unknown
-    keys are ignored, for the same reason as everywhere else.
+    An `id=` is an EDIT of that pot — name included, so renaming is an
+    ordinary field edit and no history is orphaned by it. A bare `name=`
+    is a create, and mints an id.
+
+    A partial upsert either way — only the keys given change, so
+    recalibration is `id=pot-3f9a21 dry_raw=13000 wet_raw=4200` and
+    nothing else moves. Values are single k=v tokens, so multi-word text
+    uses underscores. Unknown keys are ignored, for the same reason as
+    everywhere else.
     """
     fields: dict = {}
-    known = {"name", "mode", *POT_TEXT_FIELDS, *POT_INT_FIELDS}
+    known = {"id", "name", "mode", "controller", *POT_TEXT_FIELDS, *POT_INT_FIELDS}
     for token in text.split():
         key, sep, value = token.partition("=")
         if not sep or not key:
@@ -541,8 +557,8 @@ def parse_pot(text: str) -> dict:
             fields[key] = value
         else:
             fields[key] = value
-    if "name" not in fields:
-        raise ValueError("no name= in the request")
+    if "id" not in fields and "name" not in fields:
+        raise ValueError("no id= or name= in the request")
     return fields
 
 
@@ -1002,36 +1018,50 @@ def create_app(
             )
         return value or interval
 
-    def upsert_pot(fields: dict) -> None:
+    def upsert_pot(fields: dict) -> tuple[str, str]:
         """Create or partially update one pot, refusing inconsistent merges.
 
-        Validation runs on the MERGED row (stored values plus this
-        request), so `dry_raw=5000` today and `wet_raw=5000` tomorrow is
-        refused just like both in one request. Column names come from the
-        parse_pot whitelist, never from the wire, so building SQL from
-        them is safe.
+        `id=` edits that pot, name included, so renaming is an ordinary
+        field edit. A bare `name=` creates and mints an id. Validation runs
+        on the MERGED row, stored values plus this request, so `dry_raw`
+        today and `wet_raw` tomorrow is refused just like both at once.
+        Column names come from the parse_pot whitelist, never the wire.
 
         Mapping keys land in pot_mappings, not pots: a changed wiring
         closes the open row and opens another, so past readings stay
         attributed to the pot that was actually on that channel.
         """
-        name = fields["name"]
+        pot_id = fields.get("id")
         now = int(time.time())
-        sets = {k: v for k, v in fields.items() if k != "name"}
         with connect() as con:
             con.execute("BEGIN IMMEDIATE")
-            row = con.execute(
-                f"SELECT {', '.join(POT_COLUMNS)} FROM pots_now WHERE name = ?",
-                (name,),
-            ).fetchone()
+            if pot_id is not None:
+                row = con.execute(
+                    f"SELECT {', '.join(POT_COLUMNS)} FROM pots_now WHERE id = ?",
+                    (pot_id,),
+                ).fetchone()
+                if row is None:
+                    # An edit of a pot that is not there is a bug in the
+                    # caller, not an invitation to create one under a name
+                    # nobody asked for.
+                    raise ValueError(f"no pot {pot_id}")
+            else:
+                row = con.execute(
+                    f"SELECT {', '.join(POT_COLUMNS)} FROM pots_now WHERE name = ?",
+                    (fields["name"],),
+                ).fetchone()
             current = (
                 dict(zip(POT_COLUMNS, row))
                 if row
                 else dict.fromkeys(POT_COLUMNS)
                 | {"mode": "manual", "enabled": 1, "id": new_pot_id()}
             )
-            merged = current | sets | {"name": name}
+            # The id is minted into `current` before the merge, so a create
+            # and an edit take one path from here on.
+            sets = {k: v for k, v in fields.items() if k != "id"}
+            merged = current | sets
             pot_id = current["id"]
+            name = merged["name"]
             if merged["dry_raw"] is not None and merged["dry_raw"] == merged["wet_raw"]:
                 raise ValueError("dry_raw and wet_raw must differ")
             if (
@@ -1040,6 +1070,13 @@ def create_app(
                 and merged["target_low_pct"] >= merged["target_high_pct"]
             ):
                 raise ValueError("target_low_pct must be below target_high_pct")
+            clash = con.execute(
+                "SELECT id FROM pots WHERE name = ? AND id != ?", (name, pot_id)
+            ).fetchone()
+            if clash:
+                # The UNIQUE index would refuse this anyway, with a message
+                # nobody outside sqlite can read.
+                raise ValueError(f"the name {name} is taken by pot {clash[0]}")
             if merged["enabled"] and merged["controller"] is not None:
                 # Two enabled pots on one sensor or one hose is a config
                 # error that would misread or miswater — refuse loudly.
@@ -1089,6 +1126,7 @@ def create_app(
                         "VALUES (?, ?, ?, ?, ?, NULL)",
                         (pot_id, *wiring, now),
                     )
+        return pot_id, name
 
     def approve(cmd_id: int) -> tuple | None:
         """proposed -> queued, slot permitting; returns the blocker if busy.
@@ -1815,12 +1853,12 @@ def create_app(
         except (UnicodeDecodeError, ValueError) as why:
             return PlainTextResponse(f"refused: {why}\n", status_code=400)
         try:
-            await run_in_threadpool(upsert_pot, parsed)
+            pot_id, name = await run_in_threadpool(upsert_pot, parsed)
         except ValueError as why:
             return PlainTextResponse(f"refused: {why}\n", status_code=400)
         except sqlite3.OperationalError as why:
             return PlainTextResponse(f"try again: {why}\n", status_code=503)
-        return PlainTextResponse(f"pot={parsed['name']}\n")
+        return PlainTextResponse(f"pot={pot_id} name={name}\n")
 
     @app.post("/approve")
     async def approve_proposal(request: Request):

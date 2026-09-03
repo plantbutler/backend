@@ -103,3 +103,28 @@ def test_a_fresh_database_is_already_in_the_new_shape(tmp_path):
     con.executescript(SCHEMA_SQL)
     assert migrate(con, path) is False
     assert not (tmp_path / "fresh.db.pre-identity.bak").exists()
+
+
+def test_the_backup_carries_what_is_still_in_the_wal(tmp_path):
+    """The live database runs in WAL mode, so the main file lags behind.
+
+    The rebuild DROPs the pots table, and the backup is the only thing
+    standing between that and the garden. A plain copy of the main file
+    would omit every commit not yet checkpointed — which, for a container
+    killed between a save and a restart, is exactly the rows at risk.
+    """
+    path = str(tmp_path / "wal.db")
+    con = sqlite3.connect(path)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.executescript(OLD_POTS)
+    con.execute(
+        "INSERT INTO pots (name, controller, channel) VALUES ('basil', 'butler1', 3)"
+    )
+    con.commit()
+
+    assert migrate(con, path) is True
+
+    backup = sqlite3.connect(str(tmp_path / "wal.db.pre-identity.bak"))
+    assert backup.execute(
+        "SELECT name, controller, channel FROM pots"
+    ).fetchall() == [("basil", "butler1", 3)]
