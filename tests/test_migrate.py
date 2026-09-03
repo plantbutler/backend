@@ -3,9 +3,10 @@
 import sqlite3
 
 import pytest
+from fastapi.testclient import TestClient
 
 import butler
-from butler import migrate, new_pot_id
+from butler import create_app, migrate, new_pot_id
 
 OLD_POTS = """
 CREATE TABLE pots (
@@ -185,3 +186,43 @@ def test_the_rebuild_says_what_it_did(tmp_path, capsys):
     said = capsys.readouterr().err
     assert "2 pots" in said
     assert "old.db.pre-identity.bak" in said
+
+
+def test_starting_on_a_live_old_database_rebuilds_it(tmp_path):
+    """The rebuild is wired into startup, and the garden survives it.
+
+    Every test above drives migrate() on a hand-built table; this one is
+    the only one that exercises the line that actually calls it, and the
+    startup ordering it depends on — schema.sql runs first, and creates
+    the pots_now view over the OLD pots table, before migrate() drops it.
+    Take the call out of create_app and everything above still passes,
+    while `GET /pots` answers 503 no such column: p.species and /report
+    keeps returning 200, so nothing pages and the garden is simply gone.
+    """
+    path, con = old_db(tmp_path)
+    con.close()
+
+    client = TestClient(
+        create_app(db_path=path, token="test-token", next_s=60, cmd_ttl_s=900)
+    )
+    pots = client.get("/pots").json()["pots"]
+
+    assert [p["name"] for p in pots] == ["basil", "unmapped"]
+    basil = pots[0]
+    assert basil["id"].startswith("pot-")
+    assert (basil["controller"], basil["channel"], basil["outlet"]) == ("butler1", 3, 1)
+    assert (basil["dry_raw"], basil["wet_raw"], basil["mode"]) == (13000, 4200, "auto")
+    with sqlite3.connect(path) as check:
+        assert check.execute(
+            "SELECT controller, channel, outlet, from_ts, to_ts FROM pot_mappings "
+            "WHERE pot_id = ?",
+            (basil["id"],),
+        ).fetchall() == [("butler1", 3, 1, 0, None)]
+    assert (tmp_path / "old.db.pre-identity.bak").exists()
+
+    # The restart that matters in production: a second container start on
+    # the same file must change nothing, ids included.
+    again = TestClient(
+        create_app(db_path=path, token="test-token", next_s=60, cmd_ttl_s=900)
+    )
+    assert again.get("/pots").json()["pots"] == pots
