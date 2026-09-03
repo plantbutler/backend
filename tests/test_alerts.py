@@ -107,6 +107,7 @@ def make_pot(client, **over):
     body = " ".join(f"{k}={v}" for k, v in fields.items())
     answer = post(client, "/pot", body)
     assert answer.status_code == 200, answer.text
+    return answer.text.split()[0].removeprefix("pot=")
 
 
 def run_sql(db, sql, *params):
@@ -165,6 +166,14 @@ def plant_dose(
     sent_ts = now - sent_ago
     acked_ts = None if acked_ago is None else now - acked_ago
     with sqlite3.connect(db) as con:
+        # A pot is wired before it is watered. make_pot stamps its mapping
+        # window milliseconds ago and the dose is planted well in the past,
+        # so the window has to move back with it or the dose belongs to no
+        # pot at all and the judgement has nothing to read.
+        con.execute(
+            "UPDATE pot_mappings SET from_ts = ? WHERE to_ts IS NULL AND from_ts > ?",
+            (sent_ts - 10, sent_ts - 10),
+        )
         con.execute(
             "INSERT INTO commands (created_ts, controller, kind, outlet, ml, "
             "cap_s, state, source, sent_ts, acked_ts, flow_ml) "
@@ -472,6 +481,23 @@ def test_a_dose_with_no_moisture_rise_alerts_at_default_priority(app, client, db
     assert sent[0].priority == "default"  # the bench rig has not spoken yet
     assert "moisture went" in sent[0].message
     assert dose_rows(db) == [("dose:1", "failed")]
+
+
+def test_a_dose_is_judged_for_the_pot_that_got_it(app, client, db, sent):
+    """The hoses are swapped after the dose. The page must still name the
+    pot that was watered and read that pot's own sensor, or it reports a
+    failure against a plant that was never dosed."""
+    basil = make_pot(client)  # channel 0, outlet 3
+    plant_dose(db, flow_ml=95, after_raw=DRY + 100)  # basil did not drink it
+    post(client, "/pot", f"id={basil} channel=1 outlet=4")
+    post(client, "/pot", "name=mint controller=b1 channel=0 outlet=3")
+
+    tick(app, int(time.time()))
+
+    assert [a.key for a in sent] == ["dose:1"]
+    assert "basil" in sent[0].message
+    assert "mint" not in sent[0].message
+    assert "moisture went" in sent[0].message  # judged on basil's own window
 
 
 def test_a_dose_short_on_the_meter_alerts_high(app, client, db, sent):

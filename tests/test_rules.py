@@ -44,6 +44,7 @@ def make_pot(client, drop=None, **over):
     body = " ".join(f"{k}={v}" for k, v in fields.items())
     answer = client.post("/pot", content=body, headers={"X-Token": TOKEN})
     assert answer.status_code == 200, answer.text
+    return answer.text.split()[0].removeprefix("pot=")
 
 
 def report(client, raw=DRY, safe=True, extra="", token=TOKEN):
@@ -426,3 +427,96 @@ def test_verdict_refusals(client, db):
     assert post(client, "/verdict", "cmd=1").status_code == 400
     assert post(client, "/verdict", "verdict=ok").status_code == 400
     assert post(client, "/verdict", "cmd=1 verdict=ok", token="nope").status_code == 401
+
+
+# --------------------------------------------------------------------------- #
+# Remapping: the dose belongs to the pot, not to the hose
+# --------------------------------------------------------------------------- #
+
+
+def rewind(db, seconds):
+    """Everything that has happened so far moves that far into the past.
+
+    Mapping windows and commands are stamped in whole seconds and a test
+    runs in milliseconds, so without this the pot is created, watered and
+    remapped at one single timestamp and every window boundary is also
+    the dose. Real gardens are not repotted in the second the pump runs.
+    """
+    with sqlite3.connect(db) as con:
+        con.execute(
+            "UPDATE commands SET created_ts = created_ts - ?, "
+            "sent_ts = sent_ts - ?, acked_ts = acked_ts - ?",
+            (seconds, seconds, seconds),
+        )
+        con.execute(
+            "UPDATE pot_mappings SET from_ts = from_ts - ?, to_ts = to_ts - ?",
+            (seconds, seconds),
+        )
+
+
+def cards(client):
+    return {p["name"]: p for p in client.get("/pots").json()["pots"]}
+
+
+def test_a_dose_stays_with_the_pot_when_the_hoses_are_swapped(client, db):
+    """Whose dose was it? The pot that was on that hose when it was handed.
+
+    Otherwise the verdict the app files from mint's card — the learning
+    log adaptive dosing will be fit on — judges mint's soil against the
+    dose basil got.
+    """
+    basil = make_pot(client)
+    soak(client, 5)  # basil waters on outlet 3
+    report(client, extra="ack=1 flow_ml=97")
+    rewind(db, 3600)  # an hour later, the hoses are swapped
+
+    post(client, "/pot", f"id={basil} channel=1 outlet=4")
+    post(client, "/pot", "name=mint controller=b1 channel=0 outlet=3")
+
+    assert cards(client)["basil"]["last_dose"]["id"] == 1
+    assert cards(client)["mint"]["last_dose"] is None  # mint was never watered
+
+
+def test_a_proposal_is_not_inherited_by_the_next_pot_on_the_hose(client, db):
+    """A proposal is an offer to open a hose, so it does not travel with the
+    pot either — and the pot that arrives on that hose must not be offered
+    a dose that was sized for someone else's dryness."""
+    basil = make_pot(client, mode="learning")
+    soak(client, 5)  # proposal 1, for basil, on outlet 3
+    rewind(db, 3600)
+
+    post(client, "/pot", f"id={basil} outlet=4")
+    post(client, "/pot", "name=mint controller=b1 channel=1 outlet=3")
+
+    assert cards(client)["mint"]["proposal"] is None
+    assert cards(client)["basil"]["proposal"] is None  # not on that hose now
+
+
+def test_the_cooldown_stays_with_the_pot_when_its_hose_moves(client, db):
+    """The six hours belong to the plant, not to the plumbing. Watering a
+    pot and then moving its hose must not water it twice.
+
+    No rewind here on purpose: the remap lands in the very second of the
+    dose, which is the one genuinely ambiguous point of the window, and
+    the gates have to read that ambiguity as "watered" in both directions.
+    """
+    basil = make_pot(client)  # auto, outlet 3, default 6 h cooldown
+    soak(client, 5)
+    report(client, extra="ack=1 flow_ml=97")
+
+    post(client, "/pot", f"id={basil} outlet=4")
+
+    soak(client, 6)  # still bone dry, still freshly watered
+    assert len(commands(db)) == 1
+
+
+def test_the_daily_cap_stays_with_the_pot_when_its_hose_moves(client, db):
+    """The same, for the millilitres: a remap is not a fresh allowance."""
+    basil = make_pot(client, cooldown_h=0, daily_cap_ml=150)
+    soak(client, 5)
+    report(client, extra="ack=1 flow_ml=100")
+
+    post(client, "/pot", f"id={basil} outlet=4")
+
+    soak(client, 6)  # 100 + 100 > 150 wherever the hose hangs
+    assert len(commands(db)) == 1

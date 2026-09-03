@@ -563,6 +563,35 @@ POT_COLUMNS = (  # the pots_now view's shape: pot columns plus the open mapping
 )
 
 
+def _handed_to_pot(ends: str) -> str:
+    """A FROM clause taking one parameter, the pot id: the commands this pot
+    was actually given.
+
+    A command names a hose, not a pot, so what makes it this pot's is that
+    this pot held that hose when the board was handed it — which is what
+    pot_mappings records. A closed window keeps its doses, so moving a hose
+    takes the pot's history with it instead of leaving it for whoever
+    arrives on that hose next. Only handed commands can match: an unsent
+    one has a NULL sent_ts, and NULL >= from_ts is never true.
+    """
+    return (
+        "commands c JOIN pot_mappings m "
+        "ON m.controller = c.controller AND m.outlet = c.outlet AND m.pot_id = ? "
+        f"AND c.sent_ts >= m.from_ts AND (m.to_ts IS NULL OR c.sent_ts {ends} m.to_ts)"
+    )
+
+
+# Timestamps are whole seconds, so a dose handed in the very second a hose
+# was remapped is genuinely ambiguous, and the two readers want opposite
+# answers to it. For the record — whose dose was that, what is this verdict
+# about — exactly one pot must own it, and the window is half-open: it goes
+# to the pot that arrived. For the gates, both pots hold the cooldown and
+# spend the cap, because two pots waiting a turn they need not wait errs
+# dry, while neither of them waiting waters one of them twice.
+HANDED_TO_POT = _handed_to_pot("<")
+WATERED_THE_POT = _handed_to_pot("<=")
+
+
 def parse_pot(text: str) -> dict:
     """The `POST /pot` body: which pot, plus whatever fields to set.
 
@@ -824,7 +853,7 @@ def create_app(
         if in_quiet(time.localtime(now).tm_hour, *quiet_window):
             return
         candidates = con.execute(
-            "SELECT name, channel, outlet, dry_raw, wet_raw, target_low_pct, "
+            "SELECT id, channel, outlet, dry_raw, wet_raw, target_low_pct, "
             "dose_ml, mode, cooldown_h, daily_cap_ml FROM pots_now "
             "WHERE enabled = 1 AND mode IN ('learning', 'auto') "
             "AND controller = ? AND channel IS NOT NULL AND outlet IS NOT NULL "
@@ -834,7 +863,7 @@ def create_app(
             (r.controller,),
         ).fetchall()
         for (
-            name,
+            pot_id,
             channel,
             outlet,
             dry,
@@ -865,6 +894,9 @@ def create_app(
             median_pct = moisture_pct(window[RULES_WINDOW // 2], dry, wet)
             if median_pct is None or median_pct >= low:
                 continue
+            # Keyed on the hose, and rightly so: this one asks whether the
+            # plumbing is busy, not what this pot has had. The two gates
+            # below ask about the pot, and go through its mapping windows.
             open_cmd = con.execute(
                 "SELECT 1 FROM commands WHERE controller = ? AND outlet = ? "
                 "AND state IN ('proposed', 'queued', 'sent') LIMIT 1",
@@ -874,22 +906,22 @@ def create_app(
                 continue
             # Cooldown counts from the last command the board ever HELD
             # (sent_ts set): an expired-unacked command may still have
-            # watered, so it cools the pot just like an acked one.
+            # watered, so it cools the pot just like an acked one. It
+            # follows the pot when its hose moves — the six hours belong to
+            # the plant, and a remap that reset them would water it twice.
             cooldown_s = (cool_h if cool_h is not None else DEFAULT_COOLDOWN_H) * 3600
             watered = con.execute(
-                "SELECT 1 FROM commands WHERE controller = ? AND outlet = ? "
-                "AND sent_ts IS NOT NULL AND COALESCE(acked_ts, sent_ts) > ? "
-                "LIMIT 1",
-                (r.controller, outlet, now - cooldown_s),
+                f"SELECT 1 FROM {WATERED_THE_POT} "
+                "WHERE COALESCE(c.acked_ts, c.sent_ts) > ? LIMIT 1",
+                (pot_id, now - cooldown_s),
             ).fetchone()
             if watered:
                 continue
             cap = cap_ml if cap_ml is not None else DEFAULT_DAILY_CAP_DOSES * dose
             (spent,) = con.execute(
-                "SELECT COALESCE(SUM(COALESCE(flow_ml, ml)), 0) FROM commands "
-                "WHERE controller = ? AND outlet = ? AND sent_ts IS NOT NULL "
-                "AND sent_ts > ?",
-                (r.controller, outlet, now - 86400),
+                f"SELECT COALESCE(SUM(COALESCE(c.flow_ml, c.ml)), 0) "
+                f"FROM {WATERED_THE_POT} WHERE c.sent_ts > ?",
+                (pot_id, now - 86400),
             ).fetchone()
             if spent + dose > cap:
                 continue
@@ -1541,10 +1573,16 @@ def create_app(
             if acked_ts is not None and now < judge_at:
                 continue  # still soaking in; an expiry needs no wait
             key = f"dose:{cmd_id}"
+            # Whose dose this was: the pot on that hose when the board was
+            # handed it, not whoever hangs there now. After a remap the
+            # current occupant would put the wrong name on the page and
+            # have the rise judged against its own, undosed sensor.
             pot = con.execute(
-                "SELECT name, channel, dry_raw, wet_raw FROM pots_now "
-                "WHERE enabled = 1 AND controller = ? AND outlet = ?",
-                (controller, outlet),
+                "SELECT p.name, m.channel, p.dry_raw, p.wet_raw "
+                "FROM pot_mappings m JOIN pots p ON p.id = m.pot_id "
+                "WHERE m.controller = ? AND m.outlet = ? AND p.enabled = 1 "
+                "AND ? >= m.from_ts AND (m.to_ts IS NULL OR ? < m.to_ts)",
+                (controller, outlet, sent_ts, sent_ts),
             ).fetchone()
             name = pot[0] if pot else f"outlet {outlet}"
             symptoms: list[str] = []
@@ -1649,10 +1687,15 @@ def create_app(
             wet,
             low,
         ) in con.execute(
+            # The pot that is on the hose now AND was already on it when the
+            # proposal was made: an offer to open a hose is not something
+            # the next pot along inherits, and /pots stops showing it too.
             "SELECT c.controller, c.outlet, c.id, c.ml, c.created_ts, p.name, "
-            "p.channel, p.dry_raw, p.wet_raw, p.target_low_pct FROM commands c "
-            "JOIN pots_now p ON p.controller = c.controller "
-            "AND p.outlet = c.outlet AND p.enabled = 1 "
+            "m.channel, p.dry_raw, p.wet_raw, p.target_low_pct FROM commands c "
+            "JOIN pot_mappings m ON m.controller = c.controller "
+            "AND m.outlet = c.outlet AND m.to_ts IS NULL "
+            "AND c.created_ts >= m.from_ts "
+            "JOIN pots p ON p.id = m.pot_id AND p.enabled = 1 "
             "WHERE c.state = 'proposed' AND c.created_ts >= ? ORDER BY c.id",
             (now - PROPOSAL_TTL_S,),
         ):
@@ -1966,37 +2009,47 @@ def create_app(
                             )
                     entry["proposal"] = entry["last_dose"] = None
                     if entry["controller"] is not None and entry["outlet"] is not None:
+                        # An offer to open a hose, so unlike the dose below
+                        # it does NOT travel with the pot: it counts only
+                        # while this pot is still the one on that hose, and
+                        # a proposal older than the open window was sized
+                        # for whoever hung there before.
                         prop = con.execute(
                             "SELECT id, ml, cap_s, created_ts FROM commands "
                             "WHERE controller = ? AND outlet = ? "
                             "AND state = 'proposed' AND created_ts >= ? "
+                            "AND created_ts >= COALESCE((SELECT from_ts "
+                            "  FROM pot_mappings WHERE pot_id = ? AND to_ts IS NULL), 0) "
                             "ORDER BY id LIMIT 1",
                             (
                                 entry["controller"],
                                 entry["outlet"],
                                 int(time.time()) - PROPOSAL_TTL_S,
+                                entry["id"],
                             ),
                         ).fetchone()
                         if prop:
                             entry["proposal"] = dict(
                                 zip(("id", "ml", "cap_s", "created_ts"), prop)
                             )
-                        # The newest dose handed to the board on this hose,
-                        # with its human verdict: the id POST /verdict needs
-                        # was otherwise visible only in the log. One row on
-                        # the commands_by_outlet index.
-                        dose = con.execute(
-                            "SELECT c.id, c.ml, c.cap_s, c.flow_ml, c.state, "
-                            "c.source, c.sent_ts, c.acked_ts, v.verdict "
-                            "FROM commands c "
-                            "LEFT JOIN verdicts v ON v.command_id = c.id "
-                            "WHERE c.controller = ? AND c.outlet = ? "
-                            "AND c.kind = 'water' AND c.sent_ts IS NOT NULL "
-                            "ORDER BY c.sent_ts DESC, c.id DESC LIMIT 1",
-                            (entry["controller"], entry["outlet"]),
-                        ).fetchone()
-                        if dose:
-                            entry["last_dose"] = dict(zip(LAST_DOSE_KEYS, dose))
+                    # The newest dose this pot was ever handed, with its
+                    # human verdict: the id POST /verdict needs was
+                    # otherwise visible only in the log. Through the pot's
+                    # own windows, so moving a hose takes the history with
+                    # it instead of filing it under the next pot along —
+                    # which would judge one pot's soil against another
+                    # pot's dose, in the table the learning log is made of.
+                    dose = con.execute(
+                        f"SELECT c.id, c.ml, c.cap_s, c.flow_ml, c.state, "
+                        f"c.source, c.sent_ts, c.acked_ts, v.verdict "
+                        f"FROM {HANDED_TO_POT} "
+                        "LEFT JOIN verdicts v ON v.command_id = c.id "
+                        "WHERE c.kind = 'water' "
+                        "ORDER BY c.sent_ts DESC, c.id DESC LIMIT 1",
+                        (entry["id"],),
+                    ).fetchone()
+                    if dose:
+                        entry["last_dose"] = dict(zip(LAST_DOSE_KEYS, dose))
                     garden.append(entry)
         except sqlite3.OperationalError as why:
             return PlainTextResponse(f"try again: {why}\n", status_code=503)
