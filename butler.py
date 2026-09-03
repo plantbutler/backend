@@ -925,7 +925,9 @@ def create_app(
                 continue
             # Keyed on the hose, and rightly so: this one asks whether the
             # plumbing is busy, not what this pot has had. The two gates
-            # below ask about the pot, and go through its mapping windows.
+            # below ask about the pot, through its mapping windows — and
+            # then about the hose anyway, as the floor no attribution
+            # failure can dig under.
             open_cmd = con.execute(
                 "SELECT 1 FROM commands WHERE controller = ? AND outlet = ? "
                 "AND state IN ('proposed', 'queued', 'sent') LIMIT 1",
@@ -943,6 +945,18 @@ def create_app(
                 f"SELECT 1 FROM {WATERED_THE_POT} "
                 "WHERE COALESCE(c.acked_ts, c.sent_ts) > ? LIMIT 1",
                 (pot_id, now - cooldown_s),
+            ).fetchone() or con.execute(
+                # ...and the hose underneath it. Attribution is a lookup and
+                # a lookup can come back empty for reasons that say nothing
+                # about the plant: a dose handed before the pot was ever
+                # registered, a clock that stepped while the wiring was
+                # saved. Water went down this hose either way, so the old
+                # hose-keyed gate stays as the floor — decision #5, unknown
+                # state waters LESS, never more.
+                "SELECT 1 FROM commands WHERE controller = ? AND outlet = ? "
+                "AND sent_ts IS NOT NULL AND COALESCE(acked_ts, sent_ts) > ? "
+                "LIMIT 1",
+                (r.controller, outlet, now - cooldown_s),
             ).fetchone()
             if watered:
                 continue
@@ -958,6 +972,16 @@ def create_app(
                 f"FROM {WATERED_THE_POT} WHERE c.sent_ts > ?)",
                 (pot_id, now - 86400),
             ).fetchone()
+            # The same floor as the cooldown's, for the same reason: what
+            # this HOSE poured in the last day, whoever it was attributed
+            # to. MAX rather than a sum, because an attributed dose is
+            # counted by both queries and must be spent once.
+            (hose_spent,) = con.execute(
+                "SELECT COALESCE(SUM(COALESCE(flow_ml, ml)), 0) FROM commands "
+                "WHERE controller = ? AND outlet = ? AND sent_ts > ?",
+                (r.controller, outlet, now - 86400),
+            ).fetchone()
+            spent = max(spent, hose_spent)
             if spent + dose > cap:
                 continue
             state = "proposed"

@@ -576,3 +576,58 @@ def test_a_remap_in_the_second_of_a_dose_spends_the_cap_once(client, db):
 
     soak_both(client, 6)  # 100 ml of 250 spent, so the next 100 ml fits
     assert len(commands(db)) == 2
+
+
+# --------------------------------------------------------------------------- #
+# Attribution can fail; the gates cannot
+# --------------------------------------------------------------------------- #
+
+
+def prime_the_line_by_hand(client, db, ml=120):
+    """A dose on b1/outlet 3 that no pot can claim, a minute in the past.
+
+    Setup day: the operator primes the line before anything is registered,
+    so when the pot that hangs on that hose is saved a minute later, its
+    first mapping window starts AFTER the dose and no window of its own
+    holds it. The same shape arrives without a human when the server clock
+    steps while the wiring is being saved.
+    """
+    post(client, "/command", f"c=b1 water=3 ml={ml}")
+    report(client)  # the board is handed it
+    report(client, extra=f"ack=1 flow_ml={ml}")
+    with sqlite3.connect(db) as con:
+        con.execute(
+            "UPDATE commands SET created_ts = created_ts - 60, "
+            "sent_ts = sent_ts - 60, acked_ts = acked_ts - 60"
+        )
+
+
+def test_a_dose_the_pot_cannot_claim_still_holds_its_cooldown(client, db):
+    """A dose that matches no mapping window is a dose that happened.
+
+    Attribution is a lookup, and a lookup can come back empty for reasons
+    that have nothing to do with the plant being dry: a hand dose before
+    the pot was ever registered, a clock that stepped while the wiring was
+    saved. Reading that emptiness as "never watered" is fail-OPEN, and
+    decision #5 says unknown state makes watering less likely, not more.
+    So the pot-keyed gate has the old hose-keyed one underneath it: 120 ml
+    went down this hose a minute ago, whoever it belonged to.
+    """
+    prime_the_line_by_hand(client, db)
+    make_pot(client)  # auto, outlet 3, default 6 h cooldown
+
+    soak(client, 8)  # bone dry, and the ladder wants to water
+
+    assert len(commands(db)) == 1
+
+
+def test_a_dose_the_pot_cannot_claim_still_spends_its_daily_cap(client, db):
+    """The same, for the millilitres. With the cooldown switched off, the
+    cap is the only gate left, and 120 unattributable millilitres plus a
+    100 ml dose is over an allowance of 150."""
+    prime_the_line_by_hand(client, db)
+    make_pot(client, cooldown_h=0, daily_cap_ml=150)
+
+    soak(client, 8)
+
+    assert len(commands(db)) == 1
