@@ -231,10 +231,18 @@ def test_an_impossible_size_is_refused(client, query):
     assert upload(client, pot, query=query).status_code == 400
 
 
-@pytest.mark.parametrize("limit", ["0", "501", "lots"])
+@pytest.mark.parametrize("limit", ["0", "501", "lots", "-1"])
 def test_an_impossible_limit_is_refused(client, limit):
     pot = make_pot(client)
     assert strip(client, pot, query=f"&limit={limit}").status_code == 400
+
+
+def test_the_biggest_limit_the_refusal_names_can_actually_be_asked_for(client):
+    """`_int_in`'s top is exclusive, so every named maximum in this service
+    needs a +1 to mean what its own refusal says it means. Without this
+    test the off-by-one is invisible: 501 is refused either way."""
+    pot = make_pot(client)
+    assert strip(client, pot, query="&limit=500").status_code == 200
 
 
 def test_the_limit_pages_and_says_there_is_more(client):
@@ -312,15 +320,14 @@ def test_a_failed_row_write_takes_its_file_with_it(client, db, store, monkeypatc
     away in that very window: the file is on disk, and the row that was
     about to point at it never lands."""
     pot = make_pot(client)
-    real = butler.Path.write_bytes
+    real = butler.write_new_file
 
-    def then_break(self, data):
-        out = real(self, data)
+    def then_break(path, blob):
+        real(path, blob)
         with sqlite3.connect(db) as con:
             con.execute("DROP TABLE photos")
-        return out
 
-    monkeypatch.setattr(butler.Path, "write_bytes", then_break)
+    monkeypatch.setattr(butler, "write_new_file", then_break)
     answer = upload(client, pot)
     monkeypatch.undo()
     assert answer.status_code == 503, answer.text
@@ -380,9 +387,9 @@ def test_the_write_lock_is_not_held_across_the_disk_write(client, db, monkeypatc
     volume would answer every board report in that window with "try
     again"."""
     wrote = []
-    real = butler.Path.write_bytes
+    real = butler.write_new_file
 
-    def slow(self, data):
+    def slow(path, blob):
         # Stands in for POST /report landing mid-upload: a writer with a
         # short timeout, which fails outright if the lock is held.
         with sqlite3.connect(db, timeout=0.2) as other:
@@ -390,11 +397,11 @@ def test_the_write_lock_is_not_held_across_the_disk_write(client, db, monkeypatc
                 "INSERT INTO readings (ts, controller, channel, raw) "
                 "VALUES (1, 'b1', 0, 8000)"
             )
-        wrote.append(len(data))
-        return real(self, data)
+        wrote.append(len(blob))
+        real(path, blob)
 
     pot = make_pot(client)
-    monkeypatch.setattr(butler.Path, "write_bytes", slow)
+    monkeypatch.setattr(butler, "write_new_file", slow)
     answer = upload(client, pot)
     monkeypatch.undo()
     assert answer.status_code == 200, answer.text
@@ -447,3 +454,87 @@ def test_a_photo_store_under_an_unmounted_data_is_refused(tmp_path, monkeypatch)
             token=TOKEN,
             photos_dir="/data/photos",
         )
+
+
+# --------------------------------------------------------------------------- #
+# Two photographs that want the same id
+
+
+def test_a_taken_id_is_given_up_rather_than_overwritten(client, store, monkeypatch):
+    """The dangerous half of a collision. Writing the file first and finding
+    out from the INSERT would destroy the picture already at that path — an
+    earlier photograph, already committed, whose row would then be left
+    pointing at nothing."""
+    pot = make_pot(client)
+    minted = iter(["photo-aaaaaaaa", "photo-aaaaaaaa", "photo-bbbbbbbb"])
+    monkeypatch.setattr(butler, "new_photo_id", lambda: next(minted))
+    first = photo_id(upload(client, pot, blob=JPEG))
+    second_bytes = JPEG + b"different"
+    second = photo_id(upload(client, pot, blob=second_bytes))
+    monkeypatch.undo()
+    assert first == "photo-aaaaaaaa"
+    assert second == "photo-bbbbbbbb"
+    # The first photograph is untouched, which is the whole point.
+    assert fetch(client, first).content == JPEG
+    assert fetch(client, second).content == second_bytes
+    assert not any(row["missing"] for row in strip(client, pot).json()["photos"])
+
+
+def test_an_id_whose_row_outlived_its_file_is_also_given_up(client, store, monkeypatch):
+    """The other way two ids collide: the file is gone but the row is not,
+    which is what a half-restored backup leaves. The new picture must not
+    take that row's id and must not touch that row."""
+    pot = make_pot(client)
+    minted = iter(["photo-aaaaaaaa", "photo-aaaaaaaa", "photo-bbbbbbbb"])
+    monkeypatch.setattr(butler, "new_photo_id", lambda: next(minted))
+    first = photo_id(upload(client, pot))
+    (store / pot / f"{first}.jpg").unlink()  # the file, not the row
+    second = photo_id(upload(client, pot))
+    monkeypatch.undo()
+    assert second == "photo-bbbbbbbb"
+    rows = {row["id"]: row["missing"] for row in strip(client, pot).json()["photos"]}
+    assert rows == {"photo-aaaaaaaa": True, "photo-bbbbbbbb": False}
+
+
+def test_an_id_that_cannot_be_minted_is_a_try_again_and_not_a_500(client, monkeypatch):
+    pot = make_pot(client)
+    monkeypatch.setattr(butler, "new_photo_id", lambda: "photo-aaaaaaaa")
+    photo_id(upload(client, pot))
+    answer = upload(client, pot)
+    monkeypatch.undo()
+    assert answer.status_code == 503, answer.text
+    assert "try again" in answer.text
+
+
+def test_only_one_of_two_racing_deletes_says_ok(client):
+    """A bare SELECT takes no lock, so both callers can see the row. The
+    DELETE decides, or "deleting twice is refused rather than pretended"
+    would hold only when nobody is in a hurry."""
+    pot = make_pot(client)
+    pid = photo_id(upload(client, pot))
+    codes = []
+    lock = threading.Lock()
+
+    def go():
+        answer = forget(client, pid)
+        with lock:
+            codes.append(answer.status_code)
+
+    threads = [threading.Thread(target=go) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(codes) == [200] + [400] * 5, codes
+    assert strip(client, pot).json()["photos"] == []
+
+
+def test_an_empty_photos_dir_falls_back_like_an_empty_db_path(tmp_path):
+    """`db_path=""` falls back to the default; this has to do the same, or
+    the store lands in the process's working directory and skips the
+    unmounted-/data refusal on the way."""
+    db = tmp_path / "here" / "butler.db"
+    client = TestClient(create_app(db_path=str(db), token=TOKEN, photos_dir=""))
+    pot = make_pot(client)
+    pid = photo_id(upload(client, pot))
+    assert (tmp_path / "here" / "photos" / pot / f"{pid}.jpg").exists()
