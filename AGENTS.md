@@ -152,8 +152,11 @@ watering.
   offer, then 0.14.0 with `GET /hello` and the photograph store, on 2026-09-04, verified live from
   the NAS — GBIF and Trefle for the lookup, and for the photographs a `/hello` that answers its
   version to the right token and 401 to a wrong one, a gated `/photos`, and an upload to a pot that
-  does not exist refused without writing anything): container `plantbutler`
-  on the NAS, port 9380, image `plantbutler-backend:0.14.0` shipped via `docker save | ssh docker load` over the tailnet, database on `/volume1/docker/plantbutler/data`, secrets in `deploy.env` beside it
+  does not exist refused without writing anything; 0.15.0 on 2026-09-04 turns `plant_type` into a
+  closed set of six kinds, replaces the two free-text sizes with `pot_diameter_cm` and
+  `plant_height_cm` and reads them as a water buffer and the demand on it, and answers `kind` from
+  GBIF's family so the dropdown opens pre-selected): container `plantbutler`
+  on the NAS, port 9380, image `plantbutler-backend:0.15.0` shipped via `docker save | ssh docker load` over the tailnet, database on `/volume1/docker/plantbutler/data`, secrets in `deploy.env` beside it
   (600, not in git: the token, the ntfy topic, the healthchecks.io ping URL, the Trefle token),
   `-e TZ=Europe/Zurich` so BUTLER_QUIET means local night. Photographs share that volume —
   `/data/photos`, one directory per pot — so they are backed up or lost with the database rather
@@ -206,12 +209,19 @@ Tables (`schema.sql`): `readings(ts, controller, channel, raw)`; `pots(id, name,
 channel, outlet, plant_type, plant_size, pot_size, soil, dry_raw, wet_raw, target_low_pct,
 target_high_pct, dose_ml, mode, cooldown_h, daily_cap_ml, enabled)` (`mode`:
 manual | learning | auto) — mapping, calibration, thresholds and the descriptive
-fields (Planta-style: what is potted, how big, in what) in one table until that hurts (it did:
-since 2026-09-03 `pots.id` is a `pot-xxxxxx` and the three mapping columns live in
-`pot_mappings` with a window — read the current shape above, not this line); `commands(id, created_ts,
+fields (Planta-style: what is potted, how big, in what) in one table until that hurts (it did
+twice: since 2026-09-03 `pots.id` is a `pot-xxxxxx` and the three mapping columns live in
+`pot_mappings` with a window, and since 0.15.0 the two sizes are `plant_height_cm` and
+`pot_diameter_cm`, REAL, added by `add_columns()` rather than a second rebuild — read the current
+shape above, not this line); `commands(id, created_ts,
 outlet, ml, cap_s, state proposed→queued→sent→acked/expired/failed, source, result, verdict)` — the command log is
 the watering history; `events(ts, kind, detail)`. Percentages are derived at read time, never
-stored. Air temperature and light ride the same readings table as extra channels (the sensor kit
+stored. `schema.sql` stays additive, but `CREATE TABLE IF NOT EXISTS` is additive about tables
+only — a column appended to a CREATE that already ran never reaches an existing database — so a new
+column goes in the CREATE *and* in `butler.ADDED_COLUMNS`, which ALTERs it in at startup and can
+carry a value over from an old column. `pots_now` is dropped and recreated on every start for the
+same reason; it holds no data, and a view over a column the table has not got yet parses fine and
+then fails on every read. Air temperature and light ride the same readings table as extra channels (the sensor kit
 has both modules); season is derived from the date. Adaptive dosing from range, temperature,
 light and season is a later pitch — see the plan's Planta note — v1 rules stay thresholds.
 

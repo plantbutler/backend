@@ -68,6 +68,7 @@ import contextlib
 import hmac
 import http.client
 import json
+import math
 import os
 import re
 import secrets
@@ -91,7 +92,7 @@ from starlette.requests import ClientDisconnect
 # metadata because the container installs no package — it copies butler.py
 # beside fastapi and runs it. A test asserts this and pyproject.toml agree,
 # which is the only thing that keeps the two honest.
-VERSION = "0.14.0"
+VERSION = "0.15.0"
 
 BODY_CAP = 4096  # a full 15-channel report is ~200 bytes; 4 KB is generous
 # Photographs are the first thing here that is not small. The phone caps the
@@ -253,6 +254,56 @@ def _pots_ddl() -> list[str]:
     return ddl
 
 
+# Columns schema.sql grew after its CREATE had already run somewhere, with
+# the old column each one carries its value over from (None: nothing to
+# carry). Append-only, like the schema itself.
+ADDED_COLUMNS = (
+    ("pots", "plant_height_cm", "REAL", "plant_size"),
+    ("pots", "pot_diameter_cm", "REAL", "pot_size"),
+    ("species_names", "family", "TEXT", None),
+)
+
+
+def add_columns(con: sqlite3.Connection) -> list[str]:
+    """ALTER in whatever of ADDED_COLUMNS this database has not got yet.
+
+    `CREATE TABLE IF NOT EXISTS` is additive about TABLES and nothing else:
+    a column appended to a CREATE that has already run on a database never
+    reaches it, and the table quietly keeps the shape it was born with. This
+    is the additive answer to that, and it is deliberately an ALTER rather
+    than a second rebuild — the one rebuild this project has (migrate) stays
+    the only one.
+
+    Runs BEFORE schema.sql, because `pots_now` is recreated from that script
+    and a view over a column the table has not got yet parses fine and then
+    fails on every read.
+
+    The carry-over is best-effort by design: `pot_size` held "14cm", "10"
+    and "small", and only two of those are a measurement. A word is dropped
+    rather than invented into centimetres.
+    """
+    added = []
+    with con:
+        for table, column, kind, source in ADDED_COLUMNS:
+            cols = [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
+            if not cols or column in cols:
+                continue  # no such table here yet, or nothing to do
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+            added.append(f"{table}.{column}")
+            if source is None or source not in cols:
+                continue
+            for rowid, text in con.execute(
+                f"SELECT rowid, {source} FROM {table} WHERE {source} IS NOT NULL"
+            ).fetchall():
+                value = cm_from_text(text)
+                if value is not None:
+                    con.execute(
+                        f"UPDATE {table} SET {column} = ? WHERE rowid = ?",
+                        (value, rowid),
+                    )
+    return added
+
+
 def migrate(con: sqlite3.Connection, db_path: str) -> bool:
     """The one-time rebuild of `pots`, run at startup. Returns True if it ran.
 
@@ -333,6 +384,12 @@ def migrate(con: sqlite3.Connection, db_path: str) -> bool:
             con.execute(ddl)
         for row in rows:
             old = dict(zip(_OLD_POT_COLUMNS, row))
+            # The old shape's two free-text sizes, as far as they were ever
+            # measurements. add_columns() does the same for a database that
+            # is past this rebuild; both go through one reader so they
+            # cannot disagree.
+            old["plant_height_cm"] = cm_from_text(old.pop("plant_size"))
+            old["pot_diameter_cm"] = cm_from_text(old.pop("pot_size"))
             pot_id = new_pot_id()
             keys = [k for k in old if k not in ("controller", "channel", "outlet")]
             con.execute(
@@ -410,6 +467,43 @@ def _int_in(value: str, key: str, low: int, high: int) -> int:
     if not low <= n < high:
         raise ValueError(f"{key}= out of range: {value}")
     return n
+
+
+_CM = re.compile(r"\A\d{1,4}(?:\.\d{1,2})?\Z")
+
+
+def _cm_in(value: str, key: str, high: float) -> float:
+    """One measurement in centimetres, 0 exclusive to `high` inclusive.
+
+    The same ASCII-only strictness as `_int_in` and for the same reason —
+    bare float() takes "1e3", "inf", "nan", a Unicode digit and a leading
+    `+`, and every one of those would reach log2() in the band engine. Zero
+    is refused rather than treated as unsaid, because a 0 cm pot is a
+    half-finished edit and saying so beats silently ignoring it.
+    """
+    if not (value.isascii() and _CM.match(value)):
+        raise ValueError(f"{key}= is not a measurement in cm: {value!r}")
+    n = float(value)
+    if not 0 < n <= high:
+        raise ValueError(f"{key}= out of range: {value}")
+    return n
+
+
+def cm_from_text(text: str | None) -> float | None:
+    """A measurement out of the free text `plant_size` and `pot_size` held.
+
+    Those two fields were TEXT and took anything: "14cm", "10", "small". The
+    numbers carry over, the words do not, and a word is dropped rather than
+    guessed at — "small" meant one thing to the old keyword table and would
+    have to be invented into centimetres here.
+    """
+    if not text:
+        return None
+    found = re.search(r"\d{1,4}(?:\.\d{1,2})?", text)
+    if not found:
+        return None
+    n = float(found.group())
+    return n if 0 < n <= 1000 else None
 
 
 def parse_report(text: str) -> Report:
@@ -643,7 +737,11 @@ POT_INT_FIELDS = {  # half-open bounds, like every other field
     "daily_cap_ml": (0, 100_001),
     "enabled": (0, 2),
 }
-POT_TEXT_FIELDS = ("plant_type", "plant_size", "pot_size", "soil", "species")
+POT_TEXT_FIELDS = ("soil", "species")  # the two still typed rather than picked
+POT_CM_FIELDS = {  # centimetres, and a plausible ceiling for each
+    "pot_diameter_cm": 200.0,  # across the rim: a half-barrel and no further
+    "plant_height_cm": 1000.0,  # a 10 m tree is not in a pot on the balcony
+}
 POT_MAP_FIELDS = ("controller", "channel", "outlet")  # pot_mappings, not pots
 POT_MODES = ("manual", "learning", "auto")
 LAST_DOSE_KEYS = (
@@ -682,8 +780,8 @@ POT_COLUMNS = (  # the pots_now view's shape: pot columns plus the open mapping
     "channel",
     "outlet",
     "plant_type",
-    "plant_size",
-    "pot_size",
+    "plant_height_cm",
+    "pot_diameter_cm",
     "soil",
     "dry_raw",
     "wet_raw",
@@ -800,7 +898,16 @@ def parse_pot(text: str) -> dict:
     everywhere else.
     """
     fields: dict = {}
-    known = {"id", "name", "mode", "controller", *POT_TEXT_FIELDS, *POT_INT_FIELDS}
+    known = {
+        "id",
+        "name",
+        "mode",
+        "plant_type",
+        "controller",
+        *POT_TEXT_FIELDS,
+        *POT_CM_FIELDS,
+        *POT_INT_FIELDS,
+    }
     for token in text.split():
         key, sep, value = token.partition("=")
         if not sep or not key:
@@ -814,9 +921,22 @@ def parse_pot(text: str) -> dict:
         if key in POT_INT_FIELDS:
             low, high = POT_INT_FIELDS[key]
             fields[key] = _int_in(value, key, low, high)
+        elif key in POT_CM_FIELDS:
+            fields[key] = _cm_in(value, key, POT_CM_FIELDS[key])
         elif key == "mode":
             if value not in POT_MODES:
                 raise ValueError(f"mode= must be one of {'|'.join(POT_MODES)}")
+            fields[key] = value
+        elif key == "plant_type":
+            # A closed set on the way in, tolerant on the way out: a value
+            # written before this set existed still reads, it simply matches
+            # no band. Refusing it here is what keeps the dropdown honest —
+            # a free-text "basil" used to look saved and quietly pick
+            # nothing.
+            if value not in PLANT_KINDS:
+                raise ValueError(
+                    f"plant_type= must be one of {'|'.join(PLANT_KINDS)}"
+                )
             fields[key] = value
         else:
             fields[key] = value
@@ -1076,6 +1196,7 @@ class Taxon(NamedTuple):
     accepted: str | None  # the binomial to ask about; None when unresolved
     rank: str | None
     matched: str  # exact | fuzzy | genus | none
+    family: str | None = None  # what the plant-kind guess is read from
 
 
 def read_gbif(payload: dict) -> Taxon:
@@ -1100,7 +1221,13 @@ def read_gbif(payload: dict) -> Taxon:
     accepted = payload.get("species")
     if not isinstance(accepted, str) or not accepted.strip():
         return Taxon(None, rank, "genus" if rank == "GENUS" else "none")
-    return Taxon(accepted.strip(), rank, "fuzzy" if kind == "FUZZY" else "exact")
+    family = payload.get("family")
+    return Taxon(
+        accepted.strip(),
+        rank,
+        "fuzzy" if kind == "FUZZY" else "exact",
+        family.strip() if isinstance(family, str) and family.strip() else None,
+    )
 
 
 def pick_species(payload: dict, wanted: str) -> str | None:
@@ -1236,16 +1363,22 @@ def sole_match(candidates: list[dict], query: str) -> str | None:
 BASE_BAND = (35, 55)
 BAND_FLOOR, BAND_CEIL, BAND_MIN_WIDTH = 5, 95, 10
 
-TYPE_BANDS = (  # ordered: the first of these words to appear wins
-    ("succulent", (15, 30)),
-    ("cactus", (15, 30)),
-    ("fern", (55, 75)),
-    ("herb", (35, 55)),
-    ("vegetable", (45, 65)),
-    ("tropical", (40, 60)),
-    ("foliage", (40, 60)),
-    ("flower", (40, 60)),
-)
+# The closed set the form offers, and the band each kind starts from. A
+# dropdown rather than free text because this is the biggest lever of the
+# four: an unlabelled plant starts at 35-55 and a succulent at 15-30, so a
+# typo here is a 20-point error that no pot measurement recovers. Reading
+# stays tolerant — a value written before this set existed simply matches
+# nothing and falls to the base band — but writing one is refused.
+PLANT_KINDS = {
+    # Cacti live here too. Same water, and two identical choices in a list
+    # only make the list harder to pick from.
+    "succulent": (15, 30),
+    "fern": (55, 75),
+    "herb": (35, 55),
+    "vegetable": (45, 65),
+    "tropical": (40, 60),  # the leafy houseplants: aroids, palms, marantas
+    "flower": (40, 60),
+}
 
 SOIL_SHIFTS = (  # what the soil does to both ends
     ("cactus", (-5, -5)),  # a gritty mix drains before the sensor notices
@@ -1255,10 +1388,102 @@ SOIL_SHIFTS = (  # what the soil does to both ends
     ("clay", (0, -5)),  # holds water: the risk is the top of the band
 )
 
-POT_SHIFTS = (
-    ("small", (5, 0)),  # little buffer, so water sooner
-    ("large", (-5, -5)),  # inertia, and roots that rot before they dry
-)
+# Guessing the plant kind from the taxonomy GBIF hands back anyway, so the
+# dropdown opens pre-selected. It is a guess and is treated as one: it fills
+# the field only while the field is still empty, and one tap changes it.
+# Being wrong costs a tap; being silent costs a 20-point band nobody
+# noticed. Nothing here is ever written to a pot by the backend.
+#
+# Genus is asked before family, because family is wrong exactly where it
+# matters most: Asparagaceae holds Dracaena fragrans, a leafy thing that
+# wants watering, and Dracaena trifasciata, a succulent in all but name.
+SPECIES_KINDS = {"dracaena trifasciata": "succulent"}
+GENUS_KINDS = {
+    "aloe": "succulent",
+    "haworthia": "succulent",
+    "gasteria": "succulent",
+    "echeveria": "succulent",
+    "sedum": "succulent",
+    "kalanchoe": "succulent",
+    "euphorbia": "succulent",  # the family is half spurges that are not
+    "zamioculcas": "succulent",
+    "sansevieria": "succulent",  # the name half the world still uses
+    "peperomia": "succulent",  # thick leaves; Piperaceae is otherwise vines
+}
+# Lowercased, because GBIF's case is not a promise. Orchidaceae is left out
+# deliberately: an epiphyte on bark waters nothing like a flowering pot
+# plant, and falling through to "not sure" is better than 20 confident
+# points in the wrong direction.
+FAMILY_KINDS = {
+    "cactaceae": "succulent",
+    "crassulaceae": "succulent",
+    "aizoaceae": "succulent",
+    "asphodelaceae": "succulent",
+    "didiereaceae": "succulent",
+    "polypodiaceae": "fern",
+    "dryopteridaceae": "fern",
+    "pteridaceae": "fern",
+    "nephrolepidaceae": "fern",
+    "aspleniaceae": "fern",
+    "athyriaceae": "fern",
+    "lamiaceae": "herb",  # basil, mint, rosemary, thyme, sage, oregano
+    "apiaceae": "herb",  # parsley, coriander, dill
+    "solanaceae": "vegetable",
+    "cucurbitaceae": "vegetable",
+    "brassicaceae": "vegetable",
+    "amaranthaceae": "vegetable",
+    "araceae": "tropical",  # monstera, philodendron, pothos, peace lily
+    "marantaceae": "tropical",
+    "arecaceae": "tropical",
+    "musaceae": "tropical",
+    "strelitziaceae": "tropical",
+    "bromeliaceae": "tropical",
+    "moraceae": "tropical",  # the figs
+    "araliaceae": "tropical",
+    "asparagaceae": "tropical",
+    "asteraceae": "flower",
+    "gesneriaceae": "flower",
+    "rosaceae": "flower",
+    "begoniaceae": "flower",
+    "violaceae": "flower",
+}
+
+
+def kind_for(accepted: str | None, family: str | None) -> str | None:
+    """The plant kind to pre-select for a resolved name, or None.
+
+    None is a real answer and the common one — an unlisted family means
+    nobody here knows, and "not sure" already has correct behaviour.
+    """
+    if not accepted:
+        return None
+    name = normalise_species(accepted)
+    if name in SPECIES_KINDS:
+        return SPECIES_KINDS[name]
+    genus = name.split(" ")[0]
+    if genus in GENUS_KINDS:
+        return GENUS_KINDS[genus]
+    return FAMILY_KINDS.get(normalise_species(family or ""))
+
+
+# What a measurement does to the band. Volume goes as the cube of the
+# diameter, but the SHIFT cannot: a 40 cm pot holds 23x the water of a 14 cm
+# one, and no band survives being multiplied by 23. What is linear in
+# percentage points is the LOG of the volume — each doubling of buffer moves
+# the band one step — so the cube arrives as the factor of 3 that log2 turns
+# (d/d0)**3 into. The old small/large keywords sat at roughly +5/-5, which is
+# what 10 cm and 24 cm still come out at.
+POT_REF_CM = 14.0  # the pot the base bands assume
+HEIGHT_REF_RATIO = 1.5  # a 21 cm plant in a 14 cm pot: neither tall nor short
+BAND_PER_DOUBLING = 2.5  # percentage points per doubling
+# Three doublings of volume is twice the diameter, so a pot of 28 cm or
+# more moves the band as far as this model will take it. That is not a claim
+# that 28 cm and 60 cm want the same water — it is where a table of six
+# plant kinds stops being worth extrapolating, and a bounded wrong answer
+# beats an unbounded one.
+POT_DOUBLINGS_CAP = 3.0  # +-7.5 points
+HEIGHT_DOUBLINGS_CAP = 2.0  # +-5
+SIZE_WHY_MIN = 0.5  # under half a point cannot move a whole-point band
 
 # Northern hemisphere, because the flat this waters is in one. A pot in the
 # southern half of the world wants these two swapped, and this code has no
@@ -1280,14 +1505,17 @@ NEGATIONS = ("not", "no", "non", "without", "never")
 def _find(text: str | None, table) -> tuple[str, tuple[int, int]] | None:
     """The first table entry that matches `text`, with the phrase to say so.
 
-    Three rules, each of them a wrong answer that free text produced. A
-    keyword counts only at the START of a word, because a cauliflower is a
-    vegetable and not a flower. A keyword directly after a negation does not
-    count, because "not sandy" is not sandy — and falling through to no
-    modifier at all is the right answer there, not the opposite one. And the
-    reason is given in the user's own words when they are short enough to
-    read ("sandy loam soil", not "sand soil"), else in the keyword that
-    actually matched, since half a sentence cut mid-word explains nothing.
+    Soil is the last of these fields still typed rather than picked, so all
+    three rules stay, and each of them was a wrong answer free text produced.
+    A keyword counts only at the START of a word — the rule that kept a
+    cauliflower from being a flower back when the plant kind was typed too,
+    and that keeps "gritty" matching "grit" without "integrity" doing so. A
+    keyword directly after a negation does not count, because "not sandy" is
+    not sandy, and falling through to no modifier at all is the right answer
+    there rather than the opposite one. And the reason is given in the user's
+    own words when they are short enough to read ("sandy loam soil", not
+    "sand soil"), else in the keyword that actually matched, since half a
+    sentence cut mid-word explains nothing.
     """
     whole = normalise_species(text or "")
     words = whole.split()
@@ -1301,34 +1529,94 @@ def _find(text: str | None, table) -> tuple[str, tuple[int, int]] | None:
     return None
 
 
+def _doublings(ratio: float, cap: float) -> float:
+    """log2 of a ratio, capped both ways. The cap is what keeps a fat-fingered
+    200 cm pot from proposing a band nobody could water to."""
+    return max(-cap, min(cap, math.log2(ratio)))
+
+
+def size_shifts(
+    diameter_cm: float | None, height_cm: float | None
+) -> tuple[float, float, list[str]]:
+    """What the two measurements do to the band, and the phrases to say so.
+
+    Two independent effects, and both move the FLOOR far more than the
+    ceiling. The pot is a water buffer: a small one runs out before anybody
+    looks again, so its floor rises; a big one holds water around roots that
+    rot, so its ceiling drops. The ceiling only ever drops, because no pot
+    size is a reason to keep a plant wetter than its own kind wants — and
+    lifting it would contradict #5 as well.
+
+    The plant is the demand against that buffer, which is why height is read
+    OVER diameter rather than on its own: 40 cm of basil is thirsty in a
+    10 cm pot and comfortable in a 30 cm one. A height with no pot to
+    measure against falls back to the reference pot, which is the same
+    assumption the base bands already make.
+
+    Zero and negative are treated as unsaid rather than refused here: the
+    write path rejects them, but a row from before it did must not make the
+    whole garden unreadable through a log of zero.
+    """
+    low = high = 0.0
+    why: list[str] = []
+    diameter = diameter_cm if diameter_cm and diameter_cm > 0 else None
+    height = height_cm if height_cm and height_cm > 0 else None
+    if diameter is not None:
+        buffer_ratio = (diameter / POT_REF_CM) ** 3
+        shift = -BAND_PER_DOUBLING * _doublings(buffer_ratio, POT_DOUBLINGS_CAP)
+        low += shift
+        high += min(shift, 0.0)
+        if abs(shift) >= SIZE_WHY_MIN:
+            why.append(f"{diameter:g} cm pot")
+    if height is not None:
+        against = diameter if diameter is not None else POT_REF_CM
+        demand = (height / against) / HEIGHT_REF_RATIO
+        shift = BAND_PER_DOUBLING * _doublings(demand, HEIGHT_DOUBLINGS_CAP)
+        low += shift
+        if abs(shift) >= SIZE_WHY_MIN:
+            why.append(f"{height:g} cm plant")
+    return low, high, why
+
+
 def target_band(
-    plant_type: str | None, soil: str | None, pot_size: str | None, month: int
+    plant_type: str | None,
+    soil: str | None,
+    diameter_cm: float | None,
+    height_cm: float | None,
+    month: int,
 ) -> Band:
     """A target moisture band to offer, and the reason in words.
 
-    Nothing about the species: the only source that could have carried a
-    watering regime has none. What is left is what is actually on hand —
-    what kind of plant it is, what it sits in, how big the pot is, and the
-    time of year — which is roughly what a person would use anyway.
+    The species is in here now, but only through the door marked plant kind:
+    a lookup may pre-select that dropdown and a human may overrule it, and
+    the band reads whatever the dropdown ends up saying. No care source
+    reaches this function, because none of them carries a watering regime.
+    What is left is what is actually on hand — what kind of plant it is,
+    what it sits in, how big the pot is, how big the plant is, and the time
+    of year — which is roughly what a person would use anyway.
     """
-    kind = _find(plant_type, TYPE_BANDS)
-    low, high = kind[1] if kind else BASE_BAND
-    why = [kind[0] if kind else "unlabelled plant"]
-    for text, table, label in (
-        (soil, SOIL_SHIFTS, "soil"),
-        (pot_size, POT_SHIFTS, "pot"),
-    ):
-        hit = _find(text, table)
-        if hit:
-            low, high = low + hit[1][0], high + hit[1][1]
-            # "small pot", not "small pot pot": the label is only there to
-            # say which field a bare word like "clay" or "small" came from.
-            why.append(hit[0] if label in hit[0] else f"{hit[0]} {label}")
+    base = PLANT_KINDS.get(plant_type or "", BASE_BAND)
+    # Float from here down: three half-point shifts rounded as they land
+    # are three points that vanish one at a time.
+    low, high = float(base[0]), float(base[1])
+    why = [plant_type if plant_type in PLANT_KINDS else "unlabelled plant"]
+    hit = _find(soil, SOIL_SHIFTS)
+    if hit:
+        low, high = low + hit[1][0], high + hit[1][1]
+        # "sandy loam soil", not "sandy loam soil soil": the label is only
+        # there to say which field a bare word like "clay" came from.
+        why.append(hit[0] if "soil" in hit[0] else f"{hit[0]} soil")
+    size_low, size_high, size_why = size_shifts(diameter_cm, height_cm)
+    low, high = low + size_low, high + size_high
+    why.extend(size_why)
     season = SEASONS.get(month)
     if season in SEASON_SHIFTS:
         shift = SEASON_SHIFTS[season]
         low, high = low + shift[0], high + shift[1]
         why.append(season)
+    # Back to whole points once, at the end. Rounding each shift as it
+    # landed would let three half-points vanish one at a time.
+    low, high = round(low), round(high)
     # A band the shifts have squeezed shut is widened DOWNWARDS. Raising the
     # top instead would offer a wetter ceiling than the plant's own base —
     # a succulent in clay came out capped at 35% when its unmodified top is
@@ -1482,6 +1770,11 @@ def create_app(
     photos.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db) as bootstrap:
         bootstrap.execute("PRAGMA journal_mode=WAL")
+        # Before the script: it recreates `pots_now`, and a view over a
+        # column its table has not got yet fails on every read, not here.
+        grew = add_columns(bootstrap)
+        if grew:
+            print("added columns: " + ", ".join(grew), file=sys.stderr)
         bootstrap.executescript(SCHEMA_SQL)
         # After the script, never before: a genuinely fresh database is
         # already in the new shape, so migrate() sees no `controller`
@@ -1639,12 +1932,12 @@ def create_app(
         """
         with connect() as con:
             row = con.execute(
-                "SELECT accepted, rank, matched, fetched_ts FROM species_names "
-                "WHERE query = ?",
+                "SELECT accepted, rank, matched, fetched_ts, family "
+                "FROM species_names WHERE query = ?",
                 (query,),
             ).fetchone()
         if row and (row[0] is not None or now - row[3] < CARE_MISS_TTL_S):
-            return Taxon(row[0], row[1], row[2])
+            return Taxon(row[0], row[1], row[2], row[4])
         payload = get_json(
             f"{GBIF_MATCH_URL}?{urlencode({'name': binomial_case(query)})}"
         )
@@ -1654,8 +1947,9 @@ def create_app(
         with connect() as con:
             con.execute(
                 "INSERT OR REPLACE INTO species_names "
-                "(query, fetched_ts, accepted, rank, matched) VALUES (?, ?, ?, ?, ?)",
-                (query, now, taxon.accepted, taxon.rank, taxon.matched),
+                "(query, fetched_ts, accepted, rank, matched, family) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (query, now, taxon.accepted, taxon.rank, taxon.matched, taxon.family),
             )
         return taxon
 
@@ -1787,6 +2081,7 @@ def create_app(
             "matched": "unavailable",
             "accepted": None,
             "rank": None,
+            "kind": None,
             "care": None,
             "candidates": [],
             "note": "",
@@ -1795,6 +2090,7 @@ def create_app(
             answer["matched"] = taxon.matched
             answer["accepted"] = taxon.accepted
             answer["rank"] = taxon.rank
+            answer["kind"] = kind_for(taxon.accepted, taxon.family)
             if taxon.accepted:
                 answer["care"] = care_for(taxon.accepted, now)
                 care = answer["care"]
@@ -1829,7 +2125,8 @@ def create_app(
         band = target_band(
             entry["plant_type"],
             entry["soil"],
-            entry["pot_size"],
+            entry["pot_diameter_cm"],
+            entry["plant_height_cm"],
             time.localtime(now).tm_mon,
         )
         if (entry["target_low_pct"], entry["target_high_pct"]) == (band.low, band.high):
@@ -1846,13 +2143,15 @@ def create_app(
         now = int(time.time())
         with connect() as con:
             row = con.execute(
-                "SELECT id, plant_type, soil, pot_size, target_low_pct, "
-                "target_high_pct, enabled FROM pots_now WHERE id = ?",
+                "SELECT id, plant_type, soil, pot_diameter_cm, plant_height_cm, "
+                "target_low_pct, target_high_pct, enabled FROM pots_now WHERE id = ?",
                 (pot_id,),
             ).fetchone()
             if row is None:
                 raise ValueError(f"no pot {pot_id}")
-            band = target_band(row[1], row[2], row[3], time.localtime(now).tm_mon)
+            band = target_band(
+                row[1], row[2], row[3], row[4], time.localtime(now).tm_mon
+            )
             con.execute(
                 "INSERT OR REPLACE INTO advice_dismissed "
                 "(pot_id, kind, fingerprint, ts) VALUES (?, ?, ?, ?)",

@@ -31,10 +31,14 @@ def old_db(tmp_path):
     con = sqlite3.connect(path)
     con.executescript(OLD_POTS)
     con.execute(
-        "INSERT INTO pots (name, controller, channel, outlet, dry_raw, wet_raw, mode) "
-        "VALUES ('basil', 'butler1', 3, 1, 13000, 4200, 'auto')"
+        "INSERT INTO pots (name, controller, channel, outlet, dry_raw, wet_raw, mode, "
+        "plant_size, pot_size) "
+        "VALUES ('basil', 'butler1', 3, 1, 13000, 4200, 'auto', '40', '14cm')"
     )
-    con.execute("INSERT INTO pots (name) VALUES ('unmapped')")
+    con.execute(
+        "INSERT INTO pots (name, plant_size, pot_size) "
+        "VALUES ('unmapped', 'tall', 'small')"
+    )
     con.commit()
     return path, con
 
@@ -59,6 +63,23 @@ def test_migrate_mints_ids_and_moves_the_mapping(tmp_path):
     ).fetchall()
     assert mapping == [(rows["basil"], "butler1", 3, 1, 0, None)]
     assert con.execute("SELECT dry_raw, mode FROM pots WHERE name = 'basil'").fetchone() == (13000, "auto")
+
+
+def test_the_rebuild_carries_the_sizes_it_can_read(tmp_path):
+    """The old table's two sizes were free text and took anything. The
+    rebuild reads them through the same reader `add_columns` uses, so a
+    database that arrives here and one that arrives there cannot end up
+    disagreeing about what "14cm" meant."""
+    path, con = old_db(tmp_path)
+    assert migrate(con, path) is True
+    got = dict(
+        (name, (h, d))
+        for name, h, d in con.execute(
+            "SELECT name, plant_height_cm, pot_diameter_cm FROM pots"
+        )
+    )
+    assert got["basil"] == (40.0, 14.0)
+    assert got["unmapped"] == (None, None)  # "tall" and "small" are not cm
 
 
 def test_migrate_is_idempotent(tmp_path):

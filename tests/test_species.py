@@ -10,12 +10,15 @@ from fastapi.testclient import TestClient
 
 from butler import (
     BASE_BAND,
-    POT_SHIFTS,
+    PLANT_KINDS,
+    POT_REF_CM,
     SOIL_SHIFTS,
-    TYPE_BANDS,
     CARE_MISS_TTL_S,
     binomial_case,
+    cm_from_text,
+    kind_for,
     read_candidates,
+    size_shifts,
     sole_match,
     Taxon,
     create_app,
@@ -59,7 +62,7 @@ class Sources:
         return sum(1 for url in self.calls if key in url)
 
 
-def gbif(species="Ocimum basilicum", match="EXACT", rank="SPECIES"):
+def gbif(species="Ocimum basilicum", match="EXACT", rank="SPECIES", family="Lamiaceae"):
     return {
         "matchType": match,
         # GBIF sends confidence 100 with matchType NONE; the parser must not
@@ -69,6 +72,7 @@ def gbif(species="Ocimum basilicum", match="EXACT", rank="SPECIES"):
         "kingdom": "Plantae",
         "canonicalName": species,
         "species": species,
+        "family": family,
     }
 
 
@@ -274,84 +278,220 @@ def test_read_trefle_refuses_a_light_level_that_is_not_one():
 
 
 def test_band_without_a_single_field_is_still_an_offer():
-    band = target_band(None, None, None, 4)  # April: no seasonal shift
+    band = target_band(None, None, None, None, 4)  # April: no seasonal shift
     assert (band.low, band.high) == (35, 55)
     assert "unlabelled" in band.why
 
 
 def test_band_follows_the_kind_of_plant():
-    assert target_band("succulent", None, None, 4)[:2] == (15, 30)
-    assert target_band("hardy fern", None, None, 4)[:2] == (55, 75)
+    assert target_band("succulent", None, None, None, 4)[:2] == (15, 30)
+    assert target_band("fern", None, None, None, 4)[:2] == (55, 75)
+
+
+def test_a_kind_outside_the_set_reads_as_unlabelled():
+    # Tolerant on the way out, strict on the way in: `plant_type` was free
+    # text until 0.15.0, so a row may still say "basil" or "foliage", and
+    # the base band is the honest reading of one. parse_pot refuses to
+    # write a new one — that half is tested in test_pots.
+    for stale in ("basil", "foliage", "cactus", "hardy fern", "cauliflower"):
+        assert target_band(stale, None, None, None, 4)[:2] == BASE_BAND
 
 
 def test_gritty_soil_and_a_small_pot_pull_opposite_ways():
-    assert target_band("herb", "sandy loam", None, 4)[:2] == (30, 50)
-    assert target_band("herb", None, "small", 4)[:2] == (40, 55)
+    assert target_band("herb", "sandy loam", None, None, 4)[:2] == (30, 50)
+    assert target_band("herb", None, 10, None, 4)[:2] == (39, 55)
 
 
 def test_winter_is_drier_and_summer_is_not():
-    assert target_band("herb", None, None, 1)[:2] == (25, 45)
-    assert target_band("herb", None, None, 7)[:2] == (40, 55)
-
-
-def test_a_cauliflower_is_not_a_flower():
-    # A keyword counts only at the start of a word. Nothing recognised here,
-    # so the offer is the base one rather than the ornamental band.
-    assert target_band("cauliflower", None, None, 4)[:2] == BASE_BAND
+    assert target_band("herb", None, None, None, 1)[:2] == (25, 45)
+    assert target_band("herb", None, None, None, 7)[:2] == (40, 55)
 
 
 def test_not_sandy_is_not_sandy():
-    # Free text, so a person writes what they mean. The wrong answer here is
-    # not "no modifier" — it is the drainage shift, applied backwards.
-    assert target_band("fern", "not sandy, holds moisture well", None, 4)[:2] == (
+    # Soil is the last field still typed, so a person writes what they mean.
+    # The wrong answer here is not "no modifier" — it is the drainage shift,
+    # applied backwards.
+    assert target_band("fern", "not sandy, holds moisture well", None, None, 4)[:2] == (
         55,
         75,
     )
-    assert target_band("herb", None, "not large, a normal pot", 4)[:2] == (35, 55)
 
 
 def test_a_squeezed_band_gives_way_at_the_bottom():
-    # A succulent in clay: the shifts close the band completely. Widening it
-    # upwards would offer a wetter ceiling than the succulent's own 30%, and
-    # would contradict the "clay soil" printed beside it.
-    low, high = target_band("succulent", "clay", "small", 7)[:2]
+    # A succulent in clay in a small pot: the shifts close the band
+    # completely. Widening it upwards would offer a wetter ceiling than the
+    # succulent's own 30%, and would contradict the "clay soil" beside it.
+    low, high = target_band("succulent", "clay", 8, None, 7)[:2]
     assert (low, high) == (15, 25)
     assert high <= 30
 
 
 def test_a_long_field_is_explained_by_the_word_that_matched():
-    why = target_band(None, "an excellent free-draining mix with added grit", None, 4).why
+    why = target_band(
+        None, "an excellent free-draining mix with added grit", None, None, 4
+    ).why
     assert why == "unlabelled plant, grit soil"
+
+
+# --- the measurements ----------------------------------------------------
+
+
+def test_the_reference_pot_moves_nothing():
+    low, high, why = size_shifts(POT_REF_CM, None)
+    assert (low, high, why) == (0.0, 0.0, [])
+    # And a plant of the height that pot assumes moves nothing either.
+    assert size_shifts(POT_REF_CM, POT_REF_CM * 1.5)[2] == []
+
+
+def test_the_shift_is_the_log_of_the_volume_not_the_volume():
+    """A 40 cm pot holds 23x a 14 cm one. The band moves by a step per
+    doubling of that buffer, not by a factor of 23 — which is the whole
+    reason this is not linear in the cube."""
+    small = target_band("herb", None, 10, None, 4)
+    big = target_band("herb", None, 24, None, 4)
+    huge = target_band("herb", None, 40, None, 4)
+    assert (small.low, small.high) == (39, 55)
+    assert (big.low, big.high) == (29, 49)
+    # 23x the water, and still a single-digit shift — here the cap, which
+    # 28 cm already reaches.
+    assert (huge.low, huge.high) == (28, 48)
+    assert target_band("herb", None, 28, None, 4)[:2] == (28, 48)
+
+
+def test_only_a_big_pot_touches_the_ceiling():
+    # No pot size is a reason to keep a plant WETTER than its kind wants.
+    assert target_band("herb", None, 8, None, 4)[:2] == (41, 55)
+    assert target_band("herb", None, 30, None, 4)[1] < 55
+
+
+def test_height_is_read_against_the_pot_not_on_its_own():
+    """40 cm of basil is thirsty in a 10 cm pot and comfortable in a 30 cm
+    one, so the same height moves the floor in opposite directions."""
+    cramped = target_band("herb", None, 10, 40, 4)
+    roomy = target_band("herb", None, 30, 40, 4)
+    assert cramped.low > roomy.low
+    assert (cramped.low, cramped.high) == (42, 55)
+    # A height with no pot to measure against falls back to the reference
+    # pot, which is the assumption the base band already makes.
+    assert size_shifts(None, 40)[0] == size_shifts(None, 40)[0]
+    assert target_band("herb", None, None, 21, 4)[:2] == (35, 55)
+
+
+def test_height_never_lifts_the_ceiling():
+    for height in (1, 21, 200, 1000):
+        assert target_band("herb", None, 14, height, 4).high == 55
+
+
+def test_a_typo_sized_measurement_is_capped_not_obeyed():
+    # 200 cm across and 1000 cm tall are both inside what the write path
+    # allows, and neither may propose a band nobody could water to.
+    for diameter in (1, 200):
+        for height in (1, 1000):
+            band = target_band("herb", None, diameter, height, 1)
+            assert 5 <= band.low < band.high <= 95, (diameter, height, band)
+    assert size_shifts(1, None)[0] == 7.5  # the cap, exactly
+    assert size_shifts(200, None)[0] == -7.5
+
+
+def test_zero_and_negative_are_unsaid_rather_than_fatal():
+    # The write path refuses these; a row written before it did must not
+    # take the whole garden down through a log of zero.
+    assert size_shifts(0, 0) == (0.0, 0.0, [])
+    assert size_shifts(-5, -5) == (0.0, 0.0, [])
+    assert target_band("herb", None, 0, 0, 4)[:2] == (35, 55)
+
+
+def test_a_shift_too_small_to_matter_is_not_explained():
+    # Within a centimetre of the reference pot: under half a point, which
+    # cannot move a whole-point band on its own.
+    assert size_shifts(14.5, None)[2] == []
+    assert target_band("herb", None, 14.5, None, 4).why == "herb"
+    # But anything that DID move it is named, however little it moved.
+    assert target_band("herb", None, 15, None, 4).why == "herb, 15 cm pot"
 
 
 def test_the_band_never_closes_or_leaves_the_scale():
     """Every combination, not one sample: the offer a human is asked to
     accept must never be inverted, shut, off the scale, or wetter at the top
     than the plant type's own unmodified ceiling."""
-    kinds = [None, *[word for word, _ in TYPE_BANDS]]
+    kinds = [None, *PLANT_KINDS]
     soils = [None, *[word for word, _ in SOIL_SHIFTS]]
-    sizes = [None, *[word for word, _ in POT_SHIFTS]]
-    ceilings = dict(TYPE_BANDS)
+    diameters = [None, 1, 8, 14, 30, 200]
+    heights = [None, 1, 21, 120, 1000]
     for kind in kinds:
         for soil in soils:
-            for size in sizes:
-                for month in range(1, 13):
-                    band = target_band(kind, soil, size, month)
-                    where = (kind, soil, size, month, band)
-                    assert 5 <= band.low < band.high <= 95, where
-                    assert band.high - band.low >= 10, where
-                    if kind:
-                        assert band.high <= ceilings[kind][1], where
+            for diameter in diameters:
+                for height in heights:
+                    for month in range(1, 13):
+                        band = target_band(kind, soil, diameter, height, month)
+                        where = (kind, soil, diameter, height, month, band)
+                        assert 5 <= band.low < band.high <= 95, where
+                        assert band.high - band.low >= 10, where
+                        if kind:
+                            assert band.high <= PLANT_KINDS[kind][1], where
 
 
 def test_the_reason_names_what_moved_it():
-    why = target_band("culinary herb", "sandy loam", "small", 1).why
-    assert why == "culinary herb, sandy loam soil, small pot, winter"
+    why = target_band("herb", "sandy loam", 10, 40, 1).why
+    assert why == "herb, sandy loam soil, 10 cm pot, 40 cm plant, winter"
 
 
-def test_the_reason_does_not_say_pot_pot():
-    # The label is there for a bare "small"; the field often says it already.
-    assert target_band(None, None, "small pot", 4).why.endswith("small pot")
+def test_the_reason_does_not_say_soil_soil():
+    # The label is there for a bare "clay"; the field often says it already.
+    assert target_band(None, "clay soil", None, None, 4).why.endswith("clay soil")
+
+
+def test_a_measurement_reads_as_a_number_not_a_word():
+    assert cm_from_text("14cm") == 14.0
+    assert cm_from_text("10") == 10.0
+    assert cm_from_text("3.5 cm across") == 3.5
+    # A word meant something to the old keyword table and would have to be
+    # invented into centimetres here, so it is dropped instead.
+    assert cm_from_text("small") is None
+    assert cm_from_text("large") is None
+    assert cm_from_text(None) is None
+    assert cm_from_text("") is None
+    assert cm_from_text("0") is None  # a 0 cm pot was never a measurement
+
+
+# --- the plant kind the lookup offers ------------------------------------
+
+
+def test_a_family_suggests_a_kind():
+    assert kind_for("Ocimum basilicum", "Lamiaceae") == "herb"
+    assert kind_for("Monstera deliciosa", "Araceae") == "tropical"
+    assert kind_for("Crepis vesicaria", "Asteraceae") == "flower"
+    assert kind_for("Nephrolepis exaltata", "Nephrolepidaceae") == "fern"
+    # GBIF's case is not a promise.
+    assert kind_for("Echinopsis pachanoi", "CACTACEAE") == "succulent"
+
+
+def test_the_genus_is_asked_before_the_family():
+    # Asparagaceae holds a leafy thing that wants watering and a succulent
+    # in all but name, so the family alone would water one of them wrong.
+    assert kind_for("Dracaena fragrans", "Asparagaceae") == "tropical"
+    assert kind_for("Dracaena trifasciata", "Asparagaceae") == "succulent"
+    assert kind_for("Zamioculcas zamiifolia", "Araceae") == "succulent"
+    assert kind_for("Euphorbia trigona", "Euphorbiaceae") == "succulent"
+
+
+def test_an_unknown_family_offers_nothing_rather_than_a_guess():
+    # Orchidaceae is left out on purpose: an epiphyte on bark waters nothing
+    # like a flowering pot plant, and "not sure" already behaves correctly.
+    assert kind_for("Phalaenopsis amabilis", "Orchidaceae") is None
+    assert kind_for("Some plant", "Nothingaceae") is None
+    assert kind_for("Some plant", None) is None
+    assert kind_for(None, "Lamiaceae") is None
+
+
+def test_every_suggested_kind_is_one_the_form_can_show():
+    for table in (kind_for, ):
+        pass
+    from butler import FAMILY_KINDS, GENUS_KINDS, SPECIES_KINDS
+
+    for table in (FAMILY_KINDS, GENUS_KINDS, SPECIES_KINDS):
+        for name, kind in table.items():
+            assert kind in PLANT_KINDS, (name, kind)
 
 
 # --- the endpoint --------------------------------------------------------
@@ -367,6 +507,34 @@ def test_species_refuses_an_empty_or_giant_query(db):
     assert client.get("/species", params={"q": "  "}, headers=head).status_code == 400
     long = client.get("/species", params={"q": "a" * 200}, headers=head)
     assert long.status_code == 400
+
+
+def test_the_answer_offers_a_plant_kind_for_the_dropdown(db):
+    """The one thing a care source could never give: species finally reaches
+    the band, through a field a human can see and overrule."""
+    answer = look(app(db, Sources(BASIL)), "Ocimum_basilicum")
+    assert answer["kind"] == "herb"
+
+
+def test_the_kind_survives_the_cache(db):
+    """The family is stored with the name, so the second ask reaches nobody
+    and still knows what to pre-select."""
+    sources = Sources(BASIL)
+    client = app(db, sources)
+    look(client, "Ocimum_basilicum")
+    before = sources.hits("gbif")
+    assert look(client, "Ocimum_basilicum")["kind"] == "herb"
+    assert sources.hits("gbif") == before
+
+
+def test_a_family_nobody_listed_offers_no_kind(db):
+    sources = Sources({**BASIL, "gbif": gbif(family="Orchidaceae")})
+    assert look(app(db, sources), "Ocimum_basilicum")["kind"] is None
+
+
+def test_a_name_that_resolved_to_nothing_offers_no_kind(db):
+    sources = Sources({**BASIL, "gbif": gbif(match="NONE")})
+    assert look(app(db, sources), "Ocimum_basilicum")["kind"] is None
 
 
 def test_a_known_plant_comes_back_with_its_numbers(db):
@@ -627,7 +795,9 @@ def test_a_different_offer_is_a_new_question(db):
     )
     assert garden(client)["basil"]["advice"] is None
     # A repot changes the numbers, so the refusal no longer covers them.
-    client.post("/pot", content=f"id={pot} pot_size=small", headers={"X-Token": TOKEN})
+    client.post(
+        "/pot", content=f"id={pot} pot_diameter_cm=10", headers={"X-Token": TOKEN}
+    )
     assert garden(client)["basil"]["advice"] is not None
 
 
