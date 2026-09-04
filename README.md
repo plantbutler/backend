@@ -28,6 +28,16 @@ curl -s -X POST http://localhost:8000/report \
 curl -s http://localhost:8000/health
 ```
 
+Ask whether an address is a butler at all, and whether it accepts a token. This is what the app's
+setup screen asks before it stores either, because "nothing is listening there" and "that is not
+your token" are different mistakes and only one of them is yours to fix:
+
+```bash
+curl -s -H 'X-Token: dev' http://localhost:8000/hello
+# -> butler=0.13.0     (401 bad token when the token is wrong; connection
+#                       refused when the address is)
+```
+
 Queue a command for the board's next report, or change its report interval:
 
 ```bash

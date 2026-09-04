@@ -86,6 +86,12 @@ from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import QueryParams
 from starlette.requests import ClientDisconnect
 
+# What GET /hello answers with. Kept here rather than read from the package
+# metadata because the container installs no package — it copies butler.py
+# beside fastapi and runs it. A test asserts this and pyproject.toml agree,
+# which is the only thing that keeps the two honest.
+VERSION = "0.13.0"
+
 BODY_CAP = 4096  # a full 15-channel report is ~200 bytes; 4 KB is generous
 RETRY_WINDOW_S = 300  # how long an identical (controller, t) counts as a retry
 MAX_CHANNEL = 255
@@ -3064,6 +3070,23 @@ def create_app(
                 "points": points,
             }
         )
+
+    @app.get("/hello")
+    def hello(request: Request):
+        """Is this a butler, and is that the token?
+
+        The one call a phone can make to tell a wrong address from a wrong
+        token, which are different mistakes and only one of them is the
+        user's to fix. Nothing else here can answer it: the reads are
+        ungated and answer a wrong token exactly as they answer a right
+        one, and every gated route writes something.
+
+        Touches no database, so it stays an answer about the address and
+        the token and never about the disk.
+        """
+        if bad_token(request):
+            return PlainTextResponse("bad token\n", status_code=401)
+        return PlainTextResponse(f"butler={VERSION}\n")
 
     @app.get("/health")
     def health():

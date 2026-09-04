@@ -59,7 +59,11 @@ watering.
   accepting is an ordinary `POST /pot`),
   `POST /approve` (proposed -> queued, slot permitting), `POST /verdict` (ok | too_much |
   too_little per executed dose), `GET /health` (count, last ts, the default interval, per-controller
-  heartbeat/knob/open command/safety fields, raised alerts).
+  heartbeat/knob/open command/safety fields, raised alerts), `GET /hello` (`butler=<VERSION>`, or
+  401 — the one gated route that neither writes nor reads the database, so a phone being set up can
+  tell a wrong address from a wrong token, and a butler whose volume came unmounted can still say
+  the token was wrong. `VERSION` lives in butler.py because the container installs no package; a
+  test asserts it matches pyproject.toml).
 - The rules ladder runs in-process on each fresh report, stateless, inside the report's own
   transaction: float=1 and pos=ok from that very report, outside BUTLER_QUIET (HH-HH, server
   local time — set TZ in the container), median of the last 5 readings below target_low_pct,
