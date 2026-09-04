@@ -38,17 +38,24 @@ watering.
   refused, not quietly edited, so a stale client cannot overwrite a pot it could not see. Which
   also means a client that keys on the name forks the pot the day it is renamed and the old name
   comes free. Refuses inconsistent merges and channel/outlet collisions), `GET /pots` (the garden with latest raw, derived %, any open
-  proposal and the last handed dose with its verdict), `GET /history` (`c= ch= hours= bucket_s=`: bucketed raw counts with
+  proposal and the last handed dose with its verdict), `GET /history` (`pot= hours= bucket_s=`: bucketed raw counts with
   lo/hi/n and the server's `since`/`to`, `since` on a bucket boundary, `hours` up to a month and
   at most 2016 buckets — the bucket cap is the one that bites, so a month has to be asked for
-  hourly. The chart's wire),
+  hourly. By pot, not by channel: a plant wired into a dead one's socket must not open its chart
+  on somebody else's curve. Takes no token, which now means an unauthenticated caller can confirm
+  a pot id exists — accepted, and a pot that does not answers 200 with no points. The chart's
+  wire), `POST /pot/delete` (`id=`: erase a pot, its wiring, its readings, its doses and their
+  verdicts, its dismissed advice, and its photographs with their files. Its own route so a save
+  that lost its body can never become an erasure; the graveyard, `status=graveyard` on `POST
+  /pot`, is the reversible half and is what an app offers first),
   `GET /doses` (`pot= limit= before= before_id=`: the watering history, newest first — what was
   asked, what the meter counted, how it ended, the verdict, and the pot attributed through its own
   mapping windows. Proposals are left out (offers, not water) and so are stops (no outlet, no
   millilitres, never attributable); the expired, unacked and short-flowing rows are not, since they
   are what the list is for. Without `pot=` the whole garden, and a dose no window claims carries a
   null pot rather than vanishing; with `pot=` only handed doses can appear, because a dose belongs
-  to a pot from the moment the board is given it. `before=`/`before_id=` are the last row you have,
+  to a pot from the moment the board is given it. The pot on a dose is the STAMP the row carries,
+  written when the command was, not a window join at read time. `before=`/`before_id=` are the last row you have,
   both together because several doses can share a second and a timestamp-only cursor would skip or
   repeat them — the table is never pruned, so the older history has to stay reachable),
   `GET /species` (`q=`: the taxonomy hop through GBIF then Trefle for the accepted binomial,
@@ -118,13 +125,20 @@ watering.
 - The command slot: queued → handed exactly once in a report response (sent) → acked by the
   next report's `ack=<id> flow_ml=`; a no-ack report or the TTL expires it. Expired is gone —
   ask again. The commands table is never pruned: it doubles as the watering history.
-- One hose, one pot, and the mapping write enforces it: an enabled pot already on that
+- A pot has a `status`, a closed set of `alive` | `graveyard`, where it used to have an `enabled`
+  flag. Every reader asks a positive allow-list (`butler.waters` / `butler.live_sql`), never
+  `!= 'graveyard'`, so a word a newer backend invents does not water anything here. Burying a pot
+  CLOSES its open mapping window — that is what frees the channel and the outlet — expires its
+  open proposals, and drops its `sensor:`/`proposal:` alerts, which nothing else could clear once
+  it left the loop that raises them. Restoring leaves it unwired. `status=graveyard` together with
+  any wiring key in one body is refused: they are opposite instructions.
+- One hose, one pot, and the mapping write enforces it: a live pot already on that
   (controller, channel) or (controller, outlet) is refused — asked whatever the pot being saved
-  has for `enabled`, since a disabled pot parked on a working pot's hose opens a second window on
-  it just the same. A *disabled* pot holding the wiring is displaced instead: its open window
-  closes as the newcomer's opens, because disabling a pot does not unplug it and two open windows
-  make one dose belong to two pots at once — differently depending on which query you ask. A
-  displaced window keeps every dose it held.
+  has for `status`, since the point is the other pot. A pot still holding the wiring is displaced:
+  its open window closes as the newcomer's opens. This should now be unreachable, since burying is
+  what unplugs, and it stays because a database that arrived with two open windows on one hose has
+  no read-time GROUP BY papering over it any more — the reading stamp would pick one of the two
+  arbitrarily, and permanently.
 - `schema.sql` — additive-only DDL: `readings`, `commands`, `controllers`, `pots`,
   `pot_mappings`, the `pots_now` view, `verdicts`, `status`, `alerts`, `species_names`,
   `species_care`, `species_search`, `advice_dismissed` + indexes. Proposals are
@@ -137,9 +151,15 @@ watering.
   wiring out, run at startup, idempotent, inside a single transaction, leaving the database as
   it was at `<db>.pre-identity.bak` and one line on stderr saying so.
   Moisture % is derived at read time from each pot's (dry_raw, wet_raw), never stored:
-  recalibrating reinterprets history instead of losing it. A dose is attributed the same way,
-  through the windows: whose dose it was, whose cooldown and daily cap it spends, and which pot
-  a dose alert names all follow the pot, not the hose.
+  recalibrating reinterprets history instead of losing it. Attribution is NOT: `readings.pot_id`
+  and `commands.pot_id` are stamped as the row lands, from the window in force at that moment.
+  `pot_mappings` is demoted from "the join that answers whose dose it was" to "the source the
+  stamp is read from, and the record of which sensor a pot was on" — the dose judgement still
+  asks it for the channel, because the pot may have been rewired between the dose and the soak.
+  What stays hose-keyed: the board addresses outlets, `_hose_since` fences a proposal to the pot
+  that is on the hose now, and both watering floors count what went down a hose whoever it was
+  attributed to (decision #5). A reading on a channel nobody is mapped to stamps NULL, which is an
+  environment sensor or an unclaimed socket, and is unreachable from `/history` by design.
   `Dockerfile` — python-slim, port 9380, `/data` volume. `tests/` — the endpoints' contracts,
   `uv run pytest`.
 - `fake_device.py` — stdlib board simulator: reports on the `next=` beat, executes the one
@@ -205,17 +225,17 @@ Outlets are a flat index 0–14; only the board knows manifolds exist. A dose is
 flow meter with a hard seconds cap; if the bench rig says the meter lies, fall back to
 seconds-only and the meter stays safety-only.
 
-Tables (`schema.sql`): `readings(ts, controller, channel, raw)`; `pots(id, name, controller,
+Tables (`schema.sql`): `readings(ts, controller, channel, raw, t, pot_id)`; `pots(id, name, controller,
 channel, outlet, plant_type, plant_size, pot_size, soil, dry_raw, wet_raw, target_low_pct,
-target_high_pct, dose_ml, mode, cooldown_h, daily_cap_ml, enabled)` (`mode`:
+target_high_pct, dose_ml, mode, cooldown_h, daily_cap_ml, status)` (`mode`:
 manual | learning | auto) — mapping, calibration, thresholds and the descriptive
 fields (Planta-style: what is potted, how big, in what) in one table until that hurts (it did
 twice: since 2026-09-03 `pots.id` is a `pot-xxxxxx` and the three mapping columns live in
 `pot_mappings` with a window, and since 0.15.0 the two sizes are `plant_height_cm` and
-`pot_diameter_cm`, REAL, added by `add_columns()` rather than a second rebuild — read the current
-shape above, not this line); `commands(id, created_ts,
-outlet, ml, cap_s, state proposed→queued→sent→acked/expired/failed, source, result, verdict)` — the command log is
-the watering history; `events(ts, kind, detail)`. Percentages are derived at read time, never
+`pot_diameter_cm`, REAL, added by `add_columns()` rather than a second rebuild, and since 0.16.0
+`enabled` is `status` — read the current shape above, not this line); `commands(id, created_ts,
+outlet, ml, cap_s, state proposed→queued→sent→acked/expired/failed, source, result, verdict,
+pot_id)` — the command log is the watering history, never pruned EXCEPT by `POST /pot/delete`; `events(ts, kind, detail)`. Percentages are derived at read time, never
 stored. `schema.sql` stays additive, but `CREATE TABLE IF NOT EXISTS` is additive about tables
 only — a column appended to a CREATE that already ran never reaches an existing database — so a new
 column goes in the CREATE *and* in `butler.ADDED_COLUMNS`, which ALTERs it in at startup and can

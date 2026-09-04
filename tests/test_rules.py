@@ -118,13 +118,24 @@ def test_a_wet_median_holds_even_with_dry_readings_in_it(client, db):
         {"drop": "dose_ml"},
         {"drop": "outlet"},
         {"mode": "manual"},
-        {"enabled": 0},
     ],
 )
-def test_an_uncalibrated_or_manual_or_disabled_pot_never_waters(client, db, kwargs):
+def test_an_uncalibrated_or_manual_pot_never_waters(client, db, kwargs):
     # One variant per fresh database: /pot is a partial upsert, so reusing
     # the pot would quietly merge back the very field the variant drops.
     make_pot(client, **kwargs)
+    soak(client, 6)
+    assert commands(db) == []
+
+
+def test_a_buried_pot_never_waters(client, db):
+    """Two steps rather than a parametrize case, because burying a pot and
+    wiring it in one body is refused: the graveyard is what unwires it."""
+    pot_id = make_pot(client)
+    answer = client.post(
+        "/pot", content=f"id={pot_id} status=graveyard", headers={"X-Token": TOKEN}
+    )
+    assert answer.status_code == 200, answer.text
     soak(client, 6)
     assert commands(db) == []
 

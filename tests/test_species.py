@@ -293,28 +293,37 @@ def test_a_kind_outside_the_set_reads_as_unlabelled():
     # text until 0.15.0, so a row may still say "basil" or "foliage", and
     # the base band is the honest reading of one. parse_pot refuses to
     # write a new one — that half is tested in test_pots.
-    for stale in ("basil", "foliage", "cactus", "hardy fern", "cauliflower"):
+    for stale in ("basil", "foliage", "hardy fern", "cauliflower"):
         assert target_band(stale, None, None, None, 4)[:2] == BASE_BAND
 
 
+def test_a_cactus_is_drier_than_the_succulents_it_used_to_share_a_row_with():
+    assert target_band("cactus", None, None, None, 4)[:2] == (10, 25)
+    assert target_band("succulent", None, None, None, 4)[:2] == (15, 30)
+
+
+def test_the_new_kinds_all_move_the_band():
+    """A dropdown entry that landed on the base band would be a choice with
+    no consequence — the thing the closed set exists to prevent."""
+    for kind in ("cactus", "orchid", "mediterranean", "bulb", "palm", "carnivorous"):
+        assert target_band(kind, None, None, None, 4)[:2] != BASE_BAND, kind
+
+
 def test_gritty_soil_and_a_small_pot_pull_opposite_ways():
-    assert target_band("herb", "sandy loam", None, None, 4)[:2] == (30, 50)
+    assert target_band("herb", "sandy", None, None, 4)[:2] == (30, 50)
     assert target_band("herb", None, 10, None, 4)[:2] == (39, 55)
+
+
+def test_a_soil_outside_the_set_reads_as_unsaid():
+    """Tolerant out, strict in, exactly like the plant kind: rows written
+    while soil was free text still read, and shift nothing."""
+    for stale in ("sandy loam", "not sandy, holds moisture well", "universal"):
+        assert target_band("fern", stale, None, None, 4)[:2] == (55, 75)
 
 
 def test_winter_is_drier_and_summer_is_not():
     assert target_band("herb", None, None, None, 1)[:2] == (25, 45)
     assert target_band("herb", None, None, None, 7)[:2] == (40, 55)
-
-
-def test_not_sandy_is_not_sandy():
-    # Soil is the last field still typed, so a person writes what they mean.
-    # The wrong answer here is not "no modifier" — it is the drainage shift,
-    # applied backwards.
-    assert target_band("fern", "not sandy, holds moisture well", None, None, 4)[:2] == (
-        55,
-        75,
-    )
 
 
 def test_a_squeezed_band_gives_way_at_the_bottom():
@@ -324,13 +333,6 @@ def test_a_squeezed_band_gives_way_at_the_bottom():
     low, high = target_band("succulent", "clay", 8, None, 7)[:2]
     assert (low, high) == (15, 25)
     assert high <= 30
-
-
-def test_a_long_field_is_explained_by_the_word_that_matched():
-    why = target_band(
-        None, "an excellent free-draining mix with added grit", None, None, 4
-    ).why
-    assert why == "unlabelled plant, grit soil"
 
 
 # --- the measurements ----------------------------------------------------
@@ -415,7 +417,7 @@ def test_the_band_never_closes_or_leaves_the_scale():
     accept must never be inverted, shut, off the scale, or wetter at the top
     than the plant type's own unmodified ceiling."""
     kinds = [None, *PLANT_KINDS]
-    soils = [None, *[word for word, _ in SOIL_SHIFTS]]
+    soils = [None, *SOIL_SHIFTS]
     diameters = [None, 1, 8, 14, 30, 200]
     heights = [None, 1, 21, 120, 1000]
     for kind in kinds:
@@ -432,13 +434,17 @@ def test_the_band_never_closes_or_leaves_the_scale():
 
 
 def test_the_reason_names_what_moved_it():
-    why = target_band("herb", "sandy loam", 10, 40, 1).why
-    assert why == "herb, sandy loam soil, 10 cm pot, 40 cm plant, winter"
+    why = target_band("herb", "sandy", 10, 40, 1).why
+    assert why == "herb, sandy soil, 10 cm pot, 40 cm plant, winter"
 
 
-def test_the_reason_does_not_say_soil_soil():
-    # The label is there for a bare "clay"; the field often says it already.
-    assert target_band(None, "clay soil", None, None, 4).why.endswith("clay soil")
+def test_every_soil_carries_its_own_phrase():
+    """The word on the wire is not always the phrase a person reads: `bark`
+    is a mix, not a soil, and "bark soil" would be nonsense."""
+    assert target_band(None, "bark", None, None, 4).why.endswith("bark mix")
+    assert target_band(None, "sphagnum", None, None, 4).why.endswith("sphagnum moss")
+    for wire in SOIL_SHIFTS:
+        assert SOIL_SHIFTS[wire][2] in target_band(None, wire, None, None, 4).why
 
 
 def test_a_measurement_reads_as_a_number_not_a_word():
@@ -462,8 +468,19 @@ def test_a_family_suggests_a_kind():
     assert kind_for("Monstera deliciosa", "Araceae") == "tropical"
     assert kind_for("Crepis vesicaria", "Asteraceae") == "flower"
     assert kind_for("Nephrolepis exaltata", "Nephrolepidaceae") == "fern"
+    # A palm is no longer filed under the leafy houseplants, and a cactus is
+    # no longer filed under the succulents.
+    assert kind_for("Chamaedorea elegans", "Arecaceae") == "palm"
+    assert kind_for("Dionaea muscipula", "Droseraceae") == "carnivorous"
     # GBIF's case is not a promise.
-    assert kind_for("Echinopsis pachanoi", "CACTACEAE") == "succulent"
+    assert kind_for("Echinopsis pachanoi", "CACTACEAE") == "cactus"
+
+
+def test_an_orchid_is_answered_now_rather_than_dodged():
+    """Orchidaceae used to be left out on purpose, because a bark epiphyte
+    waters nothing like a flowering pot plant and there was no band for one.
+    There is now, so the honest answer is available."""
+    assert kind_for("Phalaenopsis amabilis", "Orchidaceae") == "orchid"
 
 
 def test_the_genus_is_asked_before_the_family():
@@ -476,17 +493,15 @@ def test_the_genus_is_asked_before_the_family():
 
 
 def test_an_unknown_family_offers_nothing_rather_than_a_guess():
-    # Orchidaceae is left out on purpose: an epiphyte on bark waters nothing
-    # like a flowering pot plant, and "not sure" already behaves correctly.
-    assert kind_for("Phalaenopsis amabilis", "Orchidaceae") is None
+    # An unlisted family means nobody here knows, and "not sure" already
+    # behaves correctly — better than 20 confident points the wrong way.
+    assert kind_for("Ginkgo biloba", "Ginkgoaceae") is None
     assert kind_for("Some plant", "Nothingaceae") is None
     assert kind_for("Some plant", None) is None
     assert kind_for(None, "Lamiaceae") is None
 
 
 def test_every_suggested_kind_is_one_the_form_can_show():
-    for table in (kind_for, ):
-        pass
     from butler import FAMILY_KINDS, GENUS_KINDS, SPECIES_KINDS
 
     for table in (FAMILY_KINDS, GENUS_KINDS, SPECIES_KINDS):
@@ -527,8 +542,57 @@ def test_the_kind_survives_the_cache(db):
     assert sources.hits("gbif") == before
 
 
+def test_a_name_cached_without_a_family_is_asked_again(db):
+    """A row that resolved a name but carries no family can suggest no plant
+    kind, and a cache hit never re-asks — so without this it would suggest
+    nothing for the life of the database. Reachable two ways: a row written
+    before the family column existed, and a GBIF answer that carried none.
+    Re-asking is TTL-gated, so the cost is one call a month, not one a
+    screen open."""
+    sources = Sources({**BASIL, "gbif": gbif(family=None)})
+    client = app(db, sources)
+    assert look(client, "Ocimum_basilicum")["kind"] is None
+    before = sources.hits("gbif")
+
+    # A month on, and GBIF has learnt the family in the meantime.
+    with sqlite3.connect(db) as con:
+        con.execute("UPDATE species_names SET fetched_ts = ?", (int(time.time()) - 31 * 86400,))
+    sources.answers = {**BASIL, "gbif": gbif(family="Lamiaceae")}
+    assert look(client, "Ocimum_basilicum")["kind"] == "herb"
+    assert sources.hits("gbif") == before + 1
+
+
+def test_a_re_ask_that_cannot_reach_gbif_keeps_the_name_it_had(db):
+    """The trap in the re-ask: turning a name that resolved yesterday into
+    "the lookup is not answering" would be a regression the day GBIF is
+    down, for a row that was perfectly usable."""
+    sources = Sources({**BASIL, "gbif": gbif(family=None)})
+    client = app(db, sources)
+    assert look(client, "Ocimum_basilicum")["accepted"] == "Ocimum basilicum"
+
+    with sqlite3.connect(db) as con:
+        con.execute("UPDATE species_names SET fetched_ts = ?", (int(time.time()) - 31 * 86400,))
+    sources.answers = {**BASIL, "gbif": None}  # the source is down
+    answer = look(client, "Ocimum_basilicum")
+    assert answer["accepted"] == "Ocimum basilicum"
+    assert answer["kind"] is None
+
+
+def test_a_complete_row_is_never_asked_again(db):
+    """The other side of the fence: a row with a family is a hit for ever,
+    and the TTL must not be read as an expiry for it."""
+    sources = Sources(BASIL)
+    client = app(db, sources)
+    look(client, "Ocimum_basilicum")
+    before = sources.hits("gbif")
+    with sqlite3.connect(db) as con:
+        con.execute("UPDATE species_names SET fetched_ts = ?", (int(time.time()) - 400 * 86400,))
+    assert look(client, "Ocimum_basilicum")["kind"] == "herb"
+    assert sources.hits("gbif") == before
+
+
 def test_a_family_nobody_listed_offers_no_kind(db):
-    sources = Sources({**BASIL, "gbif": gbif(family="Orchidaceae")})
+    sources = Sources({**BASIL, "gbif": gbif(family="Ginkgoaceae")})
     assert look(app(db, sources), "Ocimum_basilicum")["kind"] is None
 
 
@@ -756,11 +820,11 @@ def garden(client):
 
 def test_a_pot_with_no_band_is_offered_one(db):
     client = app(db, Sources(BASIL))
-    make_pot(client, name="basil", plant_type="herb", soil="sandy_loam")
+    make_pot(client, name="basil", plant_type="herb", soil="sandy")
     advice = garden(client)["basil"]["advice"]
     assert advice["kind"] == "target"
     assert advice["low"] < advice["high"]
-    assert "herb" in advice["why"] and "sandy loam soil" in advice["why"]
+    assert "herb" in advice["why"] and "sandy soil" in advice["why"]
 
 
 def test_the_offer_goes_quiet_once_the_numbers_are_the_offered_ones(db):
@@ -801,10 +865,10 @@ def test_a_different_offer_is_a_new_question(db):
     assert garden(client)["basil"]["advice"] is not None
 
 
-def test_a_disabled_pot_is_not_nagged(db):
+def test_a_buried_pot_is_not_nagged(db):
     client = app(db, Sources(BASIL))
     pot = make_pot(client, name="basil", plant_type="herb")
-    client.post("/pot", content=f"id={pot} enabled=0", headers={"X-Token": TOKEN})
+    client.post("/pot", content=f"id={pot} status=graveyard", headers={"X-Token": TOKEN})
     assert garden(client)["basil"]["advice"] is None
 
 

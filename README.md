@@ -92,10 +92,20 @@ curl -s 'http://localhost:8000/doses?pot=pot-3f9a21&limit=50'
 # -> {"doses": [...], "now": ...}: the watering history, newest first — what was asked, what
 #    the meter counted, how it ended, the verdict, and the pot it belonged to. Page back with
 #    before=<ts>&before_id=<id> from the last row you have.
-curl -s 'http://localhost:8000/history?c=butler1&ch=0&hours=24&bucket_s=300'
-# -> {"since": ..., "to": ..., "points": [{"ts", "raw", "lo", "hi", "n"}, ...]}: the chart's
-#    wire, raw counts bucketed on the server's clock; the app derives % from the pot's
-#    calibration, so recalibrating re-reads the whole curve
+curl -s 'http://localhost:8000/history?pot=pot-3f9a21&hours=24&bucket_s=300'
+# -> {"pot": ..., "since": ..., "to": ..., "points": [{"ts", "raw", "lo", "hi", "n"}, ...]}: the
+#    chart's wire, raw counts bucketed on the server's clock; the app derives % from the pot's
+#    calibration, so recalibrating re-reads the whole curve. By pot, so a plant wired into a dead
+#    one's socket does not inherit its curve
+curl -s -X POST http://localhost:8000/pot \
+  -H 'X-Token: dev' --data-binary 'id=pot-3f9a21 status=graveyard'
+# -> the reversible one: keeps every record, closes the mapping window so the channel and the
+#    outlet go back to the garden, and expires any proposal it was waiting on. status=alive
+#    brings it back, unwired.
+curl -s -X POST http://localhost:8000/pot/delete \
+  -H 'X-Token: dev' --data-binary 'id=pot-3f9a21'
+# -> ok: the pot, its wiring, its readings, its doses and their verdicts, its dismissed advice
+#    and its photographs with their files. No undo.
 ```
 
 Key a save on the name instead and it goes wrong in one of two ways. While the name is still
@@ -119,10 +129,13 @@ curl -s -X POST http://localhost:8000/verdict -H 'X-Token: dev' \
 ```
 
 Each pot in `GET /pots` also carries `last_dose`: the newest dose this POT was handed, with
-what the meter counted and the verdict so far. Whose dose a command was is resolved through
-the pot's mapping windows and not through whoever hangs on that hose today, so moving a hose
-takes the dose history with it. That is what the app judges from; a manual water-now replaces
-it only while the pot still holds the hose it was sent down.
+what the meter counted and the verdict so far. Whose dose a command was is STAMPED on the row
+when the command is written, not worked out from the wiring afterwards, so moving a hose takes
+the dose history with it and the plant that arrives on that hose inherits nothing. Readings carry
+the same stamp. What stays keyed on the hose is what physically belongs to it: the board is handed
+an outlet, a proposal is fenced to the pot on that hose now, and both watering floors count what
+went down a hose whoever it was attributed to — an attribution that came back empty must still
+water less, never more.
 
 ## What does this plant want?
 
