@@ -102,6 +102,9 @@ JPEG_HEAD = b"\xff\xd8\xff"  # every JPEG starts SOI + a marker
 PHOTO_LIMIT = 100  # the strip's default page
 MAX_PHOTO_LIMIT = 500
 MAX_PHOTO_EDGE = 8192  # w=/h= are what the phone says it downscaled to
+# Ids are four random bytes, so a collision needs tens of thousands of
+# photographs in one install. This is what stops one being a 500.
+PHOTO_ID_TRIES = 4
 # Every id that becomes part of a filesystem path goes through this first.
 # Ids here are minted, so nothing legitimate is turned away; what it stops
 # is a `pot=../../etc` writing outside the photo store, which no amount of
@@ -182,6 +185,17 @@ def new_pot_id() -> str:
     encodes an order that means nothing.
     """
     return "pot-" + secrets.token_hex(3)
+
+
+def write_new_file(path: Path, blob: bytes) -> None:
+    """Create `path` and write `blob` into it, refusing to overwrite.
+
+    O_EXCL, so claiming a name and finding it taken is one atomic step:
+    a photograph's id is also its filename, and overwriting would destroy
+    an earlier picture whose row would then point at nothing.
+    """
+    with open(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY), "wb") as f:
+        f.write(blob)
 
 
 def new_photo_id() -> str:
@@ -943,7 +957,10 @@ def parse_photos(params: QueryParams) -> tuple[str, int]:
         raise ValueError("no pot= in the request")
     if not SAFE_ID.fullmatch(pot):
         raise ValueError(f"not a pot id: {pot!r}")
-    return pot, _int_in(one("limit", str(PHOTO_LIMIT)) or "", "limit", 1, MAX_PHOTO_LIMIT)
+    # +1 like every other bound in this file (DOSES_MAX, MAX_CHANNEL,
+    # MAX_CAP_S): _int_in's top is exclusive, and the named max is meant to
+    # be a limit somebody can actually ask for.
+    return pot, _int_in(one("limit", str(PHOTO_LIMIT)) or "", "limit", 1, MAX_PHOTO_LIMIT + 1)
 
 
 def parse_photo_delete(text: str) -> str:
@@ -1453,9 +1470,7 @@ def create_app(
     # from a different day. BUTLER_PHOTOS can move them, and gets the same
     # refusal the database gets if it points into an unmounted /data.
     photos = Path(
-        photos_dir
-        if photos_dir is not None
-        else (os.environ.get("BUTLER_PHOTOS") or str(db.parent / "photos"))
+        photos_dir or os.environ.get("BUTLER_PHOTOS") or str(db.parent / "photos")
     )
     if photos.parent == Path("/data") and not os.path.ismount("/data"):
         raise ValueError(
@@ -1502,6 +1517,14 @@ def create_app(
         as missing forever. Neither connection is held across the disk
         write — a photograph is megabytes over a NAS volume, and a write
         transaction held that long is the board's reports blocked.
+
+        The id is claimed by creating its file exclusively, and a taken one
+        is simply tried again. Overwriting the file first and finding out
+        from the INSERT would destroy the picture already at that path — an
+        earlier photograph, already committed, whose row would then be left
+        pointing at nothing. Two ids can collide in two ways: the file is
+        there, or only the row is (a photograph whose file was lost), and
+        both have to fall out the same way.
         """
         with connect() as con:
             row = con.execute(
@@ -1509,25 +1532,34 @@ def create_app(
             ).fetchone()
         if row is None:
             raise ValueError(f"no such pot: {pot_id}")
-        photo_id = new_photo_id()
-        path = photo_path(pot_id, photo_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # Through a temporary file: a kill mid-write must not leave half a
-        # JPEG somewhere a row is about to point at.
-        part = path.with_suffix(".part")
-        part.write_bytes(blob)
-        part.replace(path)
-        try:
-            with connect() as con:
-                con.execute(
-                    "INSERT INTO photos (id, pot_id, ts, bytes, w, h, species) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (photo_id, pot_id, now, len(blob), w, h, row[0]),
-                )
-        except Exception:
-            path.unlink(missing_ok=True)
-            raise
-        return photo_id
+        for _ in range(PHOTO_ID_TRIES):
+            photo_id = new_photo_id()
+            path = photo_path(pot_id, photo_id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                write_new_file(path, blob)
+            except FileExistsError:
+                continue
+            try:
+                with connect() as con:
+                    con.execute(
+                        "INSERT INTO photos (id, pot_id, ts, bytes, w, h, species) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (photo_id, pot_id, now, len(blob), w, h, row[0]),
+                    )
+            except sqlite3.IntegrityError:
+                # The row is there and its file was not: the id belongs to
+                # a photograph whose bytes were lost. Leave that row alone
+                # and take another id.
+                path.unlink(missing_ok=True)
+                continue
+            except Exception:
+                path.unlink(missing_ok=True)
+                raise
+            return photo_id
+        raise sqlite3.IntegrityError(
+            f"could not mint a free photograph id in {PHOTO_ID_TRIES} tries"
+        )
 
     def photo_rows(pot_id: str, limit: int) -> list[dict]:
         """One pot's strip, newest first, straight from the rows.
@@ -1583,7 +1615,13 @@ def create_app(
             ).fetchone()
             if row is None:
                 raise ValueError(f"no such photo: {photo_id}")
-            con.execute("DELETE FROM photos WHERE id = ?", (photo_id,))
+            # The DELETE decides, not the SELECT before it. Two deletes of
+            # one photograph can both see the row — a bare SELECT takes no
+            # lock — and only the one that actually removed it may answer
+            # ok. Otherwise "deleting twice is refused rather than
+            # pretended" would hold only when nobody is in a hurry.
+            if con.execute("DELETE FROM photos WHERE id = ?", (photo_id,)).rowcount == 0:
+                raise ValueError(f"no such photo: {photo_id}")
         with contextlib.suppress(OSError):
             photo_path(row[0], photo_id).unlink(missing_ok=True)
 
@@ -3326,6 +3364,11 @@ def create_app(
             photo_id = await run_in_threadpool(keep_photo, pot_id, body, w, h, now)
         except ValueError as why:
             return PlainTextResponse(f"refused: {why}\n", status_code=400)
+        except sqlite3.IntegrityError as why:
+            # Every id keep_photo tried was taken. Retryable, and at four
+            # bytes of randomness it never happens — but a 500 with a bare
+            # traceback is not how anything else here fails.
+            return PlainTextResponse(f"try again: {why}\n", status_code=503)
         except sqlite3.OperationalError as why:
             return PlainTextResponse(f"try again: {why}\n", status_code=503)
         except OSError as why:
@@ -3418,9 +3461,11 @@ def create_app(
 
         The one call a phone can make to tell a wrong address from a wrong
         token, which are different mistakes and only one of them is the
-        user's to fix. Nothing else here can answer it: the reads are
-        ungated and answer a wrong token exactly as they answer a right
-        one, and every gated route writes something.
+        user's to fix. Nothing else here can answer it. Most of the reads
+        are ungated and answer a wrong token exactly as they answer a right
+        one; the photo routes do check it, but they read the database and
+        the disk, so their refusals are not only about the token; and every
+        other gated route writes something.
 
         Touches no database, so it stays an answer about the address and
         the token and never about the disk.
