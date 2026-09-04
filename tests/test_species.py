@@ -278,6 +278,29 @@ def test_the_second_lookup_asks_nobody(db):
     assert sources.hits("species/search") == 1
 
 
+def test_the_garden_can_still_report_while_a_lookup_is_waiting(db):
+    """A lookup makes up to three HTTP calls with their own timeouts. If a
+    write transaction were open across them, every board report in that
+    window would answer "try again" — somebody typing a plant's name must
+    not be able to stop the garden reporting."""
+    wrote = []
+
+    class Meanwhile(Sources):
+        def __call__(self, url):
+            # Stands in for POST /report landing mid-lookup: a writer with a
+            # short timeout, which fails outright if the lock is held.
+            with sqlite3.connect(db, timeout=0.2) as other:
+                other.execute(
+                    "INSERT INTO readings (ts, controller, channel, raw) "
+                    "VALUES (1, 'b1', 0, 8000)"
+                )
+            wrote.append(url)
+            return super().__call__(url)
+
+    look(app(db, Meanwhile(BASIL)), "Ocimum basilicum")
+    assert len(wrote) == 3  # gbif, the search, the species page
+
+
 def test_a_name_service_that_is_down_is_not_a_plant_that_does_not_exist(db):
     sources = Sources({"gbif": None})
     answer = look(app(db, sources), "Ocimum basilicum")

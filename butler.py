@@ -1277,17 +1277,24 @@ def create_app(
         con.execute("PRAGMA journal_mode=WAL")
         return con
 
-    def taxon_for(con: sqlite3.Connection, query: str, now: int) -> Taxon | None:
+    def taxon_for(query: str, now: int) -> Taxon | None:
         """The accepted binomial for what somebody typed, cached.
 
         None means the name service could not be asked — which is not the
         same as "no such plant" and must not be written down as one.
+
+        No database connection is held across the fetch, here or below. The
+        first write in a connection opens sqlite's write transaction, and
+        holding one for the length of three HTTP timeouts would make every
+        board report in that window answer "try again": somebody typing a
+        plant's name must not be able to stop the garden reporting.
         """
-        row = con.execute(
-            "SELECT accepted, rank, matched, fetched_ts FROM species_names "
-            "WHERE query = ?",
-            (query,),
-        ).fetchone()
+        with connect() as con:
+            row = con.execute(
+                "SELECT accepted, rank, matched, fetched_ts FROM species_names "
+                "WHERE query = ?",
+                (query,),
+            ).fetchone()
         if row and (row[0] is not None or now - row[3] < CARE_MISS_TTL_S):
             return Taxon(row[0], row[1], row[2])
         payload = get_json(
@@ -1296,11 +1303,12 @@ def create_app(
         if payload is None:
             return None
         taxon = read_gbif(payload)
-        con.execute(
-            "INSERT OR REPLACE INTO species_names "
-            "(query, fetched_ts, accepted, rank, matched) VALUES (?, ?, ?, ?, ?)",
-            (query, now, taxon.accepted, taxon.rank, taxon.matched),
-        )
+        with connect() as con:
+            con.execute(
+                "INSERT OR REPLACE INTO species_names "
+                "(query, fetched_ts, accepted, rank, matched) VALUES (?, ?, ?, ?, ?)",
+                (query, now, taxon.accepted, taxon.rank, taxon.matched),
+            )
         return taxon
 
     def cached_care(con: sqlite3.Connection, key: str) -> dict | None:
@@ -1315,7 +1323,7 @@ def create_app(
         entry.update(zip(CARE_KEYS, row[3:]))
         return entry
 
-    def care_for(con: sqlite3.Connection, accepted: str, now: int) -> dict | None:
+    def care_for(accepted: str, now: int) -> dict | None:
         """What the care source says about one binomial, cached.
 
         A miss is cached too — Trefle's houseplant coverage is empty, not
@@ -1324,7 +1332,8 @@ def create_app(
         asked at all: no token configured, or the source is not answering.
         """
         key = normalise_species(accepted)
-        entry = cached_care(con, key)
+        with connect() as con:
+            entry = cached_care(con, key)
         if entry and (entry["found"] or now - entry["fetched"] < CARE_MISS_TTL_S):
             return entry
         if not care_token:
@@ -1345,12 +1354,13 @@ def create_app(
             if detail is None:
                 return None
             care = read_trefle(detail)
-        con.execute(
-            "INSERT OR REPLACE INTO species_care "
-            f"(species, fetched_ts, source, found, {', '.join(CARE_KEYS)}) "
-            f"VALUES (?, ?, 'trefle', ?, {', '.join('?' * len(CARE_KEYS))})",
-            (key, now, int(bool(slug)), *(care[k] for k in CARE_KEYS)),
-        )
+        with connect() as con:
+            con.execute(
+                "INSERT OR REPLACE INTO species_care "
+                f"(species, fetched_ts, source, found, {', '.join(CARE_KEYS)}) "
+                f"VALUES (?, ?, 'trefle', ?, {', '.join('?' * len(CARE_KEYS))})",
+                (key, now, int(bool(slug)), *(care[k] for k in CARE_KEYS)),
+            )
         return {"fetched": now, "source": "trefle", "found": bool(slug), **care}
 
     def look_up(query: str) -> dict:
@@ -1358,32 +1368,33 @@ def create_app(
         it. Every unhappy path ends in a working screen: the numbers are
         typed in, which is what happens for most houseplants anyway."""
         now = int(time.time())
-        with connect() as con:
-            taxon = taxon_for(con, query, now)
-            if taxon is None:
-                return {
-                    "query": query,
-                    "matched": "unavailable",
-                    "accepted": None,
-                    "rank": None,
-                    "care": None,
-                    "note": "the name service is not answering — type the numbers in",
-                }
-            answer = {
+        taxon = taxon_for(query, now)
+        if taxon is None:
+            return {
                 "query": query,
-                "matched": taxon.matched,
-                "accepted": taxon.accepted,
-                "rank": taxon.rank,
+                "matched": "unavailable",
+                "accepted": None,
+                "rank": None,
                 "care": None,
-                "note": "",
+                "note": "the name service is not answering — type the numbers in",
             }
-            if taxon.matched == "genus":
-                answer["note"] = "that is a genus — which species?"
-                return answer
-            if taxon.accepted is None:
-                answer["note"] = "no plant of that name — check the spelling, or type the numbers in"
-                return answer
-            care = care_for(con, taxon.accepted, now)
+        answer = {
+            "query": query,
+            "matched": taxon.matched,
+            "accepted": taxon.accepted,
+            "rank": taxon.rank,
+            "care": None,
+            "note": "",
+        }
+        if taxon.matched == "genus":
+            answer["note"] = "that is a genus — which species?"
+            return answer
+        if taxon.accepted is None:
+            answer["note"] = (
+                "no plant of that name — check the spelling, or type the numbers in"
+            )
+            return answer
+        care = care_for(taxon.accepted, now)
         if care is None:
             answer["note"] = "no care source configured or answering — type the numbers in"
             return answer
@@ -2747,6 +2758,11 @@ def create_app(
     async def species(request: Request):
         """What is known about a plant by name. Never writes to a pot: the
         numbers a human ends up with are written by POST /pot, by that human.
+
+        The one GET here that asks for the token, because it is the one that
+        spends something not ours: an unauthenticated caller could burn the
+        Trefle quota for the whole household. Reads of our own data stay open
+        on the tailnet as they always were.
         """
         if bad_token(request):
             return PlainTextResponse("bad token\n", status_code=401)
