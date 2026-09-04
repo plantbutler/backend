@@ -1093,17 +1093,30 @@ class Band(NamedTuple):
 
 
 WHY_MAX = 24  # these fields are free text; a reason is a phrase, not an essay
+NEGATIONS = ("not", "no", "non", "without", "never")
 
 
 def _find(text: str | None, table) -> tuple[str, tuple[int, int]] | None:
-    """The first table entry whose word appears in `text`, reported back in
-    the user's own words rather than the keyword that matched — "sandy loam
-    soil", not "sand soil". A substring match, so "succulents" and "sandy
-    loam" both land and the fields stay free text."""
-    words = normalise_species(text or "")
+    """The first table entry that matches `text`, with the phrase to say so.
+
+    Three rules, each of them a wrong answer that free text produced. A
+    keyword counts only at the START of a word, because a cauliflower is a
+    vegetable and not a flower. A keyword directly after a negation does not
+    count, because "not sandy" is not sandy — and falling through to no
+    modifier at all is the right answer there, not the opposite one. And the
+    reason is given in the user's own words when they are short enough to
+    read ("sandy loam soil", not "sand soil"), else in the keyword that
+    actually matched, since half a sentence cut mid-word explains nothing.
+    """
+    whole = normalise_species(text or "")
+    words = whole.split()
     for word, value in table:
-        if word in words:
-            return words[:WHY_MAX], value
+        for i, seen in enumerate(words):
+            if not seen.startswith(word):
+                continue
+            if i and words[i - 1] in NEGATIONS:
+                continue
+            return (whole if len(whole) <= WHY_MAX else word), value
     return None
 
 
@@ -1135,6 +1148,12 @@ def target_band(
         shift = SEASON_SHIFTS[season]
         low, high = low + shift[0], high + shift[1]
         why.append(season)
+    # A band the shifts have squeezed shut is widened DOWNWARDS. Raising the
+    # top instead would offer a wetter ceiling than the plant's own base —
+    # a succulent in clay came out capped at 35% when its unmodified top is
+    # 30% — and would contradict the reason printed beside it. Lowering the
+    # floor errs dry, which is the direction #5 asks for.
+    low = min(low, high - BAND_MIN_WIDTH)
     low = max(BAND_FLOOR, min(BAND_CEIL - BAND_MIN_WIDTH, low))
     high = max(low + BAND_MIN_WIDTH, min(BAND_CEIL, high))
     return Band(low, high, ", ".join(why))

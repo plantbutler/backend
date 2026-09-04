@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from butler import (
+    BASE_BAND,
     CARE_MISS_TTL_S,
     binomial_case,
     Taxon,
@@ -222,6 +223,36 @@ def test_gritty_soil_and_a_small_pot_pull_opposite_ways():
 def test_winter_is_drier_and_summer_is_not():
     assert target_band("herb", None, None, 1)[:2] == (25, 45)
     assert target_band("herb", None, None, 7)[:2] == (40, 55)
+
+
+def test_a_cauliflower_is_not_a_flower():
+    # A keyword counts only at the start of a word. Nothing recognised here,
+    # so the offer is the base one rather than the ornamental band.
+    assert target_band("cauliflower", None, None, 4)[:2] == BASE_BAND
+
+
+def test_not_sandy_is_not_sandy():
+    # Free text, so a person writes what they mean. The wrong answer here is
+    # not "no modifier" — it is the drainage shift, applied backwards.
+    assert target_band("fern", "not sandy, holds moisture well", None, 4)[:2] == (
+        55,
+        75,
+    )
+    assert target_band("herb", None, "not large, a normal pot", 4)[:2] == (35, 55)
+
+
+def test_a_squeezed_band_gives_way_at_the_bottom():
+    # A succulent in clay: the shifts close the band completely. Widening it
+    # upwards would offer a wetter ceiling than the succulent's own 30%, and
+    # would contradict the "clay soil" printed beside it.
+    low, high = target_band("succulent", "clay", "small", 7)[:2]
+    assert (low, high) == (15, 25)
+    assert high <= 30
+
+
+def test_a_long_field_is_explained_by_the_word_that_matched():
+    why = target_band(None, "an excellent free-draining mix with added grit", None, 4).why
+    assert why == "unlabelled plant, grit soil"
 
 
 def test_the_band_never_closes_or_leaves_the_scale():
