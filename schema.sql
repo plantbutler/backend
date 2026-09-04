@@ -237,3 +237,31 @@ CREATE TABLE IF NOT EXISTS species_search (
   fetched_ts INTEGER NOT NULL,
   candidates TEXT NOT NULL  -- JSON array of {name, common, image, slug}
 );
+
+-- A picture of the plant, over time (cycle 2). The bytes live on the
+-- bind-mounted volume beside this database, one file per row, and this
+-- table is the truth: a photograph is listed, served and deleted by its
+-- row, and the directory is never read to decide what exists.
+--
+-- That settles the two reachable inconsistencies in opposite directions,
+-- on purpose. A file no row knows about is invisible and harmless — it is
+-- what a crash between the two writes leaves behind, and what a database
+-- restored from an older backup than the volume leaves behind. A row whose
+-- file has gone is the other way round, cannot be hidden, and is reported
+-- as `missing` rather than served as a broken image.
+--
+-- `species` is what the pot said it was when the picture was taken. A pot
+-- outlives its plant, and this is what lets the strip draw the break where
+-- one plant ended and the next began without inventing a replant event.
+
+CREATE TABLE IF NOT EXISTS photos (
+  id      TEXT PRIMARY KEY,  -- photo-3f9a21b4, minted once; the filename too
+  pot_id  TEXT    NOT NULL,
+  ts      INTEGER NOT NULL,  -- server arrival time, unix seconds
+  bytes   INTEGER NOT NULL,
+  w       INTEGER,           -- what the phone says it downscaled to
+  h       INTEGER,
+  species TEXT
+);
+
+CREATE INDEX IF NOT EXISTS photos_by_pot ON photos (pot_id, ts);

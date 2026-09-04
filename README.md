@@ -34,9 +34,34 @@ your token" are different mistakes and only one of them is yours to fix:
 
 ```bash
 curl -s -H 'X-Token: dev' http://localhost:8000/hello
-# -> butler=0.13.0     (401 bad token when the token is wrong; connection
+# -> butler=0.14.0     (401 bad token when the token is wrong; connection
 #                       refused when the address is)
 ```
+
+Keep a photograph of a plant. The bytes are the body — the one route here whose payload is not
+`k=v`, because it is not text — and the phone downscales before it uploads; anything that is not a
+JPEG, or is over 3 MiB, is refused. The pictures and the listing are the only reads that want the
+token: everything else here is numbers about plants, and these are the one thing that could show
+the inside of a house.
+
+```bash
+curl -s -X POST 'http://localhost:8000/photo?pot=pot-3f9a21&w=1600&h=1200' \
+  -H 'X-Token: dev' -H 'Content-Type: image/jpeg' --data-binary @basil.jpg
+# -> photo=photo-9c1f0ab2 ts=1757000000
+curl -s -H 'X-Token: dev' 'http://localhost:8000/photos?pot=pot-3f9a21'
+curl -s -H 'X-Token: dev' http://localhost:8000/photo/photo-9c1f0ab2 > basil.jpg
+curl -s -X POST http://localhost:8000/photo/delete \
+  -H 'X-Token: dev' --data-binary 'photo=photo-9c1f0ab2'
+```
+
+The bytes live under `BUTLER_PHOTOS` (by default `photos/` beside the database, so they share the
+bind mount and are backed up or lost together), one directory per pot, named by the photograph's
+own id. **The row is the truth.** A picture is listed, served and deleted by its row, and the
+directory is never read to decide what exists — so a file no row knows about is invisible and
+harmless, and a row whose file has gone is listed as `missing` rather than served as a broken
+image. Keeping a photograph writes the file first and the row second; deleting one removes the row
+first and the file second. Whichever way a crash or a half-restored backup lands, what is left over
+is the harmless direction.
 
 Queue a command for the board's next report, or change its report interval:
 
