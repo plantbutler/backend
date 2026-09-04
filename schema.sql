@@ -225,3 +225,15 @@ CREATE TABLE IF NOT EXISTS advice_dismissed (
   ts          INTEGER NOT NULL,
   PRIMARY KEY (pot_id, kind)
 );
+
+-- The fuzzy half of the lookup. GBIF only knows scientific names, so
+-- "basil", "peace lily" and "tomatoe" resolve to nothing there; Trefle's own
+-- search matches common names and tolerates a typo, and its results already
+-- carry a picture, which is how a person confirms they found their plant.
+-- One row per typing, since that is what was searched for.
+
+CREATE TABLE IF NOT EXISTS species_search (
+  query      TEXT PRIMARY KEY,
+  fetched_ts INTEGER NOT NULL,
+  candidates TEXT NOT NULL  -- JSON array of {name, common, image, slug}
+);

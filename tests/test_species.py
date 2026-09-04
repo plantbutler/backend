@@ -10,8 +10,13 @@ from fastapi.testclient import TestClient
 
 from butler import (
     BASE_BAND,
+    POT_SHIFTS,
+    SOIL_SHIFTS,
+    TYPE_BANDS,
     CARE_MISS_TTL_S,
     binomial_case,
+    read_candidates,
+    sole_match,
     Taxon,
     create_app,
     normalise_species,
@@ -88,6 +93,52 @@ def detail(light=7, humidity=5, common="Basil"):
     }
 
 
+def row(name, slug, common=None, rank="species", image="https://img/x"):
+    return {
+        "scientific_name": name,
+        "slug": slug,
+        "common_name": common,
+        "rank": rank,
+        "image_url": image,
+    }
+
+
+MONSTERAS = {
+    "data": [
+        row("Monstera adansonii", "monstera-adansonii", "Tarovine"),
+        row("Monstera deliciosa", "monstera-deliciosa", "Fruit-salad-plant"),
+    ]
+}
+
+BASILS = {
+    "data": [
+        row("Clinopodium acinos", "clinopodium-acinos", "Basil thyme"),
+        row("Ocimum gratissimum", "ocimum-gratissimum", "African basil"),
+        row("Ocimum basilicum", "ocimum-basilicum", "Basil"),
+    ]
+}
+
+LILIES = {
+    "data": [
+        row("Spathiphyllum floribundum", "spathiphyllum-floribundum", "Peace-lily"),
+        row("Spathiphyllum wallisii", "spathiphyllum-wallisii", "Peace lily"),
+    ]
+}
+
+TOMATOES = {
+    "data": [
+        row("Solanum lycopersicum", "solanum-lycopersicum", "Tomato"),
+        row(
+            "Solanum lycopersicum var. lycopersicum",
+            "slvl",
+            "Garden tomato",
+            rank="var",
+        ),
+        row("Solanum betaceum", "solanum-betaceum", "Tree-tomato"),
+    ]
+}
+
+
 BASIL = {
     "gbif": gbif(),
     "species/search": search(),
@@ -160,6 +211,24 @@ def test_gbif_outside_the_plant_kingdom_is_a_wrong_hop():
 
 
 # --- the care source -----------------------------------------------------
+
+
+def test_the_shortlist_leaves_out_the_varieties():
+    # "Solanum lycopersicum var. lycopersicum" is a worse answer to "tomato"
+    # than the species is, and it is the one Trefle ranks second.
+    names = [c["name"] for c in read_candidates(TOMATOES)]
+    assert names == ["Solanum lycopersicum", "Solanum betaceum"]
+
+
+def test_the_shortlist_drops_a_picture_the_phone_should_not_load():
+    payload = {"data": [row("X y", "x-y", "X", image="javascript:alert(1)")]}
+    assert read_candidates(payload)[0]["image"] is None
+
+
+def test_one_plant_of_that_name_is_followed_and_two_are_not():
+    assert sole_match(read_candidates(BASILS), "basil") == "Ocimum basilicum"
+    assert sole_match(read_candidates(LILIES), "peace lily") is None
+    assert sole_match(read_candidates(MONSTERAS), "monstera") is None
 
 
 def test_pick_species_takes_the_binomial_and_not_the_neighbour():
@@ -256,8 +325,23 @@ def test_a_long_field_is_explained_by_the_word_that_matched():
 
 
 def test_the_band_never_closes_or_leaves_the_scale():
-    low, high, _ = target_band("succulent", "cactus mix", "large", 1)
-    assert low >= 5 and high <= 95 and high - low >= 10
+    """Every combination, not one sample: the offer a human is asked to
+    accept must never be inverted, shut, off the scale, or wetter at the top
+    than the plant type's own unmodified ceiling."""
+    kinds = [None, *[word for word, _ in TYPE_BANDS]]
+    soils = [None, *[word for word, _ in SOIL_SHIFTS]]
+    sizes = [None, *[word for word, _ in POT_SHIFTS]]
+    ceilings = dict(TYPE_BANDS)
+    for kind in kinds:
+        for soil in soils:
+            for size in sizes:
+                for month in range(1, 13):
+                    band = target_band(kind, soil, size, month)
+                    where = (kind, soil, size, month, band)
+                    assert 5 <= band.low < band.high <= 95, where
+                    assert band.high - band.low >= 10, where
+                    if kind:
+                        assert band.high <= ceilings[kind][1], where
 
 
 def test_the_reason_names_what_moved_it():
@@ -333,7 +417,7 @@ def test_the_garden_can_still_report_while_a_lookup_is_waiting(db):
 
 
 def test_a_name_service_that_is_down_is_not_a_plant_that_does_not_exist(db):
-    sources = Sources({"gbif": None})
+    sources = Sources({"gbif": None, "species/search": {"data": []}})
     answer = look(app(db, sources), "Ocimum basilicum")
     assert answer["matched"] == "unavailable"
     assert "not answering" in answer["note"]
@@ -357,22 +441,91 @@ def test_with_no_token_the_name_still_resolves(db):
     assert "type the numbers in" in answer["note"]
 
 
-def test_a_genus_asks_for_the_species(db):
+def test_a_genus_offers_its_species_with_their_pictures(db):
     payload = gbif(rank="GENUS")
     payload["species"] = None
-    sources = Sources({"gbif": payload})
+    sources = Sources({"gbif": payload, "species/search": MONSTERAS})
     answer = look(app(db, sources), "Monstera")
     assert answer["matched"] == "genus"
-    assert "which species" in answer["note"]
-    # And it was asked as "Monstera": GBIF finds no genus in lower case.
+    assert [c["name"] for c in answer["candidates"]] == [
+        "Monstera adansonii",
+        "Monstera deliciosa",
+    ]
+    assert answer["candidates"][0]["image"].startswith("https://")
+    assert "pick the plant you recognise" in answer["note"]
+    # And GBIF was asked as "Monstera": it finds no genus in lower case.
     assert "name=Monstera" in sources.calls[0]
 
 
-def test_an_unknown_name_says_so_without_asking_trefle(db):
-    sources = Sources({"gbif": gbif(match="NONE")})
+def test_a_genus_nobody_can_search_still_says_which_species(db):
+    payload = gbif(rank="GENUS")
+    payload["species"] = None
+    sources = Sources({"gbif": payload, "species/search": {"data": []}})
+    answer = look(app(db, sources), "Monstera")
+    assert answer["candidates"] == []
+    assert "which species" in answer["note"]
+
+
+def test_an_unknown_name_that_nothing_can_place_says_so(db):
+    sources = Sources({"gbif": gbif(match="NONE"), "species/search": {"data": []}})
     answer = look(app(db, sources), "zzqq notaplant")
     assert answer["accepted"] is None
-    assert sources.hits("trefle") == 0
+    assert answer["candidates"] == []
+    assert "check the spelling" in answer["note"]
+
+
+def test_a_common_name_that_is_exactly_one_plant_is_followed(db):
+    # "basil" is nothing at all to GBIF, and among Trefle's basil thymes and
+    # African basils exactly one is called Basil. That is not a guess.
+    sources = Sources(
+        {
+            "name=Basil": gbif(match="NONE"),
+            "name=Ocimum": gbif(),
+            "species/search": BASILS,
+            "species/ocimum-basilicum": detail(),
+        }
+    )
+    answer = look(app(db, sources), "basil")
+    assert answer["matched"] == "common"
+    assert answer["accepted"] == "Ocimum basilicum"
+    assert answer["care"]["light"] == 7
+    assert answer["query"] == "basil"
+
+
+def test_two_plants_of_the_same_name_are_a_question_and_not_a_guess(db):
+    # Trefle spells the same common name two ways in adjacent rows. Picking
+    # either would be inventing an answer; two pictures is the honest one.
+    sources = Sources({"gbif": gbif(match="NONE"), "species/search": LILIES})
+    answer = look(app(db, sources), "peace lily")
+    assert answer["accepted"] is None
+    assert len(answer["candidates"]) == 2
+    assert "pick the plant you recognise" in answer["note"]
+
+
+def test_a_typo_past_gbif_still_gets_pictures(db):
+    sources = Sources({"gbif": gbif(match="NONE"), "species/search": TOMATOES})
+    answer = look(app(db, sources), "tomatoe")
+    assert [c["common"] for c in answer["candidates"]] == ["Tomato", "Tree-tomato"]
+
+
+def test_a_name_gbif_resolved_gets_no_second_guessing_shortlist(db):
+    # Ficus lyrata: GBIF places it exactly, Trefle has never heard of it.
+    # Offering other figs would be worse than saying so.
+    sources = Sources(
+        {"gbif": gbif("Ficus lyrata"), "species/search": {"data": []}}
+    )
+    answer = look(app(db, sources), "Ficus lyrata")
+    assert answer["accepted"] == "Ficus lyrata"
+    assert answer["candidates"] == []
+    assert sources.hits("species/search") == 1  # the exact one, not a shortlist
+
+
+def test_the_shortlist_is_cached_too(db):
+    sources = Sources({"gbif": gbif(match="NONE"), "species/search": LILIES})
+    client = app(db, sources)
+    look(client, "peace lily")
+    look(client, "PEACE  LILY")
+    assert sources.hits("species/search") == 1
 
 
 def test_a_plant_trefle_does_not_have_is_the_ordinary_case(db):
@@ -496,6 +649,24 @@ def test_advice_only_dismisses(db):
         "/advice", content="pot=pot-nope dismiss=1", headers={"X-Token": TOKEN}
     )
     assert unknown.status_code == 400
+
+
+def test_the_garden_finds_the_care_under_the_name_the_pot_actually_stores(db):
+    """The lookup offers the accepted name and the form takes it, so the pot
+    usually stores "Dracaena trifasciata" — which is a key in the care cache
+    but NOT in the alias table, whose key is what somebody typed."""
+    sources = Sources(
+        {
+            "gbif": gbif("Dracaena trifasciata"),
+            "species/search": search("Dracaena trifasciata", "dracaena-trifasciata"),
+            "species/dracaena": detail(light=4, common="Snake plant"),
+        }
+    )
+    client = app(db, sources)
+    look(client, "Sansevieria trifasciata")  # typed the old name
+    make_pot(client, name="snake", species="Dracaena_trifasciata")  # stored the new one
+    care = garden(client)["snake"]["care"]
+    assert care is not None and care["light"] == 4
 
 
 def test_the_garden_carries_what_was_looked_up_without_asking_again(db):

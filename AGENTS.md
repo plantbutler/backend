@@ -51,9 +51,10 @@ watering.
   both together because several doses can share a second and a timestamp-only cursor would skip or
   repeat them — the table is never pruned, so the older history has to stay reachable),
   `GET /species` (`q=`: the taxonomy hop through GBIF then Trefle for the accepted binomial,
-  both cached — `matched` is exact|fuzzy|genus|none|unavailable, `care` is null when nothing
-  could be asked, and `note` is the sentence for the screen. No watering number comes back: see
-  the band below), `POST /advice` (`pot= kind=target dismiss=1`: this offer was refused, keyed on
+  both cached — `matched` is exact|fuzzy|common|genus|none|unavailable, `care` is null when
+  nothing could be asked, `candidates` is the shortlist with pictures when no name could be
+  placed, and `note` is the sentence for the screen. No watering number comes back: see the band
+  below), `POST /advice` (`pot= kind=target dismiss=1`: this offer was refused, keyed on
   a fingerprint of the numbers refused, so a different offer is asked again. There is no accept —
   accepting is an ordinary `POST /pot`),
   `POST /approve` (proposed -> queued, slot permitting), `POST /verdict` (ok | too_much |
@@ -80,7 +81,11 @@ watering.
 - The care lookup and the band it does not come from. GBIF normalises what was typed (free, no
   key) and Trefle answers about the accepted binomial; `species_names` and `species_care` cache
   both hops, hits forever and misses for a month, so `GET /pots` reads caches only and never the
-  network. Two things the live services taught, both now in the code as comments: GBIF sends
+  network. GBIF knows scientific names only, so a name it cannot place falls to Trefle's own
+  search, which matches common names, survives a typo and answers with pictures (`species_search`,
+  cached the same way); exactly one candidate bearing the typed common name is followed
+  (`matched: common`), two are a question with two pictures, and a name GBIF *did* place is never
+  second-guessed with a shortlist. Two things the live services taught, both now in the code as comments: GBIF sends
   `matchType: NONE` with `confidence: 100`, so confidence alone means nothing; and GBIF matches a
   lowercase binomial but not a lowercase genus, so the cache key is lowercased and the question
   goes out in botanical case. Trefle has no watering regime at all (`soil_humidity` NULL for every
@@ -99,7 +104,7 @@ watering.
   displaced window keeps every dose it held.
 - `schema.sql` — additive-only DDL: `readings`, `commands`, `controllers`, `pots`,
   `pot_mappings`, the `pots_now` view, `verdicts`, `status`, `alerts`, `species_names`,
-  `species_care`, `advice_dismissed` + indexes. Proposals are
+  `species_care`, `species_search`, `advice_dismissed` + indexes. Proposals are
   commands in state 'proposed'; the verdict log is the dataset adaptive dosing will one day fit
   on. A pot is a `pot-xxxxxx` id and a nickname; its wiring (controller, channel, outlet) is NOT
   in `pots` but in `pot_mappings`, one row per period with a half-open [from_ts, to_ts) window,

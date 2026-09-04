@@ -109,6 +109,24 @@ has never heard of is the *ordinary* case for houseplants rather than an error. 
 ends the same way — you type the numbers in. Both hops are cached: hits forever, misses for a
 month, so the second lookup asks nobody and `GET /pots` never touches the network at all.
 
+A name nobody can place is not the end of it, because GBIF only knows scientific ones. Trefle's own
+search takes the typing as a common name, survives a typo, and answers with pictures:
+
+```bash
+curl -s -G http://localhost:8000/species -H 'X-Token: dev' --data-urlencode 'q=tomatoe'
+# -> {"matched": "none", "accepted": null,
+#     "candidates": [{"name": "Solanum lycopersicum", "common": "Tomato", "image": "https://…"},
+#                    {"name": "Solanum betaceum", "common": "Tree-tomato", "image": "https://…"}],
+#     "note": "not sure which one — pick the plant you recognise"}
+```
+
+Ask again with a candidate's name and it resolves exactly. `q=basil` skips even that: among Trefle's
+basil thymes and African basils exactly one is called Basil, and one is not a guess — that answers
+`"matched": "common"` with the care already filled in. Two are (`q=peace lily` finds a "Peace lily"
+and a "Peace-lily"), so those come back as two pictures and a question. A name GBIF *did* place is
+never second-guessed with a shortlist: Trefle has never heard of Ficus lyrata, and offering other
+figs would be worse than saying so.
+
 No watering number comes from any of this. Trefle carries no watering regime — `soil_humidity` was
 NULL for every species probed — so the target band is proposed locally, from the kind of plant, the
 soil, the pot size and the month, and it arrives as an offer on each pot in `GET /pots`:

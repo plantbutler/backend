@@ -1046,6 +1046,65 @@ def read_trefle(payload: dict) -> dict:
     }
 
 
+CANDIDATES_MAX = 8  # a screenful of pictures; the rest are worse matches
+CANDIDATE_KEYS = ("name", "common", "image", "slug")
+
+
+def loose(text: str) -> str:
+    """Looser than the cache key: hyphens are spaces too. Trefle spells the
+    same plant "Peace lily" and "Peace-lily" in adjacent rows, and neither
+    spelling is what anybody types."""
+    return normalise_species(text.replace("-", " "))
+
+
+def read_candidates(payload: dict) -> list[dict]:
+    """A Trefle search answer as a shortlist to show somebody.
+
+    Species only: Trefle returns varieties and subspecies alongside, and
+    "Solanum lycopersicum var. lycopersicum" is a worse answer to "tomato"
+    than the species is. The picture comes from the search itself, so a
+    shortlist of eight costs one HTTP call rather than nine.
+    """
+    out = []
+    for row in payload.get("data") or []:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("rank") or "species") != "species":
+            continue
+        name = str(row.get("scientific_name") or "").strip()
+        slug = str(row.get("slug") or "").strip()
+        if not name or not slug:
+            continue
+        image = str(row.get("image_url") or "")
+        common = str(row.get("common_name") or "").strip()
+        out.append(
+            {
+                "name": name,
+                "common": common or None,
+                # The phone loads this. A plaintext or javascript: URL from
+                # a third party has no business being handed to it.
+                "image": image if image.startswith("https://") else None,
+                "slug": slug,
+            }
+        )
+        if len(out) == CANDIDATES_MAX:
+            break
+    return out
+
+
+def sole_match(candidates: list[dict], query: str) -> str | None:
+    """The one candidate whose common name IS what was typed, or None.
+
+    "basil" has exactly one Basil among its Basil thymes and African basils,
+    so that is not a guess and can be followed. "peace lily" has two, spelt
+    "Peace lily" and "Peace-lily", and picking either would be inventing an
+    answer — two pictures and a question is the honest response there.
+    """
+    wanted = loose(query)
+    hits = {c["name"] for c in candidates if c["common"] and loose(c["common"]) == wanted}
+    return hits.pop() if len(hits) == 1 else None
+
+
 # The band is on OUR percentage — air is 0, tap water is 100, a straight
 # line between two calibration points (decision #6). It is not volumetric
 # water content, so no published figure could be copied into it even if a
@@ -1382,50 +1441,111 @@ def create_app(
             )
         return {"fetched": now, "source": "trefle", "found": bool(slug), **care}
 
-    def look_up(query: str) -> dict:
-        """One species lookup, both hops, and a sentence saying what came of
-        it. Every unhappy path ends in a working screen: the numbers are
-        typed in, which is what happens for most houseplants anyway."""
+    def search_for(query: str, now: int) -> list[dict]:
+        """Trefle's own search on what was typed, cached.
+
+        This is the fuzzy half. GBIF only knows scientific names, so "basil",
+        "basilico" and "tomatoe" resolve to nothing there; Trefle's search
+        matches common names, survives a typo, and its rows already carry a
+        picture — which is what lets somebody confirm by eye rather than by
+        spelling. An empty list is both "nothing found" and "could not ask":
+        the screen is the same either way, a list with nothing in it.
+        """
+        with connect() as con:
+            row = con.execute(
+                "SELECT fetched_ts, candidates FROM species_search WHERE query = ?",
+                (query,),
+            ).fetchone()
+        if row:
+            cached = json.loads(row[1])
+            if cached or now - row[0] < CARE_MISS_TTL_S:
+                return cached
+        if not care_token:
+            return []
+        payload = get_json(
+            f"{TREFLE_BASE}/species/search?"
+            f"{urlencode({'q': query, 'token': care_token})}"
+        )
+        if payload is None:
+            return []
+        candidates = read_candidates(payload)
+        with connect() as con:
+            con.execute(
+                "INSERT OR REPLACE INTO species_search "
+                "(query, fetched_ts, candidates) VALUES (?, ?, ?)",
+                (query, now, json.dumps(candidates)),
+            )
+        return candidates
+
+    def care_note(accepted: str, matched: str, care: dict) -> str:
+        if care["light"] is None and care["humidity"] is None:
+            note = f"Trefle knows {accepted} but has no numbers for it"
+        else:
+            note = f"Trefle: {accepted}"
+        return f"read as {accepted}. {note}" if matched == "fuzzy" else note
+
+    def miss_note(answer: dict) -> str:
+        if answer["candidates"]:
+            return "not sure which one — pick the plant you recognise"
+        if answer["matched"] == "unavailable":
+            return "the lookup is not answering — type the numbers in"
+        if answer["matched"] == "genus":
+            return "that is a genus — which species?"
+        if answer["accepted"] is None:
+            return "no plant of that name — check the spelling, or type the numbers in"
+        if answer["care"] is None:
+            return "no care source configured or answering — type the numbers in"
+        return f"{answer['accepted']} is not in Trefle — type the numbers in"
+
+    def look_up(query: str, depth: int = 0) -> dict:
+        """One species lookup, and a sentence saying what came of it.
+
+        Three ways in, in order of how much they can be trusted. GBIF on the
+        typing resolves a scientific name, corrects a typo in one, and
+        redirects a synonym to the name the plant was renamed to. Failing
+        that, Trefle's search takes the typing as a common name and answers
+        with pictures. And if exactly one of those pictures is called what
+        was typed, that is not a guess and is followed.
+
+        Every unhappy path ends in a working screen: the numbers are typed
+        in, which is what happens for most houseplants anyway.
+        """
         now = int(time.time())
         taxon = taxon_for(query, now)
-        if taxon is None:
-            return {
-                "query": query,
-                "matched": "unavailable",
-                "accepted": None,
-                "rank": None,
-                "care": None,
-                "note": "the name service is not answering — type the numbers in",
-            }
         answer = {
             "query": query,
-            "matched": taxon.matched,
-            "accepted": taxon.accepted,
-            "rank": taxon.rank,
+            "matched": "unavailable",
+            "accepted": None,
+            "rank": None,
             "care": None,
+            "candidates": [],
             "note": "",
         }
-        if taxon.matched == "genus":
-            answer["note"] = "that is a genus — which species?"
-            return answer
-        if taxon.accepted is None:
-            answer["note"] = (
-                "no plant of that name — check the spelling, or type the numbers in"
-            )
-            return answer
-        care = care_for(taxon.accepted, now)
-        if care is None:
-            answer["note"] = "no care source configured or answering — type the numbers in"
-            return answer
-        answer["care"] = care
-        if not care["found"]:
-            answer["note"] = f"{taxon.accepted} is not in Trefle — type the numbers in"
-        elif care["light"] is None and care["humidity"] is None:
-            answer["note"] = f"Trefle knows {taxon.accepted} but has no numbers for it"
-        else:
-            answer["note"] = f"Trefle: {taxon.accepted}"
-        if taxon.matched == "fuzzy":
-            answer["note"] = f"read as {taxon.accepted}. " + answer["note"]
+        if taxon is not None:
+            answer["matched"] = taxon.matched
+            answer["accepted"] = taxon.accepted
+            answer["rank"] = taxon.rank
+            if taxon.accepted:
+                answer["care"] = care_for(taxon.accepted, now)
+                care = answer["care"]
+                if care is not None and care["found"]:
+                    answer["note"] = care_note(taxon.accepted, taxon.matched, care)
+                    return answer
+                # A name GBIF resolved and Trefle has never heard of is a
+                # finished answer, not a reason to go offering other plants:
+                # the shortlist is for a name nobody could place at all.
+                answer["note"] = miss_note(answer)
+                return answer
+        candidates = search_for(query, now)
+        pick = sole_match(candidates, query)
+        if pick and depth == 0 and normalise_species(pick) != query:
+            deeper = look_up(normalise_species(pick), depth + 1)
+            if deeper["accepted"]:
+                deeper["query"] = query
+                deeper["matched"] = "common"
+                return deeper
+        answer["candidates"] = candidates
+        answer["note"] = miss_note(answer)
         return answer
 
     def advice_for(con: sqlite3.Connection, entry: dict, now: int) -> dict | None:
@@ -2760,14 +2880,21 @@ def create_app(
                     entry["advice"] = advice_for(con, entry, int(time.time()))
                     entry["care"] = None
                     if entry["species"]:
-                        name = con.execute(
-                            "SELECT accepted FROM species_names WHERE query = ?",
-                            (normalise_species(entry["species"]),),
-                        ).fetchone()
-                        if name and name[0]:
-                            entry["care"] = cached_care(
-                                con, normalise_species(name[0])
-                            )
+                        # The pot usually stores the accepted binomial — the
+                        # lookup offers it and the form takes it — which is
+                        # a key in species_care but NOT in species_names, so
+                        # asking the alias table first would find nothing.
+                        key = normalise_species(entry["species"])
+                        entry["care"] = cached_care(con, key)
+                        if entry["care"] is None:
+                            name = con.execute(
+                                "SELECT accepted FROM species_names WHERE query = ?",
+                                (key,),
+                            ).fetchone()
+                            if name and name[0]:
+                                entry["care"] = cached_care(
+                                    con, normalise_species(name[0])
+                                )
                     garden.append(entry)
         except sqlite3.OperationalError as why:
             return PlainTextResponse(f"try again: {why}\n", status_code=503)
