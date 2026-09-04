@@ -6,3 +6,6 @@ deploy.env
 .venv/
 __pycache__/
 .pytest_cache/
+
+# A local run stores its photographs beside its database (BUTLER_PHOTOS).
+photos/

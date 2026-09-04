@@ -26,7 +26,8 @@ watering.
   `BUTLER_DB`, `BUTLER_NEXT_S`, `BUTLER_CMD_TTL_S`, `BUTLER_QUIET`,
   `BUTLER_NTFY_TOPIC`, `BUTLER_NTFY_URL`, `BUTLER_DEADMAN_URL`, `BUTLER_SILENT_S`,
   `BUTLER_TREFLE_TOKEN` — unset means every care number is typed in, which is a working path and
-  not an error), `POST /report` (k=v body, `X-Token`
+  not an error, `BUTLER_PHOTOS` — where the photograph bytes live, `photos/` beside the database by
+  default), `POST /report` (k=v body, `X-Token`
   header, refuses whole on malformed channels, ignores unknown keys, stamps arrival time,
   answers `next=` plus at most one `cmd=` line), `POST /command` (queue `water=<outlet>
   ml= [cap_s=]` or `stop=1`, one slot per controller, 409 when busy; a missing cap_s is sized
@@ -63,7 +64,25 @@ watering.
   401 — the one gated route that neither writes nor reads the database, so a phone being set up can
   tell a wrong address from a wrong token, and a butler whose volume came unmounted can still say
   the token was wrong. `VERSION` lives in butler.py because the container installs no package; a
-  test asserts it matches pyproject.toml).
+  test asserts it matches pyproject.toml),
+  `POST /photo` (`?pot=&w=&h=` with the JPEG as the body — the one route whose payload is not k=v;
+  JPEG checked by its first bytes so what is served back can always be labelled image/jpeg and never
+  sniffed, 3 MiB cap, `w`/`h` a layout hint and nothing more, and the pot's `species` of the day
+  stamped on the row), `GET /photos` (`?pot=&limit=`: the strip, newest first, each row with
+  `missing`), `GET /photo/<id>` (the bytes, `nosniff`, immutable cache), `POST /photo/delete`
+  (`photo=<id>`; its own route so an upload that lost its body can never be a deletion).
+  Those four and only those are gated reads — everything else here is numbers about plants, and a
+  photograph is the one thing that could show the inside of a house.
+- **Photographs: the row is the truth.** Bytes under `BUTLER_PHOTOS` (default `photos/` beside the
+  database, so they share the bind mount and are backed up or lost together), one directory per pot.
+  A picture is listed, served and deleted by its row and the directory is never read to decide what
+  exists, so a file no row knows about is invisible and harmless while a row whose file has gone is
+  reported as `missing`. Keeping writes the file then the row (and unlinks the file if the row
+  fails); deleting removes the row then the file. Both orders leave the harmless inconsistency.
+  Neither connection is held across the disk write — a photograph is megabytes over a NAS volume,
+  and a write transaction held that long is the board's reports blocked, the same trap the care
+  lookup hit. Every id that becomes a path goes through `SAFE_ID` first, in `photo_path`, which is
+  the only function that turns an id into a path.
 - The rules ladder runs in-process on each fresh report, stateless, inside the report's own
   transaction: float=1 and pos=ok from that very report, outside BUTLER_QUIET (HH-HH, server
   local time — set TZ in the container), median of the last 5 readings below target_low_pct,
