@@ -125,9 +125,10 @@ watering.
 - Pitches 1-4 (through the alerts) are deployed (2026-09-01; 0.7.0 with `last_dose`, `next_default`,
   `/history` and the optional `cap_s` on 2026-09-02; 0.8.0 with pot identity, `species`,
   `pot_mappings` and the one-time rebuild, 0.9.0 with `/doses`, and 0.11.0 with the create/edit
-  split and a month of `/history`, on 2026-09-03): container `plantbutler` on the NAS, port
-  9380, image `plantbutler-backend:0.11.0` shipped via `docker save | ssh docker load` over the tailnet, database on `/volume1/docker/plantbutler/data`, secrets in `deploy.env` beside it
-  (600, not in git: the token, the ntfy topic, the healthchecks.io ping URL),
+  split and a month of `/history`, on 2026-09-03; 0.12.0 with the species lookup and the target-band
+  offer on 2026-09-04, verified live against GBIF and Trefle from the NAS): container `plantbutler`
+  on the NAS, port 9380, image `plantbutler-backend:0.12.0` shipped via `docker save | ssh docker load` over the tailnet, database on `/volume1/docker/plantbutler/data`, secrets in `deploy.env` beside it
+  (600, not in git: the token, the ntfy topic, the healthchecks.io ping URL, the Trefle token),
   `-e TZ=Europe/Zurich` so BUTLER_QUIET means local night. The rules run dark until the
   firmware sends `float=`/`pos=`; the alerts are live — the dead-man feeds healthchecks
   (which notifies by email, not ntfy) and the phone subscribes to the topic in the ntfy app.
