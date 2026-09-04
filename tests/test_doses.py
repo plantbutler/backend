@@ -24,7 +24,7 @@ def client(db):
     )
 
 
-def pot(db, pot_id, name, controller="b1", outlet=0, from_ts=0, to_ts=None):
+def pot(db, pot_id, name, controller=0, outlet=0, from_ts=0, to_ts=None):
     """A pot and one mapping window, stated outright. The windows no longer
     decide whose dose it was — the stamp on the row does — but they still
     say which sensor a pot was on, and enqueue reads the open one to choose
@@ -41,7 +41,7 @@ def pot(db, pot_id, name, controller="b1", outlet=0, from_ts=0, to_ts=None):
 
 
 def dose(db, cmd_id, sent_ts, state="acked", ml=100, flow_ml=None, outlet=0,
-         controller="b1", acked_ts=None, created_ts=None, kind="water",
+         controller=0, acked_ts=None, created_ts=None, kind="water",
          source="manual", pot_id="pot-1"):
     """`pot_id` is the stamp the row carries — whom the dose was made for,
     written when the command was. None is a real value: a hose no pot was
@@ -119,12 +119,12 @@ def test_a_remap_takes_the_pots_history_with_it(client, db):
     hangs on that hose now. Driven through POST /pot so the remap and the
     stamps are the real ones, not hand-written windows: with the pot on the
     row, a fixture that wrote its own windows would prove nothing."""
-    basil = post_pot(client, "name=basil controller=b1 channel=0 outlet=0")
-    water(client, basil, "b1", 0)  # 1: basil, on outlet 0
+    basil = post_pot(client, "name=basil controller=0 channel=0 outlet=0")
+    water(client, basil, 0, 0)  # 1: basil, on outlet 0
     post_pot(client, f"id={basil} outlet=3")  # basil moves hose
-    water(client, basil, "b1", 3)  # 2: basil, moved
-    mint = post_pot(client, "name=mint controller=b1 channel=1 outlet=0")
-    water(client, mint, "b1", 0)  # 3: mint, on outlet 0 now
+    water(client, basil, 0, 3)  # 2: basil, moved
+    mint = post_pot(client, "name=mint controller=0 channel=1 outlet=0")
+    water(client, mint, 0, 0)  # 3: mint, on outlet 0 now
     assert [r["id"] for r in get(client, pot=basil)] == [2, 1]
     assert [r["id"] for r in get(client, pot=mint)] == [3]
 

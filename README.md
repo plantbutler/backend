@@ -23,7 +23,7 @@ Talk to it the way the board does:
 ```bash
 curl -s -X POST http://localhost:8000/report \
   -H 'X-Token: dev' \
-  --data-binary 'c=butler1 ch0=8123 ch1=7902'
+  --data-binary 'c=0 ch0=8123 ch1=7902'
 # -> next=60
 curl -s http://localhost:8000/health
 ```
@@ -67,11 +67,11 @@ Queue a command for the board's next report, or change its report interval:
 
 ```bash
 curl -s -X POST http://localhost:8000/command \
-  -H 'X-Token: dev' --data-binary 'c=butler1 water=3 ml=50 cap_s=30'
+  -H 'X-Token: dev' --data-binary 'c=0 water=3 ml=50 cap_s=30'
 # -> cmd=1        (409 busy: ... while the slot is taken; stop=1 instead of a dose;
 #                  leave cap_s out and the rules' own formula sizes it)
 curl -s -X POST http://localhost:8000/interval \
-  -H 'X-Token: dev' --data-binary 'c=butler1 next=120'
+  -H 'X-Token: dev' --data-binary 'c=0 next=120'
 ```
 
 Tell it what hangs where. A bare `name=` creates a pot and mints its id; the answer carries
@@ -83,7 +83,7 @@ a hose is an edit; recalibrating is two numbers):
 ```bash
 curl -s -X POST http://localhost:8000/pot \
   -H 'X-Token: dev' \
-  --data-binary 'name=basil controller=butler1 channel=0 outlet=3 plant_type=herb pot_diameter_cm=14'
+  --data-binary 'name=basil controller=0 channel=0 outlet=3 plant_type=herb pot_diameter_cm=14'
 # -> pot=pot-3f9a21 name=basil
 curl -s -X POST http://localhost:8000/pot \
   -H 'X-Token: dev' --data-binary 'id=pot-3f9a21 dry_raw=12000 wet_raw=4000'

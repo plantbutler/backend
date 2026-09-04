@@ -81,7 +81,7 @@ def post(client, path, body):
 
 
 def report(client, raw=DRY, safe=True, extra=""):
-    body = f"c=b1 ch0={raw}"
+    body = f"c=0 ch0={raw}"
     if safe:
         body += " float=1 pos=ok"
     if extra:
@@ -94,7 +94,7 @@ def report(client, raw=DRY, safe=True, extra=""):
 def make_pot(client, **over):
     fields = {
         "name": "basil",
-        "controller": "b1",
+        "controller": 0,
         "channel": 0,
         "outlet": 3,
         "dry_raw": 12000,
@@ -184,7 +184,7 @@ def plant_dose(
         con.execute(
             "INSERT INTO commands (created_ts, controller, kind, outlet, ml, "
             "cap_s, state, source, sent_ts, acked_ts, flow_ml, pot_id) "
-            "VALUES (?, 'b1', 'water', ?, ?, 10, ?, 'rules', ?, ?, ?, ?)",
+            "VALUES (?, 0, 'water', ?, ?, 10, ?, 'rules', ?, ?, ?, ?)",
             (sent_ts - 5, outlet, ml, state, sent_ts, acked_ts, flow_ml,
              owner and owner[0]),
         )
@@ -195,14 +195,14 @@ def plant_dose(
         for i in range(5):  # the window the dose was decided on
             con.execute(
                 "INSERT INTO readings (ts, controller, channel, raw, pot_id) "
-                "VALUES (?, 'b1', ?, ?, ?)",
+                "VALUES (?, 0, ?, ?, ?)",
                 (sent_ts - 4 + i, channel, before_raw, stamp and stamp[0]),
             )
         if after_raw is not None and acked_ts is not None:
             for i in range(5):  # what the sensor said once the water soaked
                 con.execute(
                     "INSERT INTO readings (ts, controller, channel, raw, pot_id) "
-                    "VALUES (?, 'b1', ?, ?, ?)",
+                    "VALUES (?, 0, ?, ?, ?)",
                     (acked_ts + 60 * (i + 1), channel, after_raw, stamp and stamp[0]),
                 )
 
@@ -222,12 +222,12 @@ def test_a_silent_controller_raises_once_after_the_threshold(app, client, db, se
 
     age_controller(db, 2)  # 601 s of silence: over max(600, 3 * 60)
     assert tick(app, now) is True
-    assert keys(sent) == ["silent:b1"]
+    assert keys(sent) == ["silent:0"]
     assert sent[0].priority == "high"
-    assert "b1" in sent[0].message
+    assert "0" in sent[0].message
 
     tick(app, now)
-    assert keys(sent) == ["silent:b1"]  # raised once, not once per tick
+    assert keys(sent) == ["silent:0"]  # raised once, not once per tick
 
 
 def test_a_returning_controller_clears_once_and_reflaps_are_floored(
@@ -241,7 +241,7 @@ def test_a_returning_controller_clears_once_and_reflaps_are_floored(
 
     report(client)  # it is back
     tick(app, now)
-    assert [a.key for a in sent] == ["silent:b1", "silent:b1"]
+    assert [a.key for a in sent] == ["silent:0", "silent:0"]
     assert sent[1].priority == "default"
     assert "reporting again" in sent[1].message
 
@@ -251,7 +251,7 @@ def test_a_returning_controller_clears_once_and_reflaps_are_floored(
 
     with sqlite3.connect(db) as con:  # the hour passes
         con.execute(
-            "UPDATE alerts SET cleared_ts = cleared_ts - ? WHERE key = 'silent:b1'",
+            "UPDATE alerts SET cleared_ts = cleared_ts - ? WHERE key = 'silent:0'",
             (REALERT_FLOOR_S,),
         )
     tick(app, now)
@@ -260,7 +260,7 @@ def test_a_returning_controller_clears_once_and_reflaps_are_floored(
 
 def test_the_silent_threshold_scales_with_a_slow_report_interval(app, client, db, sent):
     report(client)
-    post(client, "/interval", "c=b1 next=300")  # threshold becomes 3 * 300
+    post(client, "/interval", "c=0 next=300")  # threshold becomes 3 * 300
     see_everything(app)
     now = int(time.time())
     age_controller(db, 700)  # over 600, under 900
@@ -269,7 +269,7 @@ def test_the_silent_threshold_scales_with_a_slow_report_interval(app, client, db
 
     age_controller(db, 300)
     tick(app, now)
-    assert keys(sent) == ["silent:b1"]
+    assert keys(sent) == ["silent:0"]
 
 
 def test_the_butlers_own_downtime_is_not_the_boards_silence(app, client, db, sent):
@@ -295,12 +295,12 @@ def test_butler_downtime_does_not_fake_a_reporting_again_clear(app, client, db, 
     now = int(time.time())
     age_controller(db, 700)
     tick(app, now)
-    assert keys(sent) == ["silent:b1"]
+    assert keys(sent) == ["silent:0"]
 
     app.state.observed["since"] = now  # the butler just woke; board still dead
     tick(app, now)
     assert len(sent) == 1  # no false "reporting again"
-    assert run_sql(db, "SELECT cleared_ts FROM alerts WHERE key = 'silent:b1'") == [
+    assert run_sql(db, "SELECT cleared_ts FROM alerts WHERE key = 'silent:0'") == [
         (None,)
     ]
 
@@ -338,12 +338,12 @@ def test_one_reservoir_blip_is_slosh_two_are_empty(app, client, db, sent):
     report(client, safe=False, extra="float=1 pos=ok")  # flapping...
     report(client, safe=False, extra="float=0 pos=ok")  # ...still means empty
     tick(app, int(time.time()))
-    assert keys(sent) == ["float:b1"]
+    assert keys(sent) == ["float:0"]
     assert sent[0].priority == "high"
     assert "reservoir" in sent[0].message
 
     tick(app, int(time.time()))
-    assert keys(sent) == ["float:b1"]  # once
+    assert keys(sent) == ["float:0"]  # once
 
 
 def test_a_full_reservoir_clears_after_a_quiet_window_and_reflaps_floor(
@@ -353,7 +353,7 @@ def test_a_full_reservoir_clears_after_a_quiet_window_and_reflaps_floor(
     report(client, safe=False, extra="float=0 pos=ok")
     now = int(time.time())
     tick(app, now)
-    assert keys(sent) == ["float:b1"]
+    assert keys(sent) == ["float:0"]
 
     report(client)  # full again, but the bad sightings are still recent
     tick(app, now)
@@ -361,7 +361,7 @@ def test_a_full_reservoir_clears_after_a_quiet_window_and_reflaps_floor(
 
     age_status(db, FLAP_WINDOW_S + 1)  # a quiet window passes
     tick(app, int(time.time()))
-    assert [a.key for a in sent] == ["float:b1", "float:b1"]
+    assert [a.key for a in sent] == ["float:0", "float:0"]
     assert "full again" in sent[1].message
 
     report(client, safe=False, extra="float=0 pos=ok")  # flaps right back
@@ -371,7 +371,7 @@ def test_a_full_reservoir_clears_after_a_quiet_window_and_reflaps_floor(
 
     with sqlite3.connect(db) as con:
         con.execute(
-            "UPDATE alerts SET cleared_ts = cleared_ts - ? WHERE key = 'float:b1'",
+            "UPDATE alerts SET cleared_ts = cleared_ts - ? WHERE key = 'float:0'",
             (REALERT_FLOOR_S,),
         )
     tick(app, int(time.time()))
@@ -382,13 +382,13 @@ def test_a_lost_manifold_position_raises_and_clears(app, client, db, sent):
     report(client, safe=False, extra="float=1 pos=unknown")
     report(client, safe=False, extra="float=1 pos=unknown")
     tick(app, int(time.time()))
-    assert keys(sent) == ["pos:b1"]
+    assert keys(sent) == ["pos:0"]
     assert "manifold" in sent[0].message
 
     report(client)
     age_status(db, FLAP_WINDOW_S + 1)
     tick(app, int(time.time()))
-    assert [a.key for a in sent] == ["pos:b1", "pos:b1"]
+    assert [a.key for a in sent] == ["pos:0", "pos:0"]
     assert sent[1].priority == "default"
 
 
@@ -409,14 +409,14 @@ def test_a_vanished_safety_field_is_its_own_alarm(app, client, db, sent):
 
     age_status(db, PERSIST_S + 1)
     tick(app, int(time.time()))
-    assert sorted(keys(sent)) == ["fields:float:b1", "fields:pos:b1"]
+    assert sorted(keys(sent)) == ["fields:float:0", "fields:pos:0"]
     assert all(a.priority == "high" for a in sent)
 
     report(client)  # the fields are back
     age_status(db, PERSIST_S + 1)
     tick(app, int(time.time()))
     assert len(sent) == 4
-    assert {a.key for a in sent[2:]} == {"fields:float:b1", "fields:pos:b1"}
+    assert {a.key for a in sent[2:]} == {"fields:float:0", "fields:pos:0"}
     assert "again" in sent[-1].message
 
 
@@ -448,13 +448,13 @@ def test_a_dead_sensor_channel_pages_while_the_controller_reports(
     with sqlite3.connect(db) as con:  # the wire comes loose; the board go on
         con.execute("UPDATE readings SET ts = ts - 700")
     tick(app, int(time.time()))
-    assert keys(sent) == ["sensor:b1:0"]
+    assert keys(sent) == ["sensor:0:0"]
     assert sent[0].priority == "high"
     assert "basil" in sent[0].message
 
     report(client)  # the wire is back
     tick(app, int(time.time()))
-    assert keys(sent) == ["sensor:b1:0", "sensor:b1:0"]
+    assert keys(sent) == ["sensor:0:0", "sensor:0:0"]
     assert "back" in sent[1].message
 
 
@@ -466,7 +466,7 @@ def test_a_silent_controller_does_not_double_page_its_sensors(app, client, db, s
     with sqlite3.connect(db) as con:
         con.execute("UPDATE readings SET ts = ts - 700")
     tick(app, int(time.time()))
-    assert keys(sent) == ["silent:b1"]  # one page, not one per sensor
+    assert keys(sent) == ["silent:0"]  # one page, not one per sensor
 
 
 # --------------------------------------------------------------------------- #
@@ -502,7 +502,7 @@ def test_a_dose_is_judged_for_the_pot_that_got_it(app, client, db, sent):
     basil = make_pot(client)  # channel 0, outlet 3
     plant_dose(db, flow_ml=95, after_raw=DRY + 100)  # basil did not drink it
     post(client, "/pot", f"id={basil} channel=1 outlet=4")
-    post(client, "/pot", "name=mint controller=b1 channel=0 outlet=3")
+    post(client, "/pot", "name=mint controller=0 channel=0 outlet=3")
 
     tick(app, int(time.time()))
 
@@ -542,7 +542,7 @@ def test_the_soak_scales_with_a_slow_report_interval(db, sent, pinged):
     client = TestClient(app)
     make_pot(client, mode="manual")
     report(client)
-    post(client, "/interval", "c=b1 next=1800")  # the soak becomes 3 * 1800
+    post(client, "/interval", "c=0 next=1800")  # the soak becomes 3 * 1800
     plant_dose(db, flow_ml=95, sent_ago=2010, acked_ago=2000)  # past SOAK_S
     tick(app, int(time.time()))
     assert dose_rows(db) == []  # a slow reporter's window is still open
@@ -611,7 +611,7 @@ def test_a_waiting_proposal_nudges_once_a_day_keyed_on_the_hose(app, client, db,
 
     now = int(time.time())
     tick(app, now)
-    assert [a.key for a in sent] == ["proposal:b1:3"]
+    assert [a.key for a in sent] == ["proposal:0:3"]
     assert "basil" in sent[0].message and "100 ml" in sent[0].message
     tick(app, now)
     assert len(sent) == 1  # one nudge, not one per tick
@@ -666,7 +666,7 @@ def test_a_channel_correction_does_not_mute_the_proposal_nudge(app, client, db, 
     post(client, "/pot", f"id={basil} channel=1")
 
     tick(app, int(time.time()))
-    assert [a.key for a in sent] == ["proposal:b1:3"]
+    assert [a.key for a in sent] == ["proposal:0:3"]
     assert "basil" in sent[0].message and "proposal 1" in sent[0].message
 
 
@@ -683,7 +683,7 @@ def test_the_nudge_is_not_inherited_by_the_next_pot_on_the_hose(app, client, db,
     rewind(db, 3600)  # an hour later, the hoses are swapped
 
     post(client, "/pot", f"id={basil} channel=1 outlet=4")
-    post(client, "/pot", "name=mint controller=b1 channel=0 outlet=3")
+    post(client, "/pot", "name=mint controller=0 channel=0 outlet=3")
 
     tick(app, int(time.time()))
     assert [a.key for a in sent if a.key.startswith("proposal:")] == []
@@ -720,7 +720,7 @@ def test_a_pass_that_sent_something_needs_no_extra_proof(db, sent, pinged):
     age_controller(db, 700)
 
     assert tick(app, int(time.time())) is True  # the send itself was proof
-    assert keys(sent) == ["silent:b1"]
+    assert keys(sent) == ["silent:0"]
     assert pinged == [True]
 
 
@@ -746,7 +746,7 @@ def test_a_failed_send_leaves_no_row_no_ping_and_is_retried(db, sent, pinged):
     assert pinged == []  # an unreachable ntfy must trip the dead man
 
     assert tick(app, now) is True
-    assert [a.key for a in sent] == ["silent:b1"]
+    assert [a.key for a in sent] == ["silent:0"]
     assert pinged == [True]
 
 
@@ -754,8 +754,8 @@ def test_the_first_failed_send_stops_the_loop(db):
     tried = []
     app = build_app(db, [], [], send=lambda alert: tried.append(alert.key) and False)
     client = TestClient(app)
-    post(client, "/report", f"c=b1 ch0={DRY}")
-    post(client, "/report", f"c=b2 ch0={DRY}")
+    post(client, "/report", f"c=0 ch0={DRY}")
+    post(client, "/report", f"c=1 ch0={DRY}")
     see_everything(app)
     age_controller(db, 700)
 
@@ -824,9 +824,9 @@ def test_health_shows_safety_fields_and_raised_conditions(app, client, db, sent)
     tick(app, int(time.time()))
 
     health = client.get("/health").json()
-    (b1,) = health["controllers"]
-    assert b1["float"] == 0 and b1["pos"] == "unknown"
-    assert sorted(a["key"] for a in health["alerts"]) == ["float:b1", "pos:b1"]
+    (board,) = health["controllers"]
+    assert board["float"] == 0 and board["pos"] == "unknown"
+    assert sorted(a["key"] for a in health["alerts"]) == ["float:0", "pos:0"]
 
     report(client)  # full and homed again
     age_status(db, FLAP_WINDOW_S + 1)
@@ -874,13 +874,13 @@ def wire():
 
 def test_post_ntfy_speaks_the_ntfy_wire_format(wire):
     url, recorder = wire
-    alert = Alert("k", "high", "warning", "the reservoir on b1 is empty")
+    alert = Alert("k", "high", "warning", "the reservoir on 0 is empty")
     assert post_ntfy(url, "garden-abc", alert) is True
     ((path, headers, body, method),) = recorder.requests
     assert (path, method, body) == (
         "/garden-abc",
         "POST",
-        "the reservoir on b1 is empty",
+        "the reservoir on 0 is empty",
     )
     assert headers["Title"] == "Plant Butler"
     assert headers["Priority"] == "high"

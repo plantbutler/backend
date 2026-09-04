@@ -55,7 +55,7 @@ def count(db, table, where="1", args=()):
         return con.execute(f"SELECT COUNT(*) FROM {table} WHERE {where}", args).fetchone()[0]
 
 
-def water(client, controller="b1", outlet=0, ml=100):
+def water(client, controller=0, outlet=0, ml=100):
     """A manual dose all the way through: queued, handed out, acknowledged."""
     answer = post(client, "/command", f"c={controller} water={outlet} ml={ml}")
     assert answer.status_code == 200, answer.text
@@ -69,10 +69,10 @@ def furnished(client, db, name="basil"):
     """One pot with everything a pot can accumulate hanging off it."""
     pot_id = pot(
         client,
-        f"name={name} controller=b1 channel=0 outlet=0 plant_type=herb "
+        f"name={name} controller=0 channel=0 outlet=0 plant_type=herb "
         f"dry_raw={DRY} wet_raw={WET}",
     )
-    post(client, "/report", "c=b1 ch0=8000")
+    post(client, "/report", "c=0 ch0=8000")
     cmd_id = water(client)
     post(client, "/verdict", f"cmd={cmd_id} verdict=ok")
     post(client, "/advice", f"pot={pot_id} kind=target dismiss=1")
@@ -110,11 +110,11 @@ def test_burying_a_pot_expires_the_proposal_it_was_waiting_on(client, db):
     offer to water a pot that is no longer on that hose."""
     basil = pot(
         client,
-        f"name=basil controller=b1 channel=0 outlet=0 plant_type=herb "
+        f"name=basil controller=0 channel=0 outlet=0 plant_type=herb "
         f"dry_raw={DRY} wet_raw={WET} target_low_pct=40 dose_ml=100 mode=learning",
     )
     for _ in range(6):
-        post(client, "/report", f"c=b1 float=1 pos=ok ch0={DRY}")
+        post(client, "/report", f"c=0 float=1 pos=ok ch0={DRY}")
     with sqlite3.connect(db) as con:
         assert con.execute(
             "SELECT COUNT(*) FROM commands WHERE state = 'proposed'"
@@ -131,21 +131,21 @@ def test_burying_a_pot_clears_the_sensor_alarm_nobody_could_clear(client, db):
     """Both the raise and the clear live inside a loop over the live pots,
     so a pot that leaves the loop while its alarm stands leaves a row
     nothing can ever clear: it sits in /health for good."""
-    basil = pot(client, "name=basil controller=b1 channel=0")
+    basil = pot(client, "name=basil controller=0 channel=0")
     with sqlite3.connect(db) as con:
         con.execute(
-            "INSERT INTO alerts (key, raised_ts) VALUES ('sensor:b1:0', ?)",
+            "INSERT INTO alerts (key, raised_ts) VALUES ('sensor:0:0', ?)",
             (int(time.time()),),
         )
     post(client, "/pot", f"id={basil} status=graveyard")
-    assert count(db, "alerts", "key = 'sensor:b1:0'") == 0
+    assert count(db, "alerts", "key = 'sensor:0:0'") == 0
 
 
 def test_another_pot_on_that_hose_keeps_its_own_alarm(client, db):
     """The alarm is not this pot's to clear while somebody alive still
     holds the pair. Same controller AND same outlet, or the key would not
     even be the same string and the test would prove nothing."""
-    basil = pot(client, "name=basil controller=b1 channel=0 outlet=0")
+    basil = pot(client, "name=basil controller=0 channel=0 outlet=0")
     with sqlite3.connect(db) as con:
         # A second live pot on the same hose is a config error the mapping
         # write refuses, so it is written by hand: the point is only that
@@ -153,16 +153,16 @@ def test_another_pot_on_that_hose_keeps_its_own_alarm(client, db):
         con.execute("INSERT INTO pots (id, name) VALUES ('pot-other', 'mint')")
         con.execute(
             "INSERT INTO pot_mappings (pot_id, controller, channel, outlet, from_ts) "
-            "VALUES ('pot-other', 'b1', 0, 0, 0)"
+            "VALUES ('pot-other', 0, 0, 0, 0)"
         )
-        for key in ("sensor:b1:0", "proposal:b1:0"):
+        for key in ("sensor:0:0", "proposal:0:0"):
             con.execute(
                 "INSERT INTO alerts (key, raised_ts) VALUES (?, ?)",
                 (key, int(time.time())),
             )
     post(client, "/pot", f"id={basil} status=graveyard")
-    assert count(db, "alerts", "key = 'sensor:b1:0'") == 1
-    assert count(db, "alerts", "key = 'proposal:b1:0'") == 1
+    assert count(db, "alerts", "key = 'sensor:0:0'") == 1
+    assert count(db, "alerts", "key = 'proposal:0:0'") == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -194,42 +194,42 @@ def test_a_delete_frees_the_alerts_the_pot_leaves_behind(client, db):
     one does not cover: both keys, and both branches of the helper."""
     basil, _ = furnished(client, db)
     with sqlite3.connect(db) as con:
-        for key in ("sensor:b1:0", "proposal:b1:0", "silent:b1"):
+        for key in ("sensor:0:0", "proposal:0:0", "silent:0"):
             con.execute(
                 "INSERT INTO alerts (key, raised_ts) VALUES (?, ?)",
                 (key, int(time.time())),
             )
     post(client, "/pot/delete", f"id={basil}")
 
-    assert count(db, "alerts", "key = 'sensor:b1:0'") == 0
-    assert count(db, "alerts", "key = 'proposal:b1:0'") == 0
+    assert count(db, "alerts", "key = 'sensor:0:0'") == 0
+    assert count(db, "alerts", "key = 'proposal:0:0'") == 0
     # The board's own conditions are not this pot's to clear.
-    assert count(db, "alerts", "key = 'silent:b1'") == 1
+    assert count(db, "alerts", "key = 'silent:0'") == 1
 
 
 def test_a_remap_frees_the_socket_it_left(client, db):
     """A pot moved to another channel leaves the old channel's alarm with
     nobody to clear it: both the raise and the clear read the pot's CURRENT
     wiring, so the row would stand in /health for ever."""
-    basil = pot(client, "name=basil controller=b1 channel=0 outlet=0")
+    basil = pot(client, "name=basil controller=0 channel=0 outlet=0")
     with sqlite3.connect(db) as con:
         con.execute(
-            "INSERT INTO alerts (key, raised_ts) VALUES ('sensor:b1:0', ?)",
+            "INSERT INTO alerts (key, raised_ts) VALUES ('sensor:0:0', ?)",
             (int(time.time()),),
         )
     post(client, "/pot", f"id={basil} channel=1")
-    assert count(db, "alerts", "key = 'sensor:b1:0'") == 0
+    assert count(db, "alerts", "key = 'sensor:0:0'") == 0
 
 
 def test_burying_a_pot_takes_a_queued_dose_with_it(client, db):
     """Burial hands the outlet back to the garden, so a dose still waiting
     for the board would pour into whatever is wired there next."""
-    basil = pot(client, "name=basil controller=b1 channel=0 outlet=0")
-    answer = post(client, "/command", "c=b1 water=0 ml=100")
+    basil = pot(client, "name=basil controller=0 channel=0 outlet=0")
+    answer = post(client, "/command", "c=0 water=0 ml=100")
     assert answer.status_code == 200, answer.text
     post(client, "/pot", f"id={basil} status=graveyard")
 
-    report = post(client, "/report", "c=b1 ch0=8000")
+    report = post(client, "/report", "c=0 ch0=8000")
     assert "cmd=" not in report.text, report.text
 
 
@@ -237,9 +237,9 @@ def test_a_pot_the_board_is_holding_a_dose_for_cannot_be_erased(client, db):
     """The row would go while the water is still running: the board acks an
     id that no longer exists, and the freed slot lets the next command out
     on top of the one already pouring."""
-    basil = pot(client, "name=basil controller=b1 channel=0 outlet=0")
-    post(client, "/command", "c=b1 water=0 ml=100")
-    assert "cmd=" in post(client, "/report", "c=b1 ch0=8000").text
+    basil = pot(client, "name=basil controller=0 channel=0 outlet=0")
+    post(client, "/command", "c=0 water=0 ml=100")
+    assert "cmd=" in post(client, "/report", "c=0 ch0=8000").text
 
     answer = post(client, "/pot/delete", f"id={basil}")
     assert answer.status_code == 400
@@ -250,23 +250,23 @@ def test_a_pot_the_board_is_holding_a_dose_for_cannot_be_erased(client, db):
 def test_wiring_a_pot_that_is_already_buried_is_refused(client, db):
     """The contradiction spread over two requests. One body saying both is
     already refused; this is the same thing said twice."""
-    basil = pot(client, "name=basil controller=b1 channel=0 outlet=0")
+    basil = pot(client, "name=basil controller=0 channel=0 outlet=0")
     post(client, "/pot", f"id={basil} status=graveyard")
 
-    answer = post(client, "/pot", f"id={basil} controller=b1 channel=0 outlet=0")
+    answer = post(client, "/pot", f"id={basil} controller=0 channel=0 outlet=0")
     assert answer.status_code == 400
     assert "bring it back first" in answer.text
     # Restoring and wiring in one body is NOT a contradiction: it is how a
     # plant comes back.
     assert post(
-        client, "/pot", f"id={basil} status=alive controller=b1 channel=0 outlet=0"
+        client, "/pot", f"id={basil} status=alive controller=0 channel=0 outlet=0"
     ).status_code == 200
 
 
 def test_a_delete_leaves_another_pots_things_alone(client, db):
     basil, _ = furnished(client, db, name="basil")
-    mint = pot(client, "name=mint controller=b1 channel=1 outlet=1")
-    post(client, "/report", "c=b1 ch1=7000")
+    mint = pot(client, "name=mint controller=0 channel=1 outlet=1")
+    post(client, "/report", "c=0 ch1=7000")
 
     post(client, "/pot/delete", f"id={basil}")
     assert count(db, "readings", "pot_id = ?", (mint,)) >= 1
@@ -290,7 +290,7 @@ def test_a_deleted_command_id_is_never_handed_out_again(client, db):
     basil, cmd_id = furnished(client, db)
     post(client, "/pot/delete", f"id={basil}")
 
-    pot(client, "name=mint controller=b1 channel=0 outlet=0")
+    pot(client, "name=mint controller=0 channel=0 outlet=0")
     assert water(client) > cmd_id
 
 
@@ -313,25 +313,25 @@ def test_the_delete_still_clears_the_ledger_it_could_leave_behind(client, db):
 def test_a_deleted_pots_readings_are_not_inherited_by_the_next_plant(client, db):
     """The reason the whole rework exists: a new plant in a dead one's
     socket must open its chart on its own soil, not on the dead one's."""
-    basil = pot(client, f"name=basil controller=b1 channel=0 dry_raw={DRY} wet_raw={WET}")
-    post(client, "/report", "c=b1 t=1 ch0=8000")
+    basil = pot(client, f"name=basil controller=0 channel=0 dry_raw={DRY} wet_raw={WET}")
+    post(client, "/report", "c=0 t=1 ch0=8000")
     post(client, "/pot/delete", f"id={basil}")
 
-    mint = pot(client, f"name=mint controller=b1 channel=0 dry_raw={DRY} wet_raw={WET}")
+    mint = pot(client, f"name=mint controller=0 channel=0 dry_raw={DRY} wet_raw={WET}")
     assert client.get(f"/history?pot={mint}").json()["points"] == []
-    post(client, "/report", "c=b1 t=2 ch0=7000")
+    post(client, "/report", "c=0 t=2 ch0=7000")
     assert [p["raw"] for p in client.get(f"/history?pot={mint}").json()["points"]] == [
         7000
     ]
 
 
 def test_the_same_is_true_of_a_pot_that_was_only_buried(client, db):
-    basil = pot(client, f"name=basil controller=b1 channel=0 dry_raw={DRY} wet_raw={WET}")
-    post(client, "/report", "c=b1 t=1 ch0=8000")
+    basil = pot(client, f"name=basil controller=0 channel=0 dry_raw={DRY} wet_raw={WET}")
+    post(client, "/report", "c=0 t=1 ch0=8000")
     post(client, "/pot", f"id={basil} status=graveyard")
 
-    mint = pot(client, f"name=mint controller=b1 channel=0 dry_raw={DRY} wet_raw={WET}")
-    post(client, "/report", "c=b1 t=2 ch0=7000")
+    mint = pot(client, f"name=mint controller=0 channel=0 dry_raw={DRY} wet_raw={WET}")
+    post(client, "/report", "c=0 t=2 ch0=7000")
     assert [p["raw"] for p in client.get(f"/history?pot={mint}").json()["points"]] == [
         7000
     ]

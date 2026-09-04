@@ -12,7 +12,7 @@
 
 CREATE TABLE IF NOT EXISTS readings (
   ts         INTEGER NOT NULL,  -- server arrival time, unix seconds
-  controller TEXT    NOT NULL,  -- c= in the report
+  controller INTEGER NOT NULL,  -- c= in the report, the board's own number
   channel    INTEGER NOT NULL,  -- chN key
   raw        INTEGER NOT NULL,  -- the count, uninterpreted
   t          INTEGER,           -- board uptime ms (t=), NULL when not sent.
@@ -58,7 +58,7 @@ CREATE INDEX IF NOT EXISTS readings_by_pot
 CREATE TABLE IF NOT EXISTS commands (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   created_ts INTEGER NOT NULL,
-  controller TEXT    NOT NULL,
+  controller INTEGER NOT NULL,
   kind       TEXT    NOT NULL,  -- 'water' | 'stop'
   outlet     INTEGER,           -- water only: flat outlet index
   ml         INTEGER,           -- water only: dose
@@ -85,7 +85,7 @@ CREATE INDEX IF NOT EXISTS commands_by_pot
 -- (next_s, NULL means the BUTLER_NEXT_S default).
 
 CREATE TABLE IF NOT EXISTS controllers (
-  controller TEXT PRIMARY KEY,
+  controller INTEGER PRIMARY KEY,
   last_seen  INTEGER NOT NULL,  -- 0 = configured but never heard from
   next_s     INTEGER
 );
@@ -128,7 +128,7 @@ CREATE TABLE IF NOT EXISTS pots (
 
 CREATE TABLE IF NOT EXISTS pot_mappings (
   pot_id     TEXT    NOT NULL,
-  controller TEXT,     -- where its sensor reports from
+  controller INTEGER,  -- which board its sensor reports from
   channel    INTEGER,  -- chN in that controller's reports
   outlet     INTEGER,  -- flat outlet index its hose hangs on
   from_ts    INTEGER NOT NULL,
@@ -185,7 +185,7 @@ CREATE INDEX IF NOT EXISTS commands_by_outlet
 -- ntfy keeps no archive and neither does this (a no-go in the pitch).
 
 CREATE TABLE IF NOT EXISTS status (
-  controller     TEXT PRIMARY KEY,
+  controller     INTEGER PRIMARY KEY,
   ts             INTEGER NOT NULL,  -- when the latest report landed
   float_ok       INTEGER,           -- float= in that report, NULL if not sent
   float_since    INTEGER,           -- when float_ok last changed value

@@ -125,6 +125,16 @@ watering.
 - The command slot: queued → handed exactly once in a report response (sent) → acked by the
   next report's `ack=<id> flow_ml=`; a no-ack report or the TTL expires it. Expired is gone —
   ask again. The commands table is never pruned: it doubles as the watering history.
+- The controller is an INTEGER on the wire and in every column, 0..255 (`MAX_CONTROLLER`), since
+  0.17.0. It was free text, which made `c=` the one field a typo could turn into a second garden:
+  a report from `bench1 ` opened its own controller row, heartbeat and alerts and nothing said the
+  two were the same board. **Board 0 is a real board** and is what the app fills in by default, so
+  every check is `is None` and never falsiness — `if not controller` refuses the commonest board
+  there is. The firmware's `PB_CONTROLLER` is an integer too, asserted into range at compile time.
+- Each pot in `GET /pots` carries `photo`: the id of its newest picture, for the thumbnail beside
+  the name in the list. The id only — the bytes come from `GET /photo/<id>`, which the app caches —
+  and the disk is deliberately NOT checked, unlike the strip, because /pots is fetched on every
+  screen open and one stat() per pot on a NAS mount is a cost the list should not carry.
 - Attribution is stamped, and the stamp is re-read when the board is HANDED the command, not when
   the command was written. A manual dose queued before its pot was registered carries no stamp at
   create time, and a hose rearranged while a command waits changes who gets the water — and a dose
@@ -220,7 +230,7 @@ watering numbers.)
 Wire, board → backend once a minute (POST, token, plain text `k=v`):
 
 ```
-c=butler1  t=<uptime_ms>  float=1  pos=ok|unknown  last=ok|fault:...
+c=0  t=<uptime_ms>  float=1  pos=ok|unknown  last=ok|fault:...
 ch0=8123 ... ch14=...
 ack=<cmd id>  flow_ml=<counted>      # only on the report after executing a command
 ```

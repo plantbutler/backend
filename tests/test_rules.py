@@ -31,7 +31,7 @@ def client(db):
 def make_pot(client, drop=None, **over):
     fields = {
         "name": "basil",
-        "controller": "b1",
+        "controller": 0,
         "channel": 0,
         "outlet": 3,
         "dry_raw": 12000,
@@ -50,7 +50,7 @@ def make_pot(client, drop=None, **over):
 
 
 def report(client, raw=DRY, safe=True, extra="", token=TOKEN):
-    body = f"c=b1 ch0={raw}"
+    body = f"c=0 ch0={raw}"
     if safe:
         body += " float=1 pos=ok"
     if extra:
@@ -182,10 +182,10 @@ def test_a_dose_the_stamp_missed_still_holds_the_cooldown(client, db):
     The stamp is re-read when the board is handed the command, so the row
     records who actually got the water.
     """
-    post(client, "/command", "c=b1 water=3 ml=100")  # nothing is on outlet 3 yet
+    post(client, "/command", "c=0 water=3 ml=100")  # nothing is on outlet 3 yet
     basil = make_pot(client)  # ...and now something is
     assert "cmd=1" in report(client).text, "handed out"
-    post(client, "/report", "c=b1 ch0=8000 ack=1 flow_ml=100")
+    post(client, "/report", "c=0 ch0=8000 ack=1 flow_ml=100")
 
     with sqlite3.connect(db) as con:
         (stamp,) = con.execute("SELECT pot_id FROM commands WHERE id = 1").fetchone()
@@ -202,7 +202,7 @@ def test_a_dose_is_recorded_against_the_pot_that_received_it(client, db):
     learning log against the wrong soil, and the judgement read a sensor
     that got no water and paged that the dose had failed."""
     basil = make_pot(client, mode="manual")
-    post(client, "/command", "c=b1 water=3 ml=100")
+    post(client, "/command", "c=0 water=3 ml=100")
     post(client, "/pot", f"id={basil} outlet=5")
     mint = make_pot(client, name="mint", channel=1, outlet=3, mode="manual")
     report(client, extra=f"ch1={DRY}")
@@ -231,16 +231,16 @@ def test_a_dose_is_recorded_against_the_pot_that_received_it(client, db):
 def test_without_fresh_safety_fields_nothing_waters(client, db, extra):
     make_pot(client)
     for _ in range(6):
-        answer = post(client, "/report", f"c=b1 ch0={DRY} {extra}".strip())
+        answer = post(client, "/report", f"c=0 ch0={DRY} {extra}".strip())
         assert answer.status_code == 200
     assert commands(db) == []
 
 
 def test_the_status_fields_are_parsed_as_strictly_as_the_rest(client):
     for bad in ["float=2", "float=1 float=1", "pos=wet", "pos=ok pos=ok"]:
-        answer = post(client, "/report", f"c=b1 ch0=1 {bad}")
+        answer = post(client, "/report", f"c=0 ch0=1 {bad}")
         assert answer.status_code == 400, bad
-    r = parse_report("c=x ch0=1 float=1 pos=unknown")
+    r = parse_report("c=7 ch0=1 float=1 pos=unknown")
     assert (r.float_ok, r.pos) == (1, "unknown")
 
 
@@ -313,7 +313,7 @@ def test_under_the_cap_a_thirsty_pot_waters_again(client, db):
 def test_auto_yields_the_slot_and_retries_next_report(client, db):
     make_pot(client, cooldown_h=0)
     soak(client, 5, safe=False)  # fills the window; unsafe reports never water
-    post(client, "/command", "c=b1 water=7 ml=10 cap_s=5")
+    post(client, "/command", "c=0 water=7 ml=10 cap_s=5")
 
     first = report(client)  # the manual command rides out; rules step aside
     assert "water=7" in first.text
@@ -395,7 +395,7 @@ def test_the_garden_carries_the_last_handed_dose_and_its_verdict(client, db):
     assert dose["acked_ts"] is not None
 
     # A manual water-now on the same hose takes its place.
-    post(client, "/command", "c=b1 water=3 ml=50 cap_s=5")
+    post(client, "/command", "c=0 water=3 ml=50 cap_s=5")
     report(client, raw=WET)
     dose = client.get("/pots").json()["pots"][0]["last_dose"]
     assert (dose["id"], dose["source"], dose["ml"], dose["verdict"]) == (
@@ -461,7 +461,7 @@ def test_a_stale_proposal_from_a_dark_board_cannot_be_approved(client, db):
 def test_a_dead_boards_abandoned_command_does_not_wedge_approval(client, db):
     make_pot(client, mode="learning")
     soak(client, 5)  # proposal cmd=1
-    post(client, "/command", "c=b1 stop=1")  # cmd=2 queued; the board dies
+    post(client, "/command", "c=0 stop=1")  # cmd=2 queued; the board dies
     with sqlite3.connect(db) as con:
         con.execute("UPDATE commands SET created_ts = created_ts - 1000 WHERE id = 2")
 
@@ -471,7 +471,7 @@ def test_a_dead_boards_abandoned_command_does_not_wedge_approval(client, db):
 def test_a_channel_gone_silent_errs_dry(client, db):
     make_pot(client)
     soak(client, 5, safe=False)  # a dry window builds; unsafe, so no water
-    silent = post(client, "/report", "c=b1 ch5=9999 float=1 pos=ok")
+    silent = post(client, "/report", "c=0 ch5=9999 float=1 pos=ok")
     assert silent.status_code == 200
     assert commands(db) == []  # no fresh ch0 reading: the stale window holds
 
@@ -500,7 +500,7 @@ def test_a_handed_but_unacked_dose_counts_its_full_ml(client, db):
 def test_approve_refusals(client, db):
     make_pot(client, mode="learning")
     soak(client, 5)
-    post(client, "/command", "c=b1 stop=1")  # a manual command holds the slot
+    post(client, "/command", "c=0 stop=1")  # a manual command holds the slot
 
     busy = post(client, "/approve", "cmd=1")
     assert busy.status_code == 409
@@ -565,7 +565,7 @@ def test_a_dose_stays_with_the_pot_when_the_hoses_are_swapped(client, db):
     rewind(db, 3600)  # an hour later, the hoses are swapped
 
     post(client, "/pot", f"id={basil} channel=1 outlet=4")
-    post(client, "/pot", "name=mint controller=b1 channel=0 outlet=3")
+    post(client, "/pot", "name=mint controller=0 channel=0 outlet=3")
 
     assert cards(client)["basil"]["last_dose"]["id"] == 1
     assert cards(client)["mint"]["last_dose"] is None  # mint was never watered
@@ -586,8 +586,8 @@ def test_a_water_now_on_a_hose_the_pot_has_left_is_not_its_dose(client, db):
     rewind(db, 3600)  # an hour later the hoses are rearranged
 
     post(client, "/pot", f"id={basil} channel=1 outlet=4")
-    post(client, "/pot", "name=mint controller=b1 channel=0 outlet=3")
-    post(client, "/command", "c=b1 water=3 ml=50 cap_s=5")
+    post(client, "/pot", "name=mint controller=0 channel=0 outlet=3")
+    post(client, "/command", "c=0 water=3 ml=50 cap_s=5")
     report(client, extra=f"ch1={DRY}")  # cmd 2 handed out, down outlet 3
 
     assert cards(client)["basil"]["last_dose"]["id"] == 1
@@ -603,7 +603,7 @@ def test_a_proposal_is_not_inherited_by_the_next_pot_on_the_hose(client, db):
     rewind(db, 3600)
 
     post(client, "/pot", f"id={basil} outlet=4")
-    post(client, "/pot", "name=mint controller=b1 channel=1 outlet=3")
+    post(client, "/pot", "name=mint controller=0 channel=1 outlet=3")
 
     assert cards(client)["mint"]["proposal"] is None
     assert cards(client)["basil"]["proposal"] is None  # not on that hose now
@@ -693,7 +693,7 @@ def test_a_remap_in_the_second_of_a_dose_spends_the_cap_once(client, db):
 
 
 def prime_the_line_by_hand(client, db, ml=120):
-    """A dose on b1/outlet 3 that no pot can claim, a minute in the past.
+    """A dose on 0/outlet 3 that no pot can claim, a minute in the past.
 
     Setup day: the operator primes the line before anything is registered,
     so when the pot that hangs on that hose is saved a minute later, its
@@ -701,7 +701,7 @@ def prime_the_line_by_hand(client, db, ml=120):
     holds it. The same shape arrives without a human when the server clock
     steps while the wiring is being saved.
     """
-    post(client, "/command", f"c=b1 water=3 ml={ml}")
+    post(client, "/command", f"c=0 water=3 ml={ml}")
     report(client)  # the board is handed it
     report(client, extra=f"ack=1 flow_ml={ml}")
     with sqlite3.connect(db) as con:

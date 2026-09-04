@@ -10,7 +10,7 @@ expiry rules get exercised for real. Standard library only; point it at a
 local `uv run uvicorn butler:create_app --factory` or at the NAS:
 
     python fake_device.py --token dev [--url http://localhost:8000]
-        [--controller fake1] [--channels 5] [--cycles 0]
+        [--controller 9] [--channels 5] [--cycles 0]
 """
 
 import argparse
@@ -65,7 +65,10 @@ def main():
     )
     ap.add_argument("--url", default="http://localhost:8000")
     ap.add_argument("--token", default=os.environ.get("BUTLER_TOKEN", ""))
-    ap.add_argument("--controller", default="fake1")
+    # An integer, like the firmware's PB_CONTROLLER: butler refuses anything
+    # else. 9 rather than 0, so a fake board cannot be mistaken for the real
+    # one the app fills in by default.
+    ap.add_argument("--controller", type=int, default=9)
     ap.add_argument("--channels", type=int, default=5)
     ap.add_argument("--cycles", type=int, default=0, help="0 = run forever")
     ap.add_argument(
