@@ -899,14 +899,24 @@ def test_the_real_ticker_evaluates_sends_and_pings(db, wire):
         deadman_url=f"{url}/ping",
         tick_s=0.05,
     )
-    with TestClient(app) as client:  # the lifespan starts the real ticker
-        report(client, safe=False, extra="float=0 pos=ok")
-        report(client, safe=False, extra="float=0 pos=ok")
-        deadline = time.time() + 5
-        while time.time() < deadline and not any(
-            r for r in recorder.requests if r[3] == "POST" and "reservoir" in r[2]
-        ):
+    def wait_for(what, deadline_s=5):
+        deadline = time.time() + deadline_s
+        while time.time() < deadline and not what():
             time.sleep(0.02)
+
+    with TestClient(app) as client:  # the lifespan starts the real ticker
+        # The clean pass has to be waited for on its own. Once the reservoir
+        # alarm stands, no tick is clean again and the dead man is never fed,
+        # so racing the two against one deadline is a coin toss.
+        report(client)
+        wait_for(lambda: any(r for r in recorder.requests if r[0] == "/ping"))
+        report(client, safe=False, extra="float=0 pos=ok")
+        report(client, safe=False, extra="float=0 pos=ok")
+        wait_for(
+            lambda: any(
+                r for r in recorder.requests if r[3] == "POST" and "reservoir" in r[2]
+            )
+        )
 
     posts = [r for r in recorder.requests if r[3] == "POST"]
     pings = [r for r in recorder.requests if r[3] == "GET" and r[0] == "/ping"]
