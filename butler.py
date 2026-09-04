@@ -67,6 +67,7 @@ import asyncio
 import contextlib
 import hmac
 import http.client
+import json
 import os
 import secrets
 import shutil
@@ -77,6 +78,7 @@ import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
+from urllib.parse import quote, urlencode
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -833,6 +835,35 @@ def parse_verdict(text: str) -> tuple[int, str]:
     return cmd_id, verdict
 
 
+ADVICE_KINDS = ("target",)
+
+
+def parse_advice(text: str) -> tuple[str, str]:
+    """The `POST /advice` body: `pot=<id> kind=target dismiss=1`.
+
+    `dismiss=1` is spelled out rather than implied by the endpoint, so that
+    an accept can never be a typo away: there is no accept here at all, and
+    a body that asks for one is refused instead of quietly dismissing.
+    """
+    fields: dict = {}
+    for token in text.split():
+        key, sep, value = token.partition("=")
+        if not sep or not key:
+            raise ValueError(f"not a k=v token: {token!r}")
+        if key in fields:
+            raise ValueError(f"{key}= given twice")
+        fields[key] = value
+    pot_id = fields.get("pot")
+    if not pot_id:
+        raise ValueError("no pot= in the request")
+    kind = fields.get("kind", "target")
+    if kind not in ADVICE_KINDS:
+        raise ValueError(f"kind= must be one of {'|'.join(ADVICE_KINDS)}")
+    if fields.get("dismiss") != "1":
+        raise ValueError("dismiss=1 is the only thing this endpoint does")
+    return pot_id, kind
+
+
 def parse_quiet(text: str) -> tuple[int, int]:
     """BUTLER_QUIET, `HH-HH` in the server's local time; `0-0` disables.
 
@@ -858,6 +889,257 @@ def in_quiet(hour: int, start: int, end: int) -> bool:
     return hour >= start or hour < end
 
 
+# --- What does this plant want? (cycle 2) --------------------------------
+#
+# Two hops, both cached, and neither of them a source of watering numbers.
+# GBIF turns whatever somebody typed into the accepted binomial: free, no
+# key, and it is what lets "Sansevieria trifasciata" find the plant now
+# filed under "Dracaena trifasciata". Trefle then answers about that
+# binomial, when it knows it at all.
+#
+# The target band comes from target_band() below and from nowhere else.
+# Trefle carries no watering regime: probed with a real key on 2026-09-04,
+# `soil_humidity` was NULL for every species asked, houseplants included.
+# What it does carry — light and atmospheric humidity on its own 0-10
+# scales — is context for a human, not an input to a number.
+
+GBIF_MATCH_URL = "https://api.gbif.org/v1/species/match"
+TREFLE_BASE = "https://trefle.io/api/v1"
+CARE_TIMEOUT_S = 6  # three hops worst case, so a lookup answers inside ~20 s
+CARE_MISS_TTL_S = 30 * 86400  # a hit is kept forever; a miss is re-asked monthly
+SPECIES_MAX = 120  # longer than any binomial; bounds what goes on the wire
+CARE_BODY_CAP = 1 << 20  # a species page is ~40 KB; never read a stream
+
+
+def fetch_json(url: str) -> dict | None:
+    """One GET, parsed as JSON. None for everything else.
+
+    A care source that is down, slow, rate-limiting, redirecting or
+    answering HTML is a normal Tuesday, and the caller's answer is the same
+    in every one of those cases: nothing is known about this plant. Never
+    raises — a lookup must not be able to take the service down.
+    """
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "plantbutler-backend"}
+    )
+    try:
+        with _OPENER.open(request, timeout=CARE_TIMEOUT_S) as answer:
+            if not 200 <= answer.status < 300:
+                return None
+            body = answer.read(CARE_BODY_CAP)
+        parsed = json.loads(body.decode("utf-8"))
+    except (OSError, http.client.HTTPException, ValueError, UnicodeDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def normalise_species(text: str) -> str:
+    """What both caches are keyed on: underscores back to spaces (a k=v
+    token cannot hold one), collapsed whitespace, lowercased."""
+    return " ".join(text.replace("_", " ").split()).lower()
+
+
+def binomial_case(query: str) -> str:
+    """What GBIF is asked, which is not what the cache is keyed on.
+
+    GBIF matches a lowercase binomial happily but a lowercase genus not at
+    all: `monstera` answers NONE while `Monstera` answers GENUS. So the key
+    stays lowercase, and the question goes out in botanical case — genus
+    capitalised, epithet not.
+    """
+    return query[:1].upper() + query[1:]
+
+
+class Taxon(NamedTuple):
+    accepted: str | None  # the binomial to ask about; None when unresolved
+    rank: str | None
+    matched: str  # exact | fuzzy | genus | none
+
+
+def read_gbif(payload: dict) -> Taxon:
+    """GBIF's match answer, read defensively.
+
+    Two traps. A `matchType` of NONE arrives with `confidence: 100`, so
+    confidence says nothing on its own and the match type is the only field
+    worth believing. And a name that resolves to a genus has no `species`
+    at all — inventing one from it would mint exactly the junk cache row the
+    taxonomy hop exists to prevent, so a genus resolves to nothing and says
+    so, for the screen to ask which species.
+    """
+    kind = str(payload.get("matchType") or "NONE").upper()
+    if kind not in ("EXACT", "FUZZY"):
+        return Taxon(None, None, "none")
+    if str(payload.get("kingdom") or "") != "Plantae":
+        # A plant name that matches an animal is a wrong hop, not a hit.
+        return Taxon(None, None, "none")
+    rank = str(payload.get("rank") or "").upper() or None
+    # `species` is the ACCEPTED name even when the typing was a synonym,
+    # which is the entire reason this hop is here.
+    accepted = payload.get("species")
+    if not isinstance(accepted, str) or not accepted.strip():
+        return Taxon(None, rank, "genus" if rank == "GENUS" else "none")
+    return Taxon(accepted.strip(), rank, "fuzzy" if kind == "FUZZY" else "exact")
+
+
+def pick_species(payload: dict, wanted: str) -> str | None:
+    """The slug for `wanted` in a Trefle search answer, or None.
+
+    Trefle's search is fuzzy and ranks by its own relevance: asking for
+    Ocimum basilicum also returns Basilicum polystachyon, and a query it
+    knows nothing about still returns whatever was nearest. Only an exact
+    binomial is this plant; anything else is a different one.
+    """
+    for row in payload.get("data") or []:
+        if not isinstance(row, dict):
+            continue
+        if normalise_species(str(row.get("scientific_name") or "")) == wanted:
+            slug = str(row.get("slug") or "").strip()
+            return slug or None
+    return None
+
+
+def _scale(value: object, low: float, high: float) -> float | None:
+    """A number inside [low, high], or None. Booleans are not numbers here
+    (True would otherwise read as a light level of 1)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if low <= value <= high else None
+
+
+CARE_KEYS = (
+    "common_name",
+    "light",
+    "humidity",
+    "ph_min",
+    "ph_max",
+    "temp_min_c",
+    "image_url",
+)
+
+
+def read_trefle(payload: dict) -> dict:
+    """The handful of fields worth keeping from a Trefle species page.
+
+    Everything is optional and most of it is usually absent — that is the
+    normal case, not a failure. `image_url` is only kept when it is https:
+    the app loads it, and a plaintext or javascript: URL from a third party
+    has no business being handed to a WebView.
+    """
+    data = payload.get("data")
+    data = data if isinstance(data, dict) else {}
+    growth = data.get("growth")
+    growth = growth if isinstance(growth, dict) else {}
+    temp = growth.get("minimum_temperature")
+    temp = temp if isinstance(temp, dict) else {}
+    image = str(data.get("image_url") or "")
+    light = _scale(growth.get("light"), 0, 10)
+    humidity = _scale(growth.get("atmospheric_humidity"), 0, 10)
+    common = str(data.get("common_name") or "").strip()
+    return {
+        "common_name": common or None,
+        "light": None if light is None else int(light),
+        "humidity": None if humidity is None else int(humidity),
+        "ph_min": _scale(growth.get("ph_minimum"), 0, 14),
+        "ph_max": _scale(growth.get("ph_maximum"), 0, 14),
+        "temp_min_c": _scale(temp.get("deg_c"), -90, 60),
+        "image_url": image if image.startswith("https://") else None,
+    }
+
+
+# The band is on OUR percentage — air is 0, tap water is 100, a straight
+# line between two calibration points (decision #6). It is not volumetric
+# water content, so no published figure could be copied into it even if a
+# source had one. These are a starting offer for a human to correct, which
+# is why nothing here is ever applied without one.
+
+BASE_BAND = (35, 55)
+BAND_FLOOR, BAND_CEIL, BAND_MIN_WIDTH = 5, 95, 10
+
+TYPE_BANDS = (  # ordered: the first of these words to appear wins
+    ("succulent", (15, 30)),
+    ("cactus", (15, 30)),
+    ("fern", (55, 75)),
+    ("herb", (35, 55)),
+    ("vegetable", (45, 65)),
+    ("tropical", (40, 60)),
+    ("foliage", (40, 60)),
+    ("flower", (40, 60)),
+)
+
+SOIL_SHIFTS = (  # what the soil does to both ends
+    ("cactus", (-5, -5)),  # a gritty mix drains before the sensor notices
+    ("sand", (-5, -5)),
+    ("grit", (-5, -5)),
+    ("perlite", (-5, -5)),
+    ("clay", (0, -5)),  # holds water: the risk is the top of the band
+)
+
+POT_SHIFTS = (
+    ("small", (5, 0)),  # little buffer, so water sooner
+    ("large", (-5, -5)),  # inertia, and roots that rot before they dry
+)
+
+# Northern hemisphere, because the flat this waters is in one. A pot in the
+# southern half of the world wants these two swapped, and this code has no
+# way of being told so — a wrong answer worth naming rather than hiding.
+SEASONS = {12: "winter", 1: "winter", 2: "winter", 6: "summer", 7: "summer", 8: "summer"}
+SEASON_SHIFTS = {"winter": (-10, -10), "summer": (5, 0)}
+
+
+class Band(NamedTuple):
+    low: int
+    high: int
+    why: str
+
+
+WHY_MAX = 24  # these fields are free text; a reason is a phrase, not an essay
+
+
+def _find(text: str | None, table) -> tuple[str, tuple[int, int]] | None:
+    """The first table entry whose word appears in `text`, reported back in
+    the user's own words rather than the keyword that matched — "sandy loam
+    soil", not "sand soil". A substring match, so "succulents" and "sandy
+    loam" both land and the fields stay free text."""
+    words = normalise_species(text or "")
+    for word, value in table:
+        if word in words:
+            return words[:WHY_MAX], value
+    return None
+
+
+def target_band(
+    plant_type: str | None, soil: str | None, pot_size: str | None, month: int
+) -> Band:
+    """A target moisture band to offer, and the reason in words.
+
+    Nothing about the species: the only source that could have carried a
+    watering regime has none. What is left is what is actually on hand —
+    what kind of plant it is, what it sits in, how big the pot is, and the
+    time of year — which is roughly what a person would use anyway.
+    """
+    kind = _find(plant_type, TYPE_BANDS)
+    low, high = kind[1] if kind else BASE_BAND
+    why = [kind[0] if kind else "unlabelled plant"]
+    for text, table, label in (
+        (soil, SOIL_SHIFTS, "soil"),
+        (pot_size, POT_SHIFTS, "pot"),
+    ):
+        hit = _find(text, table)
+        if hit:
+            low, high = low + hit[1][0], high + hit[1][1]
+            # "small pot", not "small pot pot": the label is only there to
+            # say which field a bare word like "clay" or "small" came from.
+            why.append(hit[0] if label in hit[0] else f"{hit[0]} {label}")
+    season = SEASONS.get(month)
+    if season in SEASON_SHIFTS:
+        shift = SEASON_SHIFTS[season]
+        low, high = low + shift[0], high + shift[1]
+        why.append(season)
+    low = max(BAND_FLOOR, min(BAND_CEIL - BAND_MIN_WIDTH, low))
+    high = max(low + BAND_MIN_WIDTH, min(BAND_CEIL, high))
+    return Band(low, high, ", ".join(why))
+
+
 def create_app(
     db_path: str | None = None,
     token: str | None = None,
@@ -872,6 +1154,8 @@ def create_app(
     send: Callable[[Alert], bool] | None = None,
     ping: Callable[[], bool] | None = None,
     probe: Callable[[], bool] | None = None,
+    trefle_token: str | None = None,
+    fetch: Callable[[str], dict | None] | None = None,
 ) -> FastAPI:
     """Everything configurable comes from the environment, overridable for tests.
 
@@ -965,6 +1249,15 @@ def create_app(
     if not alerts_on:
         print("BUTLER_NTFY_TOPIC unset: alerts are off", file=sys.stderr)
 
+    care_token = (
+        trefle_token
+        if trefle_token is not None
+        else os.environ.get("BUTLER_TREFLE_TOKEN", "")
+    )
+    get_json = fetch or fetch_json
+    if not care_token and fetch is None:
+        print("BUTLER_TREFLE_TOKEN unset: care lookups are typed in", file=sys.stderr)
+
     if db.parent == Path("/data") and not os.path.ismount("/data"):
         raise ValueError(
             "BUTLER_DB is under /data but /data is not a mounted volume; "
@@ -983,6 +1276,168 @@ def create_app(
         con = sqlite3.connect(db, timeout=5)
         con.execute("PRAGMA journal_mode=WAL")
         return con
+
+    def taxon_for(con: sqlite3.Connection, query: str, now: int) -> Taxon | None:
+        """The accepted binomial for what somebody typed, cached.
+
+        None means the name service could not be asked — which is not the
+        same as "no such plant" and must not be written down as one.
+        """
+        row = con.execute(
+            "SELECT accepted, rank, matched, fetched_ts FROM species_names "
+            "WHERE query = ?",
+            (query,),
+        ).fetchone()
+        if row and (row[0] is not None or now - row[3] < CARE_MISS_TTL_S):
+            return Taxon(row[0], row[1], row[2])
+        payload = get_json(
+            f"{GBIF_MATCH_URL}?{urlencode({'name': binomial_case(query)})}"
+        )
+        if payload is None:
+            return None
+        taxon = read_gbif(payload)
+        con.execute(
+            "INSERT OR REPLACE INTO species_names "
+            "(query, fetched_ts, accepted, rank, matched) VALUES (?, ?, ?, ?, ?)",
+            (query, now, taxon.accepted, taxon.rank, taxon.matched),
+        )
+        return taxon
+
+    def cached_care(con: sqlite3.Connection, key: str) -> dict | None:
+        row = con.execute(
+            "SELECT fetched_ts, source, found, "
+            f"{', '.join(CARE_KEYS)} FROM species_care WHERE species = ?",
+            (key,),
+        ).fetchone()
+        if not row:
+            return None
+        entry = {"fetched": row[0], "source": row[1], "found": bool(row[2])}
+        entry.update(zip(CARE_KEYS, row[3:]))
+        return entry
+
+    def care_for(con: sqlite3.Connection, accepted: str, now: int) -> dict | None:
+        """What the care source says about one binomial, cached.
+
+        A miss is cached too — Trefle's houseplant coverage is empty, not
+        thin, so "nothing known" is the ordinary answer and re-asking it on
+        every screen open would be the bug. None means it could not be
+        asked at all: no token configured, or the source is not answering.
+        """
+        key = normalise_species(accepted)
+        entry = cached_care(con, key)
+        if entry and (entry["found"] or now - entry["fetched"] < CARE_MISS_TTL_S):
+            return entry
+        if not care_token:
+            return None
+        found = get_json(
+            f"{TREFLE_BASE}/species/search?"
+            f"{urlencode({'q': accepted, 'token': care_token})}"
+        )
+        if found is None:
+            return None
+        slug = pick_species(found, key)
+        care = dict.fromkeys(CARE_KEYS)
+        if slug:
+            detail = get_json(
+                f"{TREFLE_BASE}/species/{quote(slug, safe='')}?"
+                f"{urlencode({'token': care_token})}"
+            )
+            if detail is None:
+                return None
+            care = read_trefle(detail)
+        con.execute(
+            "INSERT OR REPLACE INTO species_care "
+            f"(species, fetched_ts, source, found, {', '.join(CARE_KEYS)}) "
+            f"VALUES (?, ?, 'trefle', ?, {', '.join('?' * len(CARE_KEYS))})",
+            (key, now, int(bool(slug)), *(care[k] for k in CARE_KEYS)),
+        )
+        return {"fetched": now, "source": "trefle", "found": bool(slug), **care}
+
+    def look_up(query: str) -> dict:
+        """One species lookup, both hops, and a sentence saying what came of
+        it. Every unhappy path ends in a working screen: the numbers are
+        typed in, which is what happens for most houseplants anyway."""
+        now = int(time.time())
+        with connect() as con:
+            taxon = taxon_for(con, query, now)
+            if taxon is None:
+                return {
+                    "query": query,
+                    "matched": "unavailable",
+                    "accepted": None,
+                    "rank": None,
+                    "care": None,
+                    "note": "the name service is not answering — type the numbers in",
+                }
+            answer = {
+                "query": query,
+                "matched": taxon.matched,
+                "accepted": taxon.accepted,
+                "rank": taxon.rank,
+                "care": None,
+                "note": "",
+            }
+            if taxon.matched == "genus":
+                answer["note"] = "that is a genus — which species?"
+                return answer
+            if taxon.accepted is None:
+                answer["note"] = "no plant of that name — check the spelling, or type the numbers in"
+                return answer
+            care = care_for(con, taxon.accepted, now)
+        if care is None:
+            answer["note"] = "no care source configured or answering — type the numbers in"
+            return answer
+        answer["care"] = care
+        if not care["found"]:
+            answer["note"] = f"{taxon.accepted} is not in Trefle — type the numbers in"
+        elif care["light"] is None and care["humidity"] is None:
+            answer["note"] = f"Trefle knows {taxon.accepted} but has no numbers for it"
+        else:
+            answer["note"] = f"Trefle: {taxon.accepted}"
+        if taxon.matched == "fuzzy":
+            answer["note"] = f"read as {taxon.accepted}. " + answer["note"]
+        return answer
+
+    def advice_for(con: sqlite3.Connection, entry: dict, now: int) -> dict | None:
+        """The band this pot would be offered, or None when there is nothing
+        to say: the pot is off, it already holds those numbers, or the
+        person has already refused this exact offer. A different offer — a
+        new season, a repot, another soil — is a new question and is asked.
+        """
+        if not entry["enabled"]:
+            return None
+        band = target_band(
+            entry["plant_type"],
+            entry["soil"],
+            entry["pot_size"],
+            time.localtime(now).tm_mon,
+        )
+        if (entry["target_low_pct"], entry["target_high_pct"]) == (band.low, band.high):
+            return None
+        row = con.execute(
+            "SELECT fingerprint FROM advice_dismissed WHERE pot_id = ? AND kind = ?",
+            (entry["id"], "target"),
+        ).fetchone()
+        if row and row[0] == f"{band.low}-{band.high}":
+            return None
+        return {"kind": "target", "low": band.low, "high": band.high, "why": band.why}
+
+    def dismiss_advice(pot_id: str, kind: str) -> None:
+        now = int(time.time())
+        with connect() as con:
+            row = con.execute(
+                "SELECT id, plant_type, soil, pot_size, target_low_pct, "
+                "target_high_pct, enabled FROM pots_now WHERE id = ?",
+                (pot_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"no pot {pot_id}")
+            band = target_band(row[1], row[2], row[3], time.localtime(now).tm_mon)
+            con.execute(
+                "INSERT OR REPLACE INTO advice_dismissed "
+                "(pot_id, kind, fingerprint, ts) VALUES (?, ?, ?, ?)",
+                (pot_id, kind, f"{band.low}-{band.high}", now),
+            )
 
     def water_rules(con: sqlite3.Connection, r: Report, now: int) -> None:
         """The ladder from the design sketch, statelessly, inside the
@@ -2269,10 +2724,70 @@ def create_app(
                     ).fetchone()
                     if dose:
                         entry["last_dose"] = dict(zip(LAST_DOSE_KEYS, dose))
+                    # Both of these read caches only. The garden is fetched
+                    # on every screen open and a care source in the middle
+                    # of that would make the app as slow as the internet.
+                    entry["advice"] = advice_for(con, entry, int(time.time()))
+                    entry["care"] = None
+                    if entry["species"]:
+                        name = con.execute(
+                            "SELECT accepted FROM species_names WHERE query = ?",
+                            (normalise_species(entry["species"]),),
+                        ).fetchone()
+                        if name and name[0]:
+                            entry["care"] = cached_care(
+                                con, normalise_species(name[0])
+                            )
                     garden.append(entry)
         except sqlite3.OperationalError as why:
             return PlainTextResponse(f"try again: {why}\n", status_code=503)
         return JSONResponse({"pots": garden})
+
+    @app.get("/species")
+    async def species(request: Request):
+        """What is known about a plant by name. Never writes to a pot: the
+        numbers a human ends up with are written by POST /pot, by that human.
+        """
+        if bad_token(request):
+            return PlainTextResponse("bad token\n", status_code=401)
+        query = normalise_species(request.query_params.get("q") or "")
+        if not query:
+            return PlainTextResponse("refused: q= is empty\n", status_code=400)
+        if len(query) > SPECIES_MAX:
+            return PlainTextResponse(
+                f"refused: q= is longer than {SPECIES_MAX} characters\n",
+                status_code=400,
+            )
+        try:
+            # In the threadpool: two HTTP hops with their own timeouts have
+            # no business on the event loop, and neither has the disk.
+            answer = await run_in_threadpool(look_up, query)
+        except sqlite3.OperationalError as why:
+            return PlainTextResponse(f"try again: {why}\n", status_code=503)
+        return JSONResponse(answer)
+
+    @app.post("/advice")
+    async def advice(request: Request):
+        """`pot=<id> kind=target dismiss=1` — this offer was seen and
+        refused. Only the refusal is stored; accepting an offer is an
+        ordinary POST /pot, so no watering number is ever written from here.
+        """
+        if bad_token(request):
+            return PlainTextResponse("bad token\n", status_code=401)
+        body = await slurp(request)
+        if isinstance(body, PlainTextResponse):
+            return body
+        try:
+            pot_id, kind = parse_advice(body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=400)
+        try:
+            await run_in_threadpool(dismiss_advice, pot_id, kind)
+        except ValueError as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=400)
+        except sqlite3.OperationalError as why:
+            return PlainTextResponse(f"try again: {why}\n", status_code=503)
+        return PlainTextResponse("ok\n")
 
     @app.get("/doses")
     def doses(request: Request):
