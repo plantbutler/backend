@@ -48,8 +48,15 @@ CREATE INDEX IF NOT EXISTS readings_by_pot
 -- The one exception is a pot the owner has erased: POST /pot/delete removes
 -- its commands with everything else of its. See DECISIONS.md.
 
+-- AUTOINCREMENT, and it earns its keep: without it `id` is a rowid alias
+-- and sqlite hands a deleted command's id straight back out. POST /pot/delete
+-- makes that reachable, and a recycled id inherits the erased pot's verdict
+-- and its `dose:<id>` judgement ledger row — so a stranger's verdict labels a
+-- new dose, and a real dose is never judged at all. The delete removes both
+-- of those anyway; this is the belt to that pair of braces, and the only one
+-- of the two a race with the alert ticker cannot get past.
 CREATE TABLE IF NOT EXISTS commands (
-  id         INTEGER PRIMARY KEY,
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
   created_ts INTEGER NOT NULL,
   controller TEXT    NOT NULL,
   kind       TEXT    NOT NULL,  -- 'water' | 'stop'

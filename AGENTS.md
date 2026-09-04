@@ -125,6 +125,17 @@ watering.
 - The command slot: queued → handed exactly once in a report response (sent) → acked by the
   next report's `ack=<id> flow_ml=`; a no-ack report or the TTL expires it. Expired is gone —
   ask again. The commands table is never pruned: it doubles as the watering history.
+- Attribution is stamped, and the stamp is re-read when the board is HANDED the command, not when
+  the command was written. A manual dose queued before its pot was registered carries no stamp at
+  create time, and a hose rearranged while a command waits changes who gets the water — and a dose
+  the pot half of the cooldown cannot see is one the hose floor stops covering the moment that pot
+  is rewired, so both layers of decision 7 go at once. The rules' median window reads the pot's own
+  readings, bounded to the last `RULES_WINDOW * 3` reports, so a socket that has changed hands
+  cannot water a new plant on a dead one's dryness and a pot rewired after a month waits for its
+  own five.
+- `commands.id` is `AUTOINCREMENT`, so a deleted command's id is never handed out again. Without it
+  a recycled id inherits the erased pot's verdict and its `dose:<id>` judgement row, and a real
+  dose is then never judged.
 - A pot has a `status`, a closed set of `alive` | `graveyard`, where it used to have an `enabled`
   flag. Every reader asks a positive allow-list (`butler.waters` / `butler.live_sql`), never
   `!= 'graveyard'`, so a word a newer backend invents does not water anything here. Burying a pot

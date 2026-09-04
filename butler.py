@@ -2244,6 +2244,12 @@ def create_app(
         )
         if r.float_ok != 1 or r.pos != "ok":
             return  # no reservoir, no known position, no report field: dry
+        # This board's own beat, so "recent" below means the same number of
+        # reports whether it speaks every minute or every hour.
+        beat = con.execute(
+            "SELECT next_s FROM controllers WHERE controller = ?", (r.controller,)
+        ).fetchone()
+        cadence = (beat and beat[0]) or interval
         if in_quiet(time.localtime(now).tm_hour, *quiet_window):
             return
         candidates = con.execute(
@@ -2273,13 +2279,23 @@ def create_app(
                 # float=: without it the window would freeze on stale values
                 # and water the pot at cooldown pace forever.
                 continue
+            # THIS pot's readings, not this channel's. A socket that has
+            # just changed hands still holds the last plant's rows, and four
+            # of a dead plant's drought readings under one fresh one make a
+            # median that opens a valve on a pot nobody has measured.
+            #
+            # And only recent ones, which the channel key gave for free and
+            # the pot key does not: a pot rewired after a month would
+            # otherwise decide on four month-old rows plus today's. Fewer
+            # than RULES_WINDOW inside the window means it waits — dry.
+            fresh = now - RULES_WINDOW * 3 * cadence
             window = [
                 raw
                 for (raw,) in con.execute(
                     "SELECT raw FROM readings "
-                    "WHERE controller = ? AND channel = ? "
+                    "WHERE pot_id = ? AND ts >= ? "
                     "ORDER BY ts DESC, rowid DESC LIMIT ?",
-                    (r.controller, channel, RULES_WINDOW),
+                    (pot_id, fresh, RULES_WINDOW),
                 )
             ]
             if len(window) < RULES_WINDOW:
@@ -2480,9 +2496,28 @@ def create_app(
                 (r.controller,),
             ).fetchone()
             if handed:
+                # The stamp is re-read HERE, not kept from when the command
+                # was written. The board is handed an outlet, and the water
+                # goes to whoever is on that outlet at this moment — which
+                # is not always who was on it when the command was made:
+                # a manual dose queued before the pot was registered was
+                # stamped NULL, and a hose rearranged while a command waited
+                # would file the water under the pot that no longer holds it.
+                #
+                # Both cost more than a wrong name. A dose the pot half of
+                # the cooldown cannot see is a dose the HOSE floor stops
+                # covering the moment that pot is rewired, so both layers of
+                # DECISIONS #7 go at once and the plant is watered twice.
+                owner = con.execute(
+                    "SELECT pot_id FROM pot_mappings "
+                    "WHERE controller = ? AND outlet IS ? AND to_ts IS NULL "
+                    "ORDER BY rowid LIMIT 1",
+                    (r.controller, handed[2]),
+                ).fetchone()
                 con.execute(
-                    "UPDATE commands SET state = 'sent', sent_ts = ? WHERE id = ?",
-                    (now, handed[0]),
+                    "UPDATE commands SET state = 'sent', sent_ts = ?, pot_id = ? "
+                    "WHERE id = ?",
+                    (now, owner and owner[0], handed[0]),
                 )
             (override,) = con.execute(
                 "SELECT next_s FROM controllers WHERE controller = ?",
@@ -2616,6 +2651,18 @@ def create_app(
                     "SELECT id FROM photos WHERE pot_id = ?", (pot_id,)
                 )
             ]
+            # The board is holding a dose for this pot: it will pour, and
+            # it will ack an id that no longer exists. Deleting the row also
+            # frees the controller's one slot while the water is still
+            # running, so the next command goes out on top of it.
+            if con.execute(
+                "SELECT 1 FROM commands WHERE pot_id = ? AND state = 'sent' LIMIT 1",
+                (pot_id,),
+            ).fetchone():
+                raise ValueError(
+                    f"the board is holding a dose for {pot_id}: "
+                    "try again after its next report"
+                )
             wiring = con.execute(
                 "SELECT controller, channel, outlet FROM pot_mappings "
                 "WHERE pot_id = ? AND to_ts IS NULL",
@@ -2709,6 +2756,17 @@ def create_app(
                 and merged["target_low_pct"] >= merged["target_high_pct"]
             ):
                 raise ValueError("target_low_pct must be below target_high_pct")
+            if merged["status"] == "graveyard" and any(
+                k in sets for k in POT_MAP_FIELDS
+            ):
+                # parse_pot refuses the two in one body; this catches the two
+                # in two bodies, which is the same contradiction spread out.
+                # Asked of the MERGED status, so restoring and wiring
+                # together still goes through — that one is not a
+                # contradiction, it is how a plant comes back.
+                raise ValueError(
+                    "a graveyard pot holds no wiring: bring it back first"
+                )
             clash = con.execute(
                 "SELECT id FROM pots WHERE name = ? AND id != ?", (name, pot_id)
             ).fetchone()
@@ -2801,6 +2859,17 @@ def create_app(
                         "VALUES (?, ?, ?, ?, ?, NULL)",
                         (pot_id, *wiring, edge),
                     )
+                    # The socket it just left, for the same reason burying
+                    # one does it: `sensor:<c>:<ch>` is raised and cleared
+                    # inside a loop over the pot's CURRENT wiring, so an
+                    # alarm on the old channel has nobody left to clear it.
+                    free_alerts(
+                        con,
+                        pot_id,
+                        current["controller"],
+                        current["channel"],
+                        current["outlet"],
+                    )
             if sets.get("status") == "graveyard" and current["status"] != "graveyard":
                 # Burying a pot is what UNPLUGS it, and that is the whole
                 # difference from the switch this replaced: the hose and the
@@ -2815,9 +2884,13 @@ def create_app(
                 )
                 # No new window: it comes back unwired, because the plant
                 # that comes back is not in the socket the old one left.
+                # 'queued' as well as 'proposed': burial hands the outlet
+                # back to the garden, so a dose still waiting for the board
+                # would pour into whatever is wired there next. A 'sent' one
+                # is already with the board and expires on its next report.
                 con.execute(
                     "UPDATE commands SET state = 'expired' "
-                    "WHERE pot_id = ? AND state = 'proposed'",
+                    "WHERE pot_id = ? AND state IN ('proposed', 'queued')",
                     (pot_id,),
                 )
                 free_alerts(

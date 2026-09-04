@@ -153,12 +153,13 @@ curl -s -G http://localhost:8000/species -H 'X-Token: dev' --data-urlencode 'q=S
 ```
 
 `kind` is the one thing the taxonomy hop gives that a care source could not:
-which of `plant_type`'s six kinds to pre-select. It is read from GBIF's family,
+which of `plant_type`'s twelve kinds to pre-select. It is read from GBIF's family,
 which arrives in the same free call, with a genus table checked first because
 family is wrong exactly where it matters — Asparagaceae holds both a leafy
 Dracaena that wants watering and this one, a succulent in all but name. It is a
 guess, so it only ever fills a field that is still empty, and one tap changes
-it. Orchids are left unguessed on purpose.
+it. Orchids used to be left unguessed on purpose; there is a band for a bark
+epiphyte now, so they are answered.
 
 `note` is the sentence to put on screen, because most of the answers are unhappy ones and each is
 unhappy in its own way: a genus needs a species, a typo is corrected out loud, and a plant Trefle
@@ -191,7 +192,7 @@ pot in `GET /pots`:
 
 ```bash
 # "advice": {"kind": "target", "low": 30, "high": 50,
-#            "why": "herb, sandy loam soil, 10 cm pot, 40 cm plant"}
+#            "why": "herb, sandy soil, 10 cm pot, 40 cm plant"}
 curl -s -X POST http://localhost:8000/pot -H 'X-Token: dev' \
   --data-binary 'id=pot-3f9a21 target_low_pct=30 target_high_pct=50'   # accepting it
 curl -s -X POST http://localhost:8000/advice -H 'X-Token: dev' \
@@ -199,10 +200,17 @@ curl -s -X POST http://localhost:8000/advice -H 'X-Token: dev' \
 ```
 
 `plant_type` is the base band and the biggest lever: an unlabelled plant starts at 35–55 and a
-succulent at 15–30, so it is a closed set — `succulent | fern | herb | vegetable | tropical |
-flower` — and anything else is refused rather than saved and quietly ignored, which is what free
-text used to do. Reading stays tolerant: a value written before the set existed simply matches
-nothing and falls to the base band.
+cactus at 10–25, so it is a closed set — `cactus | succulent | orchid | mediterranean | bulb |
+flower | herb | palm | tropical | vegetable | fern | carnivorous`, driest first — and anything
+else is refused rather than saved and quietly ignored, which is what free text used to do.
+
+`soil` is a closed set too, and only of the values that actually move the band: `sphagnum | peat |
+clay | sandy | perlite | cactus | bark`. An ordinary potting mix is deliberately not among them —
+it is what the plant kinds are written against, so leaving the field unset says the same thing.
+Every ceiling shift is ≤ 0, because the band is only ever widened downwards and a soil that raised
+the ceiling above the plant's own base would contradict the reason printed beside it.
+
+Reading stays tolerant in both: a value written before the sets existed simply matches nothing.
 
 The two sizes are measurements, `pot_diameter_cm` and `plant_height_cm`, and the pot is read as a
 water buffer. Volume goes as the cube of the diameter, but the shift cannot: a 40 cm pot holds 23×
