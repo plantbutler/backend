@@ -34,7 +34,7 @@ your token" are different mistakes and only one of them is yours to fix:
 
 ```bash
 curl -s -H 'X-Token: dev' http://localhost:8000/hello
-# -> butler=0.14.0     (401 bad token when the token is wrong; connection
+# -> butler=0.15.0     (401 bad token when the token is wrong; connection
 #                       refused when the address is)
 ```
 
@@ -83,7 +83,7 @@ a hose is an edit; recalibrating is two numbers):
 ```bash
 curl -s -X POST http://localhost:8000/pot \
   -H 'X-Token: dev' \
-  --data-binary 'name=basil controller=butler1 channel=0 outlet=3 plant_type=basil pot_size=14cm'
+  --data-binary 'name=basil controller=butler1 channel=0 outlet=3 plant_type=herb pot_diameter_cm=14'
 # -> pot=pot-3f9a21 name=basil
 curl -s -X POST http://localhost:8000/pot \
   -H 'X-Token: dev' --data-binary 'id=pot-3f9a21 dry_raw=12000 wet_raw=4000'
@@ -134,9 +134,18 @@ has ever heard of it:
 ```bash
 curl -s -G http://localhost:8000/species -H 'X-Token: dev' --data-urlencode 'q=Sansevieria trifasciata'
 # -> {"matched": "exact", "accepted": "Dracaena trifasciata", "rank": "SPECIES",
+#     "kind": "succulent",
 #     "care": {"found": true, "light": null, ...},
 #     "note": "Trefle knows Dracaena trifasciata but has no numbers for it"}
 ```
+
+`kind` is the one thing the taxonomy hop gives that a care source could not:
+which of `plant_type`'s six kinds to pre-select. It is read from GBIF's family,
+which arrives in the same free call, with a genus table checked first because
+family is wrong exactly where it matters — Asparagaceae holds both a leafy
+Dracaena that wants watering and this one, a succulent in all but name. It is a
+guess, so it only ever fills a field that is still empty, and one tap changes
+it. Orchids are left unguessed on purpose.
 
 `note` is the sentence to put on screen, because most of the answers are unhappy ones and each is
 unhappy in its own way: a genus needs a species, a typo is corrected out loud, and a plant Trefle
@@ -164,16 +173,32 @@ figs would be worse than saying so.
 
 No watering number comes from any of this. Trefle carries no watering regime — `soil_humidity` was
 NULL for every species probed — so the target band is proposed locally, from the kind of plant, the
-soil, the pot size and the month, and it arrives as an offer on each pot in `GET /pots`:
+soil, the size of the pot, the size of the plant and the month, and it arrives as an offer on each
+pot in `GET /pots`:
 
 ```bash
 # "advice": {"kind": "target", "low": 30, "high": 50,
-#            "why": "culinary herb, sandy loam soil, small pot"}
+#            "why": "herb, sandy loam soil, 10 cm pot, 40 cm plant"}
 curl -s -X POST http://localhost:8000/pot -H 'X-Token: dev' \
   --data-binary 'id=pot-3f9a21 target_low_pct=30 target_high_pct=50'   # accepting it
 curl -s -X POST http://localhost:8000/advice -H 'X-Token: dev' \
   --data-binary 'pot=pot-3f9a21 dismiss=1'                             # refusing it
 ```
+
+`plant_type` is the base band and the biggest lever: an unlabelled plant starts at 35–55 and a
+succulent at 15–30, so it is a closed set — `succulent | fern | herb | vegetable | tropical |
+flower` — and anything else is refused rather than saved and quietly ignored, which is what free
+text used to do. Reading stays tolerant: a value written before the set existed simply matches
+nothing and falls to the base band.
+
+The two sizes are measurements, `pot_diameter_cm` and `plant_height_cm`, and the pot is read as a
+water buffer. Volume goes as the cube of the diameter, but the shift cannot: a 40 cm pot holds 23×
+a 14 cm one, and no band survives being multiplied by 23. What is linear in percentage points is
+the log of that volume — 2.5 points per doubling of buffer — so a 10 cm pot comes out at +4 on the
+floor and a 24 cm one at −6 on both ends, which is roughly where the old `small` and `large`
+keywords sat. The ceiling only ever drops, because no pot size is a reason to keep a plant wetter
+than its kind wants. Height is read over diameter rather than on its own: 40 cm of basil is thirsty
+in a 10 cm pot and comfortable in a 30 cm one.
 
 Accepting is an ordinary pot edit, so no number is ever written except by the person writing it.
 A refusal is remembered against the numbers that were refused: change the soil, repot, or let the

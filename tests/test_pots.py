@@ -66,7 +66,7 @@ def test_a_pot_is_born_from_one_line(client):
     answer = pot(
         client,
         "name=basil controller=butler1 channel=0 outlet=3 "
-        "plant_type=basil plant_size=small pot_size=14cm soil=universal",
+        "plant_type=herb plant_height_cm=21 pot_diameter_cm=14 soil=universal",
     )
     assert answer.status_code == 200
     # The contract changed with the pot's identity: the answer names the id
@@ -78,7 +78,11 @@ def test_a_pot_is_born_from_one_line(client):
     assert entry["id"] == pot_id(answer)
     assert entry["name"] == "basil"
     assert entry["outlet"] == 3
-    assert entry["plant_type"] == "basil"
+    assert entry["plant_type"] == "herb"
+    # Measurements, not adjectives: the wire carries numbers and the band
+    # engine reads them as numbers.
+    assert entry["pot_diameter_cm"] == 14.0
+    assert entry["plant_height_cm"] == 21.0
     assert entry["mode"] == "manual"
     assert entry["enabled"] == 1
     assert entry["pct"] is None  # uncalibrated
@@ -86,13 +90,13 @@ def test_a_pot_is_born_from_one_line(client):
 
 
 def test_an_update_touches_only_the_keys_given(client):
-    basil = pot_id(pot(client, "name=basil controller=butler1 channel=0 plant_type=basil"))
+    basil = pot_id(pot(client, "name=basil controller=butler1 channel=0 plant_type=herb"))
 
     pot(client, f"id={basil} outlet=4")
 
     (entry,) = garden(client)
     assert entry["outlet"] == 4
-    assert entry["plant_type"] == "basil"
+    assert entry["plant_type"] == "herb"
     assert entry["channel"] == 0
 
 
@@ -257,7 +261,16 @@ def test_different_controllers_do_not_collide(client):
 @pytest.mark.parametrize(
     "body",
     [
-        "plant_type=basil",  # no name
+        "plant_type=herb",  # no name
+        "name=basil plant_type=basil",  # not one of the kinds
+        "name=basil pot_diameter_cm=0",  # a 0 cm pot is a half-finished edit
+        "name=basil pot_diameter_cm=-4",  # nor a negative one
+        "name=basil pot_diameter_cm=1e3",  # float() would take this
+        "name=basil pot_diameter_cm=inf",  # and this
+        "name=basil pot_diameter_cm=nan",  # and this
+        "name=basil pot_diameter_cm=201",  # bigger than a half-barrel
+        "name=basil plant_height_cm=1001",  # a tree, not a pot plant
+        "name=basil plant_height_cm=abc",  # not a measurement at all
         "name=basil name=mint",  # name twice
         "name=basil channel=999",  # channel out of range
         "name=basil dry_raw=abc",  # not an integer

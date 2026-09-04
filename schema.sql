@@ -76,9 +76,9 @@ CREATE TABLE IF NOT EXISTS pots (
   id              TEXT    PRIMARY KEY,      -- pot-3f9a21, minted once
   name            TEXT    NOT NULL UNIQUE,  -- nickname, editable
   species         TEXT,                     -- what the care lookup keys on
-  plant_type      TEXT,     -- descriptive, Planta-style
-  plant_size      TEXT,
-  pot_size        TEXT,
+  plant_type      TEXT,     -- one of butler.PLANT_KINDS, or NULL for "not sure"
+  plant_height_cm REAL,     -- measurements, not adjectives: the band engine
+  pot_diameter_cm REAL,     -- reads them as numbers (butler.size_shifts)
   soil            TEXT,
   dry_raw         INTEGER,  -- calibration: raw count bone dry
   wet_raw         INTEGER,  -- calibration: raw count soaked
@@ -116,11 +116,17 @@ CREATE INDEX IF NOT EXISTS pot_mappings_by_outlet
 
 -- Every reader that wants "the pot as it is wired right now" reads this and
 -- gets the column shape the pots table used to have.
+--
+-- Dropped and recreated on every start rather than IF NOT EXISTS. A view
+-- holds no data — it is derived, like a percentage — so rebuilding it costs
+-- nothing, and IF NOT EXISTS would leave a database that predates a column
+-- serving the old shape forever with nothing to say it had.
 
-CREATE VIEW IF NOT EXISTS pots_now AS
+DROP VIEW IF EXISTS pots_now;
+CREATE VIEW pots_now AS
 SELECT p.id, p.name, p.species,
        m.controller, m.channel, m.outlet,
-       p.plant_type, p.plant_size, p.pot_size, p.soil,
+       p.plant_type, p.plant_height_cm, p.pot_diameter_cm, p.soil,
        p.dry_raw, p.wet_raw, p.target_low_pct, p.target_high_pct,
        p.dose_ml, p.mode, p.cooldown_h, p.daily_cap_ml, p.enabled
   FROM pots p
@@ -189,7 +195,8 @@ CREATE TABLE IF NOT EXISTS species_names (
   fetched_ts INTEGER NOT NULL,
   accepted   TEXT,
   rank       TEXT,              -- SPECIES, GENUS, ... as GBIF reports it
-  matched    TEXT NOT NULL      -- exact | fuzzy | genus | none
+  matched    TEXT NOT NULL,     -- exact | fuzzy | genus | none
+  family     TEXT               -- what the plant-kind guess is read from
 );
 
 -- The care source's answer for one accepted binomial. `found = 0` is a
