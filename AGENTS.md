@@ -149,10 +149,18 @@ watering.
   `/history` and the optional `cap_s` on 2026-09-02; 0.8.0 with pot identity, `species`,
   `pot_mappings` and the one-time rebuild, 0.9.0 with `/doses`, and 0.11.0 with the create/edit
   split and a month of `/history`, on 2026-09-03; 0.12.0 with the species lookup and the target-band
-  offer on 2026-09-04, verified live against GBIF and Trefle from the NAS): container `plantbutler`
-  on the NAS, port 9380, image `plantbutler-backend:0.12.0` shipped via `docker save | ssh docker load` over the tailnet, database on `/volume1/docker/plantbutler/data`, secrets in `deploy.env` beside it
+  offer, then 0.14.0 with `GET /hello` and the photograph store, on 2026-09-04, verified live from
+  the NAS — GBIF and Trefle for the lookup, and for the photographs a `/hello` that answers its
+  version to the right token and 401 to a wrong one, a gated `/photos`, and an upload to a pot that
+  does not exist refused without writing anything): container `plantbutler`
+  on the NAS, port 9380, image `plantbutler-backend:0.14.0` shipped via `docker save | ssh docker load` over the tailnet, database on `/volume1/docker/plantbutler/data`, secrets in `deploy.env` beside it
   (600, not in git: the token, the ntfy topic, the healthchecks.io ping URL, the Trefle token),
-  `-e TZ=Europe/Zurich` so BUTLER_QUIET means local night. The rules run dark until the
+  `-e TZ=Europe/Zurich` so BUTLER_QUIET means local night. Photographs share that volume —
+  `/data/photos`, one directory per pot — so they are backed up or lost with the database rather
+  than separately, which is the one arrangement a restore cannot half-do.
+  Recreating the container keeps the environment by dumping the running one's `BUTLER_*` and `TZ`
+  into a temporary `--env-file` on the NAS and shredding it afterwards, so no secret is read out
+  or retyped to redeploy. The rules run dark until the
   firmware sends `float=`/`pos=`; the alerts are live — the dead-man feeds healthchecks
   (which notifies by email, not ntfy) and the phone subscribes to the topic in the ntfy app.
 
