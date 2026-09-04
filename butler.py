@@ -69,6 +69,7 @@ import hmac
 import http.client
 import json
 import os
+import re
 import secrets
 import shutil
 import sqlite3
@@ -81,7 +82,7 @@ from typing import NamedTuple
 from urllib.parse import quote, urlencode
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import QueryParams
 from starlette.requests import ClientDisconnect
@@ -90,9 +91,22 @@ from starlette.requests import ClientDisconnect
 # metadata because the container installs no package — it copies butler.py
 # beside fastapi and runs it. A test asserts this and pyproject.toml agree,
 # which is the only thing that keeps the two honest.
-VERSION = "0.13.0"
+VERSION = "0.14.0"
 
 BODY_CAP = 4096  # a full 15-channel report is ~200 bytes; 4 KB is generous
+# Photographs are the first thing here that is not small. The phone caps the
+# long edge before it uploads, which puts a JPEG around 300-500 KB; 3 MiB is
+# room for a bad guess and still a refusal long before the NAS volume cares.
+PHOTO_CAP = 3 * 1024 * 1024
+JPEG_HEAD = b"\xff\xd8\xff"  # every JPEG starts SOI + a marker
+PHOTO_LIMIT = 100  # the strip's default page
+MAX_PHOTO_LIMIT = 500
+MAX_PHOTO_EDGE = 8192  # w=/h= are what the phone says it downscaled to
+# Every id that becomes part of a filesystem path goes through this first.
+# Ids here are minted, so nothing legitimate is turned away; what it stops
+# is a `pot=../../etc` writing outside the photo store, which no amount of
+# "but the pot has to exist" reasoning further down would catch on its own.
+SAFE_ID = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
 RETRY_WINDOW_S = 300  # how long an identical (controller, t) counts as a retry
 MAX_CHANNEL = 255
 MAX_RAW = 2**31  # 14-bit ADC today; headroom without letting 2**63 near sqlite
@@ -168,6 +182,16 @@ def new_pot_id() -> str:
     encodes an order that means nothing.
     """
     return "pot-" + secrets.token_hex(3)
+
+
+def new_photo_id() -> str:
+    """A photograph's identity, and its filename: `photo-3f9a21b4`.
+
+    Four bytes rather than a pot's three: this is also a path segment, and
+    the only thing standing between a guessed id and somebody else's
+    picture on a shared tailnet.
+    """
+    return "photo-" + secrets.token_hex(4)
 
 
 # The columns the old pots table carried, in its own order, so the rebuild
@@ -870,6 +894,81 @@ def parse_advice(text: str) -> tuple[str, str]:
     return pot_id, kind
 
 
+def parse_photo(params: QueryParams) -> tuple[str, int | None, int | None]:
+    """`POST /photo?pot=<id>&w=&h=`, with the JPEG as the body.
+
+    The one route here whose payload is not k=v, because it is bytes; the
+    metadata rides the query string instead of a multipart envelope, which
+    would be a dependency and a parser for one field and a file.
+
+    `w`/`h` are what the phone says it downscaled to. They are a hint for
+    laying out the strip before the bytes arrive, nothing more — no one
+    here opens the JPEG to check, and nothing is decided from them.
+    """
+
+    def one(key: str) -> str | None:
+        values = params.getlist(key)
+        if len(values) > 1:
+            raise ValueError(f"{key}= given twice")
+        return values[0] if values else None
+
+    pot = (one("pot") or "").strip()
+    if not pot:
+        raise ValueError("no pot= in the request")
+    if not SAFE_ID.fullmatch(pot):
+        raise ValueError(f"not a pot id: {pot!r}")
+
+    def edge(key: str) -> int | None:
+        raw = one(key)
+        return None if raw is None else _int_in(raw, key, 1, MAX_PHOTO_EDGE)
+
+    return pot, edge("w"), edge("h")
+
+
+def parse_photos(params: QueryParams) -> tuple[str, int]:
+    """`GET /photos?pot=<id>&limit=<1..500>`: one pot's strip, newest first.
+
+    A pot is required, unlike /doses. A garden-wide roll of photographs is
+    a gallery, and the pitch is a pot carrying its own growth history.
+    """
+
+    def one(key: str, default: str | None = None) -> str | None:
+        values = params.getlist(key)
+        if len(values) > 1:
+            raise ValueError(f"{key}= given twice")
+        return values[0] if values else default
+
+    pot = (one("pot") or "").strip()
+    if not pot:
+        raise ValueError("no pot= in the request")
+    if not SAFE_ID.fullmatch(pot):
+        raise ValueError(f"not a pot id: {pot!r}")
+    return pot, _int_in(one("limit", str(PHOTO_LIMIT)) or "", "limit", 1, MAX_PHOTO_LIMIT)
+
+
+def parse_photo_delete(text: str) -> str:
+    """The `POST /photo/delete` body: `photo=<id>`.
+
+    Its own route rather than a `delete=1` field on /photo, because /photo
+    carries a picture and this one must never be reachable by an upload
+    that lost its body.
+    """
+    fields: dict = {}
+    for token in text.split():
+        key, sep, value = token.partition("=")
+        if not sep or not key:
+            raise ValueError(f"not a k=v token: {token!r}")
+        if key in fields:
+            raise ValueError(f"{key}= given twice")
+        fields[key] = value
+    photo_id = fields.get("photo")
+    if not photo_id:
+        raise ValueError("no photo= in the request")
+    if not SAFE_ID.fullmatch(photo_id):
+        raise ValueError(f"not a photo id: {photo_id!r}")
+    return photo_id
+
+
 def parse_quiet(text: str) -> tuple[int, int]:
     """BUTLER_QUIET, `HH-HH` in the server's local time; `0-0` disables.
 
@@ -1240,6 +1339,7 @@ def create_app(
     probe: Callable[[], bool] | None = None,
     trefle_token: str | None = None,
     fetch: Callable[[str], dict | None] | None = None,
+    photos_dir: str | None = None,
 ) -> FastAPI:
     """Everything configurable comes from the environment, overridable for tests.
 
@@ -1347,7 +1447,24 @@ def create_app(
             "BUTLER_DB is under /data but /data is not a mounted volume; "
             "refusing to store readings in the container layer"
         )
+    # The photographs sit beside the database by default, so they land on
+    # the same bind mount and are backed up or lost together — the one
+    # arrangement in which a restore cannot produce rows whose files are
+    # from a different day. BUTLER_PHOTOS can move them, and gets the same
+    # refusal the database gets if it points into an unmounted /data.
+    photos = Path(
+        photos_dir
+        if photos_dir is not None
+        else (os.environ.get("BUTLER_PHOTOS") or str(db.parent / "photos"))
+    )
+    if photos.parent == Path("/data") and not os.path.ismount("/data"):
+        raise ValueError(
+            "BUTLER_PHOTOS is under /data but /data is not a mounted volume; "
+            "refusing to store photographs in the container layer"
+        )
+
     db.parent.mkdir(parents=True, exist_ok=True)
+    photos.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db) as bootstrap:
         bootstrap.execute("PRAGMA journal_mode=WAL")
         bootstrap.executescript(SCHEMA_SQL)
@@ -1360,6 +1477,115 @@ def create_app(
         con = sqlite3.connect(db, timeout=5)
         con.execute("PRAGMA journal_mode=WAL")
         return con
+
+    def photo_path(pot_id: str, photo_id: str) -> Path:
+        """Where one picture's bytes live. One directory per pot, so the
+        volume stays readable by a person with a file browser and a backup
+        of one pot is a directory.
+
+        Both halves are re-checked here rather than trusted from wherever
+        they came: this is the only function that turns an id into a path,
+        so it is the only place a traversal could get in.
+        """
+        if not SAFE_ID.fullmatch(pot_id) or not SAFE_ID.fullmatch(photo_id):
+            raise ValueError("not an id")
+        return photos / pot_id / f"{photo_id}.jpg"
+
+    def keep_photo(
+        pot_id: str, blob: bytes, w: int | None, h: int | None, now: int
+    ) -> str:
+        """The bytes, then the row.
+
+        A crash between the two leaves a file no row knows about, which
+        nothing lists and nothing serves; the other order would leave a row
+        whose picture never existed and which the strip would have to show
+        as missing forever. Neither connection is held across the disk
+        write — a photograph is megabytes over a NAS volume, and a write
+        transaction held that long is the board's reports blocked.
+        """
+        with connect() as con:
+            row = con.execute(
+                "SELECT species FROM pots WHERE id = ?", (pot_id,)
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"no such pot: {pot_id}")
+        photo_id = new_photo_id()
+        path = photo_path(pot_id, photo_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Through a temporary file: a kill mid-write must not leave half a
+        # JPEG somewhere a row is about to point at.
+        part = path.with_suffix(".part")
+        part.write_bytes(blob)
+        part.replace(path)
+        try:
+            with connect() as con:
+                con.execute(
+                    "INSERT INTO photos (id, pot_id, ts, bytes, w, h, species) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (photo_id, pot_id, now, len(blob), w, h, row[0]),
+                )
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
+        return photo_id
+
+    def photo_rows(pot_id: str, limit: int) -> list[dict]:
+        """One pot's strip, newest first, straight from the rows.
+
+        `missing` is the one thing the disk is asked: a row whose file has
+        gone — a half-restored backup, a volume that came back empty — is
+        listed and said to be missing rather than served as a picture that
+        will not load.
+        """
+        with connect() as con:
+            rows = con.execute(
+                "SELECT id, ts, bytes, w, h, species FROM photos "
+                "WHERE pot_id = ? ORDER BY ts DESC, rowid DESC LIMIT ?",
+                (pot_id, limit),
+            ).fetchall()
+        return [
+            {
+                "id": photo_id,
+                "ts": ts,
+                "bytes": size,
+                "w": w,
+                "h": h,
+                "species": species,
+                "missing": not photo_path(pot_id, photo_id).exists(),
+            }
+            for photo_id, ts, size, w, h, species in rows
+        ]
+
+    def photo_blob(photo_id: str) -> bytes:
+        """The picture itself, found through its row and never through the
+        directory: a file nothing here minted is not reachable by guessing
+        its name."""
+        with connect() as con:
+            row = con.execute(
+                "SELECT pot_id FROM photos WHERE id = ?", (photo_id,)
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"no such photo: {photo_id}")
+        try:
+            return photo_path(row[0], photo_id).read_bytes()
+        except OSError:
+            raise ValueError(f"{photo_id} is listed but its file is gone") from None
+
+    def forget_photo(photo_id: str) -> None:
+        """The row, then the file — the opposite order to keeping one, and
+        for the same reason: whichever way a crash lands, what is left over
+        is a file nobody knows about rather than a row nobody can show. The
+        person said the picture is gone, so it goes from the listing even
+        if the volume refuses to give up the bytes."""
+        with connect() as con:
+            row = con.execute(
+                "SELECT pot_id FROM photos WHERE id = ?", (photo_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"no such photo: {photo_id}")
+            con.execute("DELETE FROM photos WHERE id = ?", (photo_id,))
+        with contextlib.suppress(OSError):
+            photo_path(row[0], photo_id).unlink(missing_ok=True)
 
     def taxon_for(query: str, now: int) -> Taxon | None:
         """The accepted binomial for what somebody typed, cached.
@@ -2669,12 +2895,12 @@ def create_app(
         # which would turn a garbled header into a 500 instead of a 401.
         return not hmac.compare_digest(given.encode("utf-8"), secret.encode("utf-8"))
 
-    async def slurp(request: Request) -> bytes | PlainTextResponse:
+    async def slurp(request: Request, cap: int = BODY_CAP) -> bytes | PlainTextResponse:
         body = b""
         try:
             async for chunk in request.stream():
                 body += chunk
-                if len(body) > BODY_CAP:
+                if len(body) > cap:
                     return PlainTextResponse("body too large\n", status_code=413)
         except ClientDisconnect:
             # Half-sent body on a WiFi drop: the client is gone, the response
@@ -3070,6 +3296,121 @@ def create_app(
                 "points": points,
             }
         )
+
+    @app.post("/photo")
+    async def add_photo(request: Request):
+        """`?pot=<id>&w=&h=` with the JPEG as the body.
+
+        JPEG only, checked by its first bytes rather than by what the
+        uploader called it. The store then holds one kind of file, so what
+        goes back out can always be labelled image/jpeg and never sniffed
+        by a browser into something it would run.
+        """
+        if bad_token(request):
+            return PlainTextResponse("bad token\n", status_code=401)
+        try:
+            pot_id, w, h = parse_photo(request.query_params)
+        except ValueError as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=400)
+        body = await slurp(request, PHOTO_CAP)
+        if isinstance(body, PlainTextResponse):
+            return body
+        if not body.startswith(JPEG_HEAD):
+            return PlainTextResponse(
+                "refused: that is not a JPEG — the phone downscales and "
+                "re-encodes before it uploads\n",
+                status_code=400,
+            )
+        now = int(time.time())
+        try:
+            photo_id = await run_in_threadpool(keep_photo, pot_id, body, w, h, now)
+        except ValueError as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=400)
+        except sqlite3.OperationalError as why:
+            return PlainTextResponse(f"try again: {why}\n", status_code=503)
+        except OSError as why:
+            # A full volume, or one that went read-only. Its own status,
+            # because it is the one failure here that nobody can retry away.
+            return PlainTextResponse(f"refused: {why}\n", status_code=507)
+        return PlainTextResponse(f"photo={photo_id} ts={now}\n")
+
+    @app.get("/photos")
+    def list_photos(request: Request):
+        """`?pot=<id>&limit=`: one pot's strip, newest first.
+
+        Gated, unlike every other read here, and so is the picture itself.
+        The rest of them are numbers about plants; these are the one thing
+        in this system that could show the inside of somebody's house. It
+        costs nothing — the app puts the token on every GET already.
+        """
+        if bad_token(request):
+            return PlainTextResponse("bad token\n", status_code=401)
+        try:
+            pot_id, limit = parse_photos(request.query_params)
+        except ValueError as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=400)
+        try:
+            rows = photo_rows(pot_id, limit)
+        except sqlite3.OperationalError as why:
+            return PlainTextResponse(f"try again: {why}\n", status_code=503)
+        return JSONResponse(
+            {
+                "pot": pot_id,
+                "photos": rows,
+                # A full page may have older ones behind it. Nothing pages
+                # yet: the strip asks for more by raising limit, and this is
+                # what tells it there would be a point.
+                "more": len(rows) >= limit,
+                "now": int(time.time()),
+            }
+        )
+
+    @app.get("/photo/{photo_id}")
+    async def get_photo(photo_id: str, request: Request):
+        if bad_token(request):
+            return PlainTextResponse("bad token\n", status_code=401)
+        if not SAFE_ID.fullmatch(photo_id):
+            return PlainTextResponse("refused: not a photo id\n", status_code=400)
+        try:
+            blob = await run_in_threadpool(photo_blob, photo_id)
+        except ValueError as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=404)
+        except sqlite3.OperationalError as why:
+            return PlainTextResponse(f"try again: {why}\n", status_code=503)
+        return Response(
+            blob,
+            media_type="image/jpeg",
+            headers={
+                "X-Content-Type-Options": "nosniff",
+                # An id is minted once and its bytes never change, so a
+                # phone may keep the picture for as long as it likes. This
+                # is what stops a strip re-downloading megabytes on every
+                # refresh over the tailnet.
+                "Cache-Control": "private, max-age=31536000, immutable",
+            },
+        )
+
+    @app.post("/photo/delete")
+    async def delete_photo(request: Request):
+        """`photo=<id>`. Its own route rather than a field on /photo: that
+        one carries a picture, and losing a body must never become a
+        deletion."""
+        if bad_token(request):
+            return PlainTextResponse("bad token\n", status_code=401)
+        body = await slurp(request)
+        if isinstance(body, PlainTextResponse):
+            return body
+        try:
+            photo_id = parse_photo_delete(body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=400)
+        try:
+            await run_in_threadpool(forget_photo, photo_id)
+        except ValueError as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=400)
+        except sqlite3.OperationalError as why:
+            return PlainTextResponse(f"try again: {why}\n", status_code=503)
+        return PlainTextResponse("ok\n")
 
     @app.get("/hello")
     def hello(request: Request):
