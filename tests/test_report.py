@@ -31,8 +31,69 @@ def rows(db):
         ).fetchall()
 
 
+def stamps(db):
+    """(channel, pot_id) per reading, oldest first: whose reading each one is."""
+    with sqlite3.connect(db) as con:
+        return con.execute(
+            "SELECT channel, pot_id FROM readings ORDER BY ts, channel"
+        ).fetchall()
+
+
 def post(client, body, token=TOKEN):
     return client.post("/report", content=body, headers={"X-Token": token})
+
+
+def pot(client, body):
+    answer = client.post("/pot", content=body, headers={"X-Token": TOKEN})
+    assert answer.status_code == 200, answer.text
+    return answer.text.split()[0].removeprefix("pot=")
+
+
+# --------------------------------------------------------------------------- #
+# Whose reading it is: stamped as the row lands
+# --------------------------------------------------------------------------- #
+
+
+def test_a_reading_carries_the_pot_that_was_on_that_channel(client, db):
+    basil = pot(client, "name=basil controller=butler1 channel=0")
+    post(client, REPORT)
+    # ch0 is basil's; ch1 and ch2 are sockets nobody has claimed, and NULL
+    # is the honest answer for them rather than a gap to fill in later.
+    assert stamps(db) == [(0, basil), (1, None), (2, None)]
+
+
+def test_a_remap_changes_what_is_stamped_next_and_leaves_the_past_alone(client, db):
+    """The whole point of stamping: a plant moved to another socket takes
+    its old readings with it, and the pot that arrives on the socket it
+    left does not inherit them."""
+    basil = pot(client, "name=basil controller=butler1 channel=0")
+    post(client, "c=butler1 t=1\nch0=8000\n")
+    pot(client, f"id={basil} channel=1")
+    mint = pot(client, "name=mint controller=butler1 channel=0")
+    post(client, "c=butler1 t=2\nch0=7000 ch1=6000\n")
+
+    assert stamps(db) == [(0, basil), (0, mint), (1, basil)]
+
+
+def test_a_buried_pots_channel_stamps_nobody(client, db):
+    """Burying a pot closes its window, and the socket goes back to the
+    garden — so a reading that arrives afterwards belongs to no plant."""
+    basil = pot(client, "name=basil controller=butler1 channel=0")
+    post(client, "c=butler1 t=1\nch0=8000\n")
+    client.post(
+        "/pot", content=f"id={basil} status=graveyard", headers={"X-Token": TOKEN}
+    )
+    post(client, "c=butler1 t=2\nch0=8000\n")
+
+    assert stamps(db) == [(0, basil), (0, None)]
+
+
+def test_a_retry_still_dedups_when_nothing_is_mapped(client, db):
+    """The dedup probe is on (controller, t) and has nothing to do with
+    pots: an unmapped board must not write its readings twice."""
+    post(client, REPORT)
+    post(client, REPORT)
+    assert len(stamps(db)) == 3
 
 
 # --------------------------------------------------------------------------- #

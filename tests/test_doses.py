@@ -25,8 +25,10 @@ def client(db):
 
 
 def pot(db, pot_id, name, controller="b1", outlet=0, from_ts=0, to_ts=None):
-    """A pot and one mapping window, stated outright: these tests are about
-    which window a dose falls in, so the windows are the fixture."""
+    """A pot and one mapping window, stated outright. The windows no longer
+    decide whose dose it was — the stamp on the row does — but they still
+    say which sensor a pot was on, and enqueue reads the open one to choose
+    the stamp, so they stay part of the fixture."""
     with sqlite3.connect(db) as con:
         con.execute(
             "INSERT OR IGNORE INTO pots (id, name) VALUES (?, ?)", (pot_id, name)
@@ -39,12 +41,16 @@ def pot(db, pot_id, name, controller="b1", outlet=0, from_ts=0, to_ts=None):
 
 
 def dose(db, cmd_id, sent_ts, state="acked", ml=100, flow_ml=None, outlet=0,
-         controller="b1", acked_ts=None, created_ts=None, kind="water", source="manual"):
+         controller="b1", acked_ts=None, created_ts=None, kind="water",
+         source="manual", pot_id="pot-1"):
+    """`pot_id` is the stamp the row carries — whom the dose was made for,
+    written when the command was. None is a real value: a hose no pot was
+    on, and a stop, which names no hose at all."""
     with sqlite3.connect(db) as con:
         con.execute(
             "INSERT INTO commands (id, created_ts, controller, kind, outlet, ml, "
-            "cap_s, state, source, sent_ts, acked_ts, flow_ml) "
-            "VALUES (?, ?, ?, ?, ?, ?, 30, ?, ?, ?, ?, ?)",
+            "cap_s, state, source, sent_ts, acked_ts, flow_ml, pot_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, 30, ?, ?, ?, ?, ?, ?)",
             (
                 cmd_id,
                 created_ts if created_ts is not None else (sent_ts or 0),
@@ -57,8 +63,37 @@ def dose(db, cmd_id, sent_ts, state="acked", ml=100, flow_ml=None, outlet=0,
                 sent_ts,
                 acked_ts,
                 flow_ml,
+                pot_id,
             ),
         )
+
+
+def post_pot(client, body):
+    answer = client.post("/pot", content=body, headers={"X-Token": TOKEN})
+    assert answer.status_code == 200, answer.text
+    return answer.text.split()[0].removeprefix("pot=")
+
+
+def water(client, pot_id, controller, outlet, ml=100):
+    """A manual dose through the real path, then handed out and acked, so
+    the stamp and the sent_ts are the ones production would write."""
+    answer = client.post(
+        "/command",
+        content=f"c={controller} water={outlet} ml={ml}",
+        headers={"X-Token": TOKEN},
+    )
+    assert answer.status_code == 200, answer.text
+    cmd_id = int(answer.text.split()[0].removeprefix("cmd="))
+    report = client.post(
+        "/report", content=f"c={controller} ch0=8000", headers={"X-Token": TOKEN}
+    )
+    assert f"cmd={cmd_id}" in report.text, report.text
+    client.post(
+        "/report",
+        content=f"c={controller} ch0=8000 ack={cmd_id} flow_ml={ml}",
+        headers={"X-Token": TOKEN},
+    )
+    return cmd_id
 
 
 def get(client, **params):
@@ -80,18 +115,18 @@ def test_a_pot_gets_the_doses_it_was_handed_newest_first(client, db):
 
 
 def test_a_remap_takes_the_pots_history_with_it(client, db):
-    """The point of the windows: the dose belongs to whoever held the hose
-    when the board was handed it, not to whoever hangs there now."""
-    now = int(time.time())
-    moved = now - 1000
-    pot(db, "pot-1", "basil", outlet=0, from_ts=0, to_ts=moved)
-    pot(db, "pot-1", "basil", outlet=3, from_ts=moved)
-    pot(db, "pot-2", "mint", outlet=0, from_ts=moved)
-    dose(db, 1, moved - 500, acked_ts=moved - 490)  # basil, on outlet 0
-    dose(db, 2, moved + 500, acked_ts=moved + 510, outlet=3)  # basil, moved
-    dose(db, 3, moved + 600, acked_ts=moved + 610)  # mint, on outlet 0 now
-    assert [r["id"] for r in get(client, pot="pot-1")] == [2, 1]
-    assert [r["id"] for r in get(client, pot="pot-2")] == [3]
+    """A dose belongs to whoever the board was told to water, not to whoever
+    hangs on that hose now. Driven through POST /pot so the remap and the
+    stamps are the real ones, not hand-written windows: with the pot on the
+    row, a fixture that wrote its own windows would prove nothing."""
+    basil = post_pot(client, "name=basil controller=b1 channel=0 outlet=0")
+    water(client, basil, "b1", 0)  # 1: basil, on outlet 0
+    post_pot(client, f"id={basil} outlet=3")  # basil moves hose
+    water(client, basil, "b1", 3)  # 2: basil, moved
+    mint = post_pot(client, "name=mint controller=b1 channel=1 outlet=0")
+    water(client, mint, "b1", 0)  # 3: mint, on outlet 0 now
+    assert [r["id"] for r in get(client, pot=basil)] == [2, 1]
+    assert [r["id"] for r in get(client, pot=mint)] == [3]
 
 
 def test_the_odd_rows_are_listed_not_filtered_out(client, db):
@@ -121,7 +156,7 @@ def test_the_garden_list_keeps_a_dose_nobody_can_be_blamed_for(client, db):
     not vanish just because no window claims it."""
     now = int(time.time())
     pot(db, "pot-1", "basil", outlet=0, from_ts=now - 100)
-    dose(db, 1, now - 500, outlet=7, acked_ts=now - 490)  # a hose no pot held
+    dose(db, 1, now - 500, outlet=7, acked_ts=now - 490, pot_id=None)  # no pot
     dose(db, 2, now - 50, acked_ts=now - 40)
     rows = get(client)
     assert [r["id"] for r in rows] == [2, 1]
@@ -135,6 +170,8 @@ def test_a_dose_never_handed_out_has_no_pot_and_sorts_by_when_it_was_made(client
     now = int(time.time())
     pot(db, "pot-1", "basil")
     dose(db, 1, now - 500, acked_ts=now - 490)
+    # Stamped for basil and never handed out: the stamp says whom it was
+    # made for, and `sent_ts IS NOT NULL` is what makes it not yet a dose.
     dose(db, 2, None, state="queued", created_ts=now - 10)
     rows = get(client)
     assert [r["id"] for r in rows] == [2, 1]
@@ -165,18 +202,18 @@ def test_limit_bounds_the_list_and_the_newest_survive(client, db):
     assert [r["id"] for r in get(client, pot="pot-1", limit=3)] == [7, 6, 5]
 
 
-def test_an_overlapping_window_lists_a_dose_once(client, db):
-    """Two pots on one hose at one instant cannot be reached through the API
-    any more (see test_pots), but if a database ever held it the garden list
-    must not show the dose twice. Note what this does NOT promise: with the
-    windows overlapping, each pot's own list still claims the dose, because
-    each pot's window genuinely covers it. Which is why the fix is upstream,
-    in the mapping write, and not here."""
+def test_two_open_windows_on_one_hose_cannot_split_a_dose(client, db):
+    """This used to need a GROUP BY: two overlapping windows claimed one
+    dose and the garden list showed it twice. A stamped row has exactly one
+    owner, so overlapping windows cannot reach it at all — which is also why
+    the backstop in the mapping write matters more than it did (test_pots)."""
     now = int(time.time())
     pot(db, "pot-1", "basil", outlet=0, from_ts=0)
     pot(db, "pot-2", "mint", outlet=0, from_ts=0)
     dose(db, 1, now - 100, acked_ts=now - 90)
     assert [r["id"] for r in get(client)] == [1]
+    assert [r["id"] for r in get(client, pot="pot-1")] == [1]
+    assert get(client, pot="pot-2") == [], "the window does not make it mint's"
 
 
 def test_a_stop_is_not_a_dose(client, db):
@@ -186,7 +223,8 @@ def test_a_stop_is_not_a_dose(client, db):
     now = int(time.time())
     pot(db, "pot-1", "basil")
     dose(db, 1, now - 100, acked_ts=now - 90)
-    dose(db, 2, now - 50, kind="stop", outlet=None, ml=None, acked_ts=now - 40)
+    dose(db, 2, now - 50, kind="stop", outlet=None, ml=None, acked_ts=now - 40,
+         pot_id=None)
     assert [r["id"] for r in get(client)] == [1]
     assert [r["id"] for r in get(client, pot="pot-1")] == [1]
 

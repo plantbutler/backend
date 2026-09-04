@@ -161,37 +161,49 @@ def plant_dose(
     outlet=3,
     channel=0,
 ):
-    """One executed dose and its readings, timestamps fully controlled."""
+    """One executed dose and its readings, timestamps fully controlled.
+
+    The command carries the stamp production would have written, and the
+    readings carry theirs: both are what the judgement reads."""
     now = int(time.time())
     sent_ts = now - sent_ago
     acked_ts = None if acked_ago is None else now - acked_ago
     with sqlite3.connect(db) as con:
         # A pot is wired before it is watered. make_pot stamps its mapping
         # window milliseconds ago and the dose is planted well in the past,
-        # so the window has to move back with it or the dose belongs to no
-        # pot at all and the judgement has nothing to read.
+        # so the window has to move back with it, or the judgement cannot
+        # find which SENSOR the pot was on when the water went down.
         con.execute(
             "UPDATE pot_mappings SET from_ts = ? WHERE to_ts IS NULL AND from_ts > ?",
             (sent_ts - 10, sent_ts - 10),
         )
+        owner = con.execute(
+            "SELECT pot_id FROM pot_mappings WHERE to_ts IS NULL AND outlet = ?",
+            (outlet,),
+        ).fetchone()
         con.execute(
             "INSERT INTO commands (created_ts, controller, kind, outlet, ml, "
-            "cap_s, state, source, sent_ts, acked_ts, flow_ml) "
-            "VALUES (?, 'b1', 'water', ?, ?, 10, ?, 'rules', ?, ?, ?)",
-            (sent_ts - 5, outlet, ml, state, sent_ts, acked_ts, flow_ml),
+            "cap_s, state, source, sent_ts, acked_ts, flow_ml, pot_id) "
+            "VALUES (?, 'b1', 'water', ?, ?, 10, ?, 'rules', ?, ?, ?, ?)",
+            (sent_ts - 5, outlet, ml, state, sent_ts, acked_ts, flow_ml,
+             owner and owner[0]),
         )
+        stamp = con.execute(
+            "SELECT pot_id FROM pot_mappings WHERE to_ts IS NULL AND channel = ?",
+            (channel,),
+        ).fetchone()
         for i in range(5):  # the window the dose was decided on
             con.execute(
-                "INSERT INTO readings (ts, controller, channel, raw) "
-                "VALUES (?, 'b1', ?, ?)",
-                (sent_ts - 4 + i, channel, before_raw),
+                "INSERT INTO readings (ts, controller, channel, raw, pot_id) "
+                "VALUES (?, 'b1', ?, ?, ?)",
+                (sent_ts - 4 + i, channel, before_raw, stamp and stamp[0]),
             )
         if after_raw is not None and acked_ts is not None:
             for i in range(5):  # what the sensor said once the water soaked
                 con.execute(
-                    "INSERT INTO readings (ts, controller, channel, raw) "
-                    "VALUES (?, 'b1', ?, ?)",
-                    (acked_ts + 60 * (i + 1), channel, after_raw),
+                    "INSERT INTO readings (ts, controller, channel, raw, pot_id) "
+                    "VALUES (?, 'b1', ?, ?, ?)",
+                    (acked_ts + 60 * (i + 1), channel, after_raw, stamp and stamp[0]),
                 )
 
 

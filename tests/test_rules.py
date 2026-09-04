@@ -118,15 +118,99 @@ def test_a_wet_median_holds_even_with_dry_readings_in_it(client, db):
         {"drop": "dose_ml"},
         {"drop": "outlet"},
         {"mode": "manual"},
-        {"enabled": 0},
     ],
 )
-def test_an_uncalibrated_or_manual_or_disabled_pot_never_waters(client, db, kwargs):
+def test_an_uncalibrated_or_manual_pot_never_waters(client, db, kwargs):
     # One variant per fresh database: /pot is a partial upsert, so reusing
     # the pot would quietly merge back the very field the variant drops.
     make_pot(client, **kwargs)
     soak(client, 6)
     assert commands(db) == []
+
+
+def test_a_buried_pot_never_waters(client, db):
+    """Two steps rather than a parametrize case, because burying a pot and
+    wiring it in one body is refused: the graveyard is what unwires it."""
+    pot_id = make_pot(client)
+    answer = client.post(
+        "/pot", content=f"id={pot_id} status=graveyard", headers={"X-Token": TOKEN}
+    )
+    assert answer.status_code == 200, answer.text
+    soak(client, 6)
+    assert commands(db) == []
+
+
+def test_a_new_pot_does_not_inherit_the_dead_ones_dryness(client, db):
+    """The socket has changed hands. The rules read the newest five
+    readings, so a channel-keyed window makes the decision almost entirely
+    on rows taken through a different probe, in a different pot, and reads
+    them through the new pot's calibration. The direction of that error is
+    WET, which is the one direction decision 5 forbids.
+    """
+    old = make_pot(client, name="old", mode="manual")
+    soak(client, 5)  # five bone-dry readings, all `old`'s
+    post(client, "/pot", f"id={old} status=graveyard")
+
+    make_pot(client, name="new")  # same channel and hose, auto, freshly potted
+    report(client, raw=WET)  # soaking: nothing should be watered
+    assert commands(db) == []
+
+
+def test_a_pot_waits_for_its_own_readings_after_a_remap(client, db):
+    """The other half of the same choice. Reading by pot means a pot moved
+    to another socket carries its old rows with it, so the window is bounded
+    by time as well: too few RECENT readings and it waits."""
+    basil = make_pot(client)
+    soak(client, 5)
+    assert len(commands(db)) == 1  # dry and calibrated: it waters
+
+    with sqlite3.connect(db) as con:  # a month goes by, all of it silent
+        con.execute("UPDATE readings SET ts = ts - ?", (30 * 86400,))
+        con.execute("DELETE FROM commands")
+    post(client, "/pot", f"id={basil} channel=1")
+    report(client, extra=f"ch1={DRY}")
+    assert commands(db) == [], "one fresh reading is not a window"
+
+
+def test_a_dose_the_stamp_missed_still_holds_the_cooldown(client, db):
+    """The regression this pair exists for. A manual dose queued before the
+    pot was registered carried no pot stamp; the pot half of the cooldown
+    could not see it, and the hose floor stopped covering it the moment the
+    pot was rewired — so BOTH layers of decision 7 went at once and the
+    plant was watered twice within minutes.
+
+    The stamp is re-read when the board is handed the command, so the row
+    records who actually got the water.
+    """
+    post(client, "/command", "c=b1 water=3 ml=100")  # nothing is on outlet 3 yet
+    basil = make_pot(client)  # ...and now something is
+    assert "cmd=1" in report(client).text, "handed out"
+    post(client, "/report", "c=b1 ch0=8000 ack=1 flow_ml=100")
+
+    with sqlite3.connect(db) as con:
+        (stamp,) = con.execute("SELECT pot_id FROM commands WHERE id = 1").fetchone()
+    assert stamp == basil, "the pot that actually got the water"
+
+    post(client, "/pot", f"id={basil} outlet=5")  # the hose floor stops covering it
+    soak_both(client, 6)
+    assert [c[0] for c in commands(db)] == [1], "no second dose inside the cooldown"
+
+
+def test_a_dose_is_recorded_against_the_pot_that_received_it(client, db):
+    """A hose rearranged while a command waited used to file the water under
+    the pot that no longer holds that outlet — so the verdict trained the
+    learning log against the wrong soil, and the judgement read a sensor
+    that got no water and paged that the dose had failed."""
+    basil = make_pot(client, mode="manual")
+    post(client, "/command", "c=b1 water=3 ml=100")
+    post(client, "/pot", f"id={basil} outlet=5")
+    mint = make_pot(client, name="mint", channel=1, outlet=3, mode="manual")
+    report(client, extra=f"ch1={DRY}")
+
+    with sqlite3.connect(db) as con:
+        (stamp,) = con.execute("SELECT pot_id FROM commands WHERE id = 1").fetchone()
+    assert stamp == mint, "the water went down outlet 3, and mint is on it"
+    assert stamp != basil
 
 
 # --------------------------------------------------------------------------- #

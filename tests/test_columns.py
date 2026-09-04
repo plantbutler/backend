@@ -83,16 +83,21 @@ def columns(path, table):
 
 def test_the_columns_arrive_and_the_old_ones_stay(old):
     con = sqlite3.connect(old)
+    # `readings` and `commands` are not in this fixture at all, and
+    # add_columns skips a table it cannot find without claiming it did
+    # anything — which is why only the pots and species_names entries show.
     assert add_columns(con) == [
         "pots.plant_height_cm",
         "pots.pot_diameter_cm",
         "species_names.family",
+        "pots.status",
     ]
     con.close()
     # Additive means additive: nothing is dropped, so a rollback to the
     # previous container still reads every pot it wrote.
     assert "plant_size" in columns(old, "pots")
     assert "pot_size" in columns(old, "pots")
+    assert "enabled" in columns(old, "pots")
 
 
 def test_a_measurement_carries_over_and_a_word_does_not(old):
@@ -149,8 +154,18 @@ def test_the_cached_names_gain_a_family_they_can_be_refilled_with(old):
         "SELECT family FROM species_names WHERE query = 'ocimum basilicum'"
     ).fetchone()
     con.close()
-    # A row cached before the column existed has no family, and a cache hit
-    # never re-asks — so an old row suggests no plant kind until it is
-    # evicted. Nobody's band moves because of it; the dropdown just opens
-    # empty, which is what it did yesterday.
+    # The ALTER cannot invent what GBIF was never asked for, so the carried
+    # row starts empty. What stops it staying empty for ever is taxon_for:
+    # a row that resolved a name but carries no family counts as stale
+    # rather than as a hit, so the next lookup re-asks and fills it in.
+    # (That half is tested in test_species; here the point is only that the
+    # column arrives NULL rather than wrong.)
     assert family is None
+
+
+def test_the_pots_carried_over_are_alive(old):
+    """The switch became a word, and the fixture's pots were all enabled."""
+    client = TestClient(create_app(db_path=str(old), token=TOKEN))
+    answer = client.get("/pots")
+    assert answer.status_code == 200, answer.text
+    assert {p["status"] for p in answer.json()["pots"]} == {"alive"}

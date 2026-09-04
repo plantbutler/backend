@@ -15,10 +15,18 @@ CREATE TABLE IF NOT EXISTS readings (
   controller TEXT    NOT NULL,  -- c= in the report
   channel    INTEGER NOT NULL,  -- chN key
   raw        INTEGER NOT NULL,  -- the count, uninterpreted
-  t          INTEGER            -- board uptime ms (t=), NULL when not sent.
+  t          INTEGER,           -- board uptime ms (t=), NULL when not sent.
                                 -- Deliberately NOT unique: uptime restarts on
                                 -- reboot, so values recur; retry dedup is a
                                 -- time-windowed check in the app instead.
+  pot_id     TEXT               -- whose reading it is, stamped as the row
+                                -- lands from the pot_mappings window then in
+                                -- force. NULL when nothing was mapped there
+                                -- (an environment channel, or a socket
+                                -- nobody has claimed). Never recomputed: the
+                                -- board sends a channel, and which plant sat
+                                -- on it at 04:00 is not a fact the board can
+                                -- be asked about later.
 );
 
 CREATE INDEX IF NOT EXISTS readings_by_channel
@@ -27,13 +35,28 @@ CREATE INDEX IF NOT EXISTS readings_by_channel
 CREATE INDEX IF NOT EXISTS readings_by_uptime
   ON readings (controller, t, ts);
 
+-- The chart and the hard delete both read by pot. Without this they scan the
+-- one table that grows without bound, on a NAS, and they degrade slowly
+-- enough that no test would ever notice.
+CREATE INDEX IF NOT EXISTS readings_by_pot
+  ON readings (pot_id, ts);
+
 -- Command hand-off (cycle 1 stretch). One slot per controller, not a job
 -- system: queued -> sent (handed once, in a report response) -> acked, or
 -- expired (no ack on the next report, or nobody collected it in time).
--- The command log doubles as the watering history, so rows are never deleted.
+-- The command log doubles as the watering history, so rows are never pruned.
+-- The one exception is a pot the owner has erased: POST /pot/delete removes
+-- its commands with everything else of its. See DECISIONS.md.
 
+-- AUTOINCREMENT, and it earns its keep: without it `id` is a rowid alias
+-- and sqlite hands a deleted command's id straight back out. POST /pot/delete
+-- makes that reachable, and a recycled id inherits the erased pot's verdict
+-- and its `dose:<id>` judgement ledger row — so a stranger's verdict labels a
+-- new dose, and a real dose is never judged at all. The delete removes both
+-- of those anyway; this is the belt to that pair of braces, and the only one
+-- of the two a race with the alert ticker cannot get past.
 CREATE TABLE IF NOT EXISTS commands (
-  id         INTEGER PRIMARY KEY,
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
   created_ts INTEGER NOT NULL,
   controller TEXT    NOT NULL,
   kind       TEXT    NOT NULL,  -- 'water' | 'stop'
@@ -44,11 +67,18 @@ CREATE TABLE IF NOT EXISTS commands (
   source     TEXT    NOT NULL,  -- who queued it ('manual' until rules exist)
   sent_ts    INTEGER,
   acked_ts   INTEGER,
-  flow_ml    INTEGER            -- what the board says actually flowed
+  flow_ml    INTEGER,           -- what the board says actually flowed
+  pot_id     TEXT               -- whom the dose was made for, stamped when
+                                -- the row is written. NULL for a stop, and
+                                -- for a hose no pot was on. The board is
+                                -- still handed an outlet, not a pot.
 );
 
 CREATE INDEX IF NOT EXISTS commands_open
   ON commands (controller, state);
+
+CREATE INDEX IF NOT EXISTS commands_by_pot
+  ON commands (pot_id, sent_ts);
 
 -- One row per controller that has ever reported or been configured:
 -- heartbeat (last_seen) and the per-controller report interval override
@@ -79,7 +109,7 @@ CREATE TABLE IF NOT EXISTS pots (
   plant_type      TEXT,     -- one of butler.PLANT_KINDS, or NULL for "not sure"
   plant_height_cm REAL,     -- measurements, not adjectives: the band engine
   pot_diameter_cm REAL,     -- reads them as numbers (butler.size_shifts)
-  soil            TEXT,
+  soil            TEXT,     -- one of butler.SOIL_SHIFTS, or NULL for "not said"
   dry_raw         INTEGER,  -- calibration: raw count bone dry
   wet_raw         INTEGER,  -- calibration: raw count soaked
   target_low_pct  INTEGER,  -- the ideal moisture range
@@ -88,7 +118,7 @@ CREATE TABLE IF NOT EXISTS pots (
   mode            TEXT    NOT NULL DEFAULT 'manual',  -- manual|learning|auto
   cooldown_h      INTEGER,
   daily_cap_ml    INTEGER,
-  enabled         INTEGER NOT NULL DEFAULT 1
+  status          TEXT    NOT NULL DEFAULT 'alive'  -- one of butler.POT_STATUSES
 );
 
 -- Where a pot was wired, and when. Exactly one open row per pot (to_ts IS
@@ -128,7 +158,7 @@ SELECT p.id, p.name, p.species,
        m.controller, m.channel, m.outlet,
        p.plant_type, p.plant_height_cm, p.pot_diameter_cm, p.soil,
        p.dry_raw, p.wet_raw, p.target_low_pct, p.target_high_pct,
-       p.dose_ml, p.mode, p.cooldown_h, p.daily_cap_ml, p.enabled
+       p.dose_ml, p.mode, p.cooldown_h, p.daily_cap_ml, p.status
   FROM pots p
   LEFT JOIN pot_mappings m ON m.pot_id = p.id AND m.to_ts IS NULL;
 

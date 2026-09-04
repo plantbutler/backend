@@ -92,7 +92,7 @@ from starlette.requests import ClientDisconnect
 # metadata because the container installs no package — it copies butler.py
 # beside fastapi and runs it. A test asserts this and pyproject.toml agree,
 # which is the only thing that keeps the two honest.
-VERSION = "0.15.0"
+VERSION = "0.16.0"
 
 BODY_CAP = 4096  # a full 15-channel report is ~200 bytes; 4 KB is generous
 # Photographs are the first thing here that is not small. The phone caps the
@@ -257,10 +257,26 @@ def _pots_ddl() -> list[str]:
 # Columns schema.sql grew after its CREATE had already run somewhere, with
 # the old column each one carries its value over from (None: nothing to
 # carry). Append-only, like the schema itself.
+# The converters are lambdas because cm_from_text is defined further down
+# and this tuple is built at import.
 ADDED_COLUMNS = (
-    ("pots", "plant_height_cm", "REAL", "plant_size"),
-    ("pots", "pot_diameter_cm", "REAL", "pot_size"),
-    ("species_names", "family", "TEXT", None),
+    ("pots", "plant_height_cm", "REAL", "plant_size", lambda v: cm_from_text(v)),
+    ("pots", "pot_diameter_cm", "REAL", "pot_size", lambda v: cm_from_text(v)),
+    ("species_names", "family", "TEXT", None, None),
+    # The switch became a word. The carry sets the value and cannot repair
+    # the wiring: a pot carried over as `graveyard` keeps its open mapping
+    # window, where a graveyarding through POST /pot would have closed it.
+    # Unreachable in production — the database this ships with is new — and
+    # untrue of every pot in the test fixture, which are all enabled.
+    (
+        "pots",
+        "status",
+        "TEXT NOT NULL DEFAULT 'alive'",
+        "enabled",
+        lambda flag: "alive" if flag else "graveyard",
+    ),
+    ("readings", "pot_id", "TEXT", None, None),
+    ("commands", "pot_id", "TEXT", None, None),
 )
 
 
@@ -280,11 +296,12 @@ def add_columns(con: sqlite3.Connection) -> list[str]:
 
     The carry-over is best-effort by design: `pot_size` held "14cm", "10"
     and "small", and only two of those are a measurement. A word is dropped
-    rather than invented into centimetres.
+    rather than invented into centimetres, and a converter that answers None
+    leaves the new column NULL.
     """
     added = []
     with con:
-        for table, column, kind, source in ADDED_COLUMNS:
+        for table, column, kind, source, convert in ADDED_COLUMNS:
             cols = [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
             if not cols or column in cols:
                 continue  # no such table here yet, or nothing to do
@@ -295,7 +312,7 @@ def add_columns(con: sqlite3.Connection) -> list[str]:
             for rowid, text in con.execute(
                 f"SELECT rowid, {source} FROM {table} WHERE {source} IS NOT NULL"
             ).fetchall():
-                value = cm_from_text(text)
+                value = convert(text)
                 if value is not None:
                     con.execute(
                         f"UPDATE {table} SET {column} = ? WHERE rowid = ?",
@@ -390,6 +407,9 @@ def migrate(con: sqlite3.Connection, db_path: str) -> bool:
             # cannot disagree.
             old["plant_height_cm"] = cm_from_text(old.pop("plant_size"))
             old["pot_diameter_cm"] = cm_from_text(old.pop("pot_size"))
+            # The switch became a word here too, for the same reason and by
+            # the same rule: the rebuild writes the columns pots has NOW.
+            old["status"] = "alive" if old.pop("enabled") else "graveyard"
             pot_id = new_pot_id()
             keys = [k for k in old if k not in ("controller", "channel", "outlet")]
             con.execute(
@@ -694,8 +714,8 @@ def parse_doses(params: QueryParams) -> tuple[str | None, int, int | None, int]:
     return pot, limit, before, before_id
 
 
-def parse_history(params: QueryParams) -> tuple[str, int, int, int]:
-    """`GET /history?c=<controller>&ch=<channel>&hours=<1..168>&bucket_s=<60..3600>`.
+def parse_history(params: QueryParams) -> tuple[str, int, int]:
+    """`GET /history?pot=<pot id>&hours=<1..168>&bucket_s=<60..3600>`.
 
     Query parameters instead of a body because it is a read; the same
     ASCII-digit strictness and the same "given twice" refusal as every k=v
@@ -709,20 +729,16 @@ def parse_history(params: QueryParams) -> tuple[str, int, int, int]:
             raise ValueError(f"{key}= given twice")
         return values[0] if values else default
 
-    controller = one("c")
-    if not controller:
-        raise ValueError("no c= in the request")
-    ch = one("ch")
-    if ch is None:
-        raise ValueError("no ch= in the request")
-    channel = _int_in(ch, "ch", 0, MAX_CHANNEL + 1)
+    pot = one("pot")
+    if not pot:
+        raise ValueError("no pot= in the request")
     hours = _int_in(one("hours", "24") or "", "hours", 1, HISTORY_MAX_HOURS + 1)
     bucket_s = _int_in(one("bucket_s", "300") or "", "bucket_s", 60, 3601)
     if hours * 3600 // bucket_s > HISTORY_MAX_BUCKETS:
         raise ValueError(
             f"too many buckets: {hours} h at {bucket_s} s is over {HISTORY_MAX_BUCKETS}"
         )
-    return controller, channel, hours, bucket_s
+    return pot, hours, bucket_s
 
 
 POT_INT_FIELDS = {  # half-open bounds, like every other field
@@ -735,15 +751,34 @@ POT_INT_FIELDS = {  # half-open bounds, like every other field
     "dose_ml": (1, MAX_DOSE_ML + 1),
     "cooldown_h": (0, 8761),  # a year of cooldown is already a config error
     "daily_cap_ml": (0, 100_001),
-    "enabled": (0, 2),
 }
-POT_TEXT_FIELDS = ("soil", "species")  # the two still typed rather than picked
+POT_TEXT_FIELDS = ("species",)  # the one still typed rather than picked
 POT_CM_FIELDS = {  # centimetres, and a plausible ceiling for each
     "pot_diameter_cm": 200.0,  # across the rim: a half-barrel and no further
     "plant_height_cm": 1000.0,  # a 10 m tree is not in a pot on the balcony
 }
 POT_MAP_FIELDS = ("controller", "channel", "outlet")  # pot_mappings, not pots
 POT_MODES = ("manual", "learning", "auto")
+# What a pot IS, where `enabled` was what it was allowed to do. A closed set,
+# and shaped so a third word (paused-but-wired, say) is one entry here plus
+# one label in the app.
+POT_STATUSES = ("alive", "graveyard")
+# A positive allow-list, never `!= 'graveyard'`. A status this build has not
+# heard of — a newer backend's word reaching an older reader — must not
+# water, propose or page. Failure direction is dry (DECISIONS #5).
+LIVE_STATUSES = ("alive",)
+
+
+def waters(status: str | None) -> bool:
+    """Whether a pot in this state may be watered, proposed for or alarmed
+    about. The Python half of the allow-list; live_sql() is the SQL half."""
+    return status in LIVE_STATUSES
+
+
+def live_sql(col: str = "status") -> str:
+    """The same allow-list as a SQL predicate. One source, so a fourth
+    status cannot be admitted by one reader and refused by another."""
+    return f"{col} IN (" + ", ".join(f"'{s}'" for s in LIVE_STATUSES) + ")"
 LAST_DOSE_KEYS = (
     "id",
     "ml",
@@ -791,37 +826,8 @@ POT_COLUMNS = (  # the pots_now view's shape: pot columns plus the open mapping
     "mode",
     "cooldown_h",
     "daily_cap_ml",
-    "enabled",
+    "status",
 )
-
-
-def _handed_to_pot(ends: str) -> str:
-    """A FROM clause taking one parameter, the pot id: the commands this pot
-    was actually given.
-
-    A command names a hose, not a pot, so what makes it this pot's is that
-    this pot held that hose when the board was handed it — which is what
-    pot_mappings records. A closed window keeps its doses, so moving a hose
-    takes the pot's history with it instead of leaving it for whoever
-    arrives on that hose next. Only handed commands can match: an unsent
-    one has a NULL sent_ts, and NULL >= from_ts is never true.
-    """
-    return (
-        "commands c JOIN pot_mappings m "
-        "ON m.controller = c.controller AND m.outlet = c.outlet AND m.pot_id = ? "
-        f"AND c.sent_ts >= m.from_ts AND (m.to_ts IS NULL OR c.sent_ts {ends} m.to_ts)"
-    )
-
-
-# Timestamps are whole seconds, so a dose handed in the very second a hose
-# was remapped is genuinely ambiguous, and the two readers want opposite
-# answers to it. For the record — whose dose was that, what is this verdict
-# about — exactly one pot must own it, and the window is half-open: it goes
-# to the pot that arrived. For the gates, both pots hold the cooldown and
-# spend the cap, because two pots waiting a turn they need not wait errs
-# dry, while neither of them waiting waters one of them twice.
-HANDED_TO_POT = _handed_to_pot("<")
-WATERED_THE_POT = _handed_to_pot("<=")
 
 
 def window_edge(con: sqlite3.Connection, pot_id: str, now: int) -> int:
@@ -903,6 +909,8 @@ def parse_pot(text: str) -> dict:
         "name",
         "mode",
         "plant_type",
+        "soil",
+        "status",
         "controller",
         *POT_TEXT_FIELDS,
         *POT_CM_FIELDS,
@@ -938,10 +946,28 @@ def parse_pot(text: str) -> dict:
                     f"plant_type= must be one of {'|'.join(PLANT_KINDS)}"
                 )
             fields[key] = value
+        elif key == "soil":
+            # Closed on the way in for the same reason as plant_type, and
+            # tolerant on the way out for the same reason: a row still
+            # holding free text from before this set reads fine and simply
+            # matches no shift.
+            if value not in SOIL_SHIFTS:
+                raise ValueError(f"soil= must be one of {'|'.join(SOIL_SHIFTS)}")
+            fields[key] = value
+        elif key == "status":
+            if value not in POT_STATUSES:
+                raise ValueError(f"status= must be one of {'|'.join(POT_STATUSES)}")
+            fields[key] = value
         else:
             fields[key] = value
     if "id" not in fields and "name" not in fields:
         raise ValueError("no id= or name= in the request")
+    if fields.get("status") == "graveyard" and any(k in fields for k in POT_MAP_FIELDS):
+        # Graveyarding is what UNWIRES a pot, so a body that does both at
+        # once is asking for two opposite things. Asked of the request, not
+        # of the merged row: graveyarding a pot that is wired right now is
+        # the whole point and must go through.
+        raise ValueError("a graveyard pot holds no wiring: send status=graveyard alone")
     return fields
 
 
@@ -1106,6 +1132,30 @@ def parse_photo_delete(text: str) -> str:
     return photo_id
 
 
+def parse_pot_delete(text: str) -> str:
+    """The `POST /pot/delete` body: `id=<pot id>`.
+
+    Its own route rather than a field on /pot, for the same reason and a
+    louder one: a save that lost its body must never become an erasure.
+    SAFE_ID is not decoration here — the delete turns this id into the
+    directory `photos/<pot id>/` and removes it.
+    """
+    fields: dict = {}
+    for token in text.split():
+        key, sep, value = token.partition("=")
+        if not sep or not key:
+            raise ValueError(f"not a k=v token: {token!r}")
+        if key in fields:
+            raise ValueError(f"{key}= given twice")
+        fields[key] = value
+    pot_id = fields.get("id")
+    if not pot_id:
+        raise ValueError("no id= in the request")
+    if not SAFE_ID.fullmatch(pot_id):
+        raise ValueError(f"not a pot id: {pot_id!r}")
+    return pot_id
+
+
 def parse_quiet(text: str) -> tuple[int, int]:
     """BUTLER_QUIET, `HH-HH` in the server's local time; `0-0` disables.
 
@@ -1148,7 +1198,8 @@ def in_quiet(hour: int, start: int, end: int) -> bool:
 GBIF_MATCH_URL = "https://api.gbif.org/v1/species/match"
 TREFLE_BASE = "https://trefle.io/api/v1"
 CARE_TIMEOUT_S = 6  # three hops worst case, so a lookup answers inside ~20 s
-CARE_MISS_TTL_S = 30 * 86400  # a hit is kept forever; a miss is re-asked monthly
+CARE_MISS_TTL_S = 30 * 86400  # a complete hit is kept forever; anything else
+#                               is re-asked monthly (see taxon_for)
 SPECIES_MAX = 120  # longer than any binomial; bounds what goes on the wire
 CARE_BODY_CAP = 1 << 20  # a species page is ~40 KB; never read a stream
 
@@ -1369,24 +1420,48 @@ BAND_FLOOR, BAND_CEIL, BAND_MIN_WIDTH = 5, 95, 10
 # typo here is a 20-point error that no pot measurement recovers. Reading
 # stays tolerant — a value written before this set existed simply matches
 # nothing and falls to the base band — but writing one is refused.
+# Insertion order is the dropdown's order and the refusal message's order:
+# driest first, so the list reads as the one axis it actually is.
 PLANT_KINDS = {
-    # Cacti live here too. Same water, and two identical choices in a list
-    # only make the list harder to pick from.
+    # A cactus is drier than the succulents it used to share a row with.
+    # They were one entry while the field was free text and six words wide;
+    # a dropdown can afford to tell them apart, and 5 points is the
+    # difference between a barrel cactus and an echeveria.
+    "cactus": (10, 25),
     "succulent": (15, 30),
-    "fern": (55, 75),
+    # An epiphyte in bark is not potted in anything that holds water. The
+    # band is low because the medium is, not because the plant likes drought.
+    "orchid": (20, 35),
+    "mediterranean": (25, 45),  # rosemary, lavender, olive: woody and dry
+    "bulb": (30, 50),  # rots wet, and dormant for half the year
+    "flower": (35, 50),
     "herb": (35, 55),
+    "palm": (40, 55),
+    "tropical": (40, 60),  # the leafy houseplants: aroids, marantas, figs
     "vegetable": (45, 65),
-    "tropical": (40, 60),  # the leafy houseplants: aroids, palms, marantas
-    "flower": (40, 60),
+    "fern": (55, 75),
+    "carnivorous": (70, 90),  # a bog plant: the one kind that wants it wet
 }
 
-SOIL_SHIFTS = (  # what the soil does to both ends
-    ("cactus", (-5, -5)),  # a gritty mix drains before the sensor notices
-    ("sand", (-5, -5)),
-    ("grit", (-5, -5)),
-    ("perlite", (-5, -5)),
-    ("clay", (0, -5)),  # holds water: the risk is the top of the band
-)
+# The soils that MOVE the band, and the phrase each one contributes to the
+# reason. An ordinary potting mix is not here on purpose: it is the
+# reference the plant bands are written against, so "not said" and "the bag
+# from the shop" are the same answer and the list stays a list of movers.
+#
+# Every ceiling shift is <= 0, and that is an invariant rather than a
+# coincidence. The band is only ever widened DOWNWARDS (see the squeeze at
+# the end of target_band): a soil that raised the ceiling above the plant's
+# own base would offer a wetter top than the kind allows, and contradict the
+# reason printed beside it.
+SOIL_SHIFTS = {
+    "sphagnum": (10, 0, "sphagnum moss"),  # stays wet by design
+    "peat": (5, 0, "peat soil"),  # what most nursery pots arrive in
+    "clay": (0, -5, "clay soil"),  # holds water: the risk is the top
+    "sandy": (-5, -5, "sandy soil"),  # drains before the sensor notices
+    "perlite": (-5, -5, "perlite mix"),
+    "cactus": (-8, -5, "cactus mix"),  # gritty, and meant to run dry
+    "bark": (-10, -5, "bark mix"),  # orchid bark barely holds water at all
+}
 
 # Guessing the plant kind from the taxonomy GBIF hands back anyway, so the
 # dropdown opens pre-selected. It is a guess and is treated as one: it fills
@@ -1397,7 +1472,12 @@ SOIL_SHIFTS = (  # what the soil does to both ends
 # Genus is asked before family, because family is wrong exactly where it
 # matters most: Asparagaceae holds Dracaena fragrans, a leafy thing that
 # wants watering, and Dracaena trifasciata, a succulent in all but name.
-SPECIES_KINDS = {"dracaena trifasciata": "succulent"}
+SPECIES_KINDS = {
+    "dracaena trifasciata": "succulent",
+    # Lamiaceae would call it a herb; it is a woody Mediterranean shrub and
+    # wants a good deal less water than basil.
+    "salvia rosmarinus": "mediterranean",
+}
 GENUS_KINDS = {
     "aloe": "succulent",
     "haworthia": "succulent",
@@ -1409,13 +1489,16 @@ GENUS_KINDS = {
     "zamioculcas": "succulent",
     "sansevieria": "succulent",  # the name half the world still uses
     "peperomia": "succulent",  # thick leaves; Piperaceae is otherwise vines
+    "schlumbergera": "tropical",  # a cactus that lives on a branch, not sand
+    "citrus": "mediterranean",
+    "lavandula": "mediterranean",
 }
-# Lowercased, because GBIF's case is not a promise. Orchidaceae is left out
-# deliberately: an epiphyte on bark waters nothing like a flowering pot
-# plant, and falling through to "not sure" is better than 20 confident
-# points in the wrong direction.
+# Lowercased, because GBIF's case is not a promise. Orchidaceae used to be
+# left out deliberately — an epiphyte on bark waters nothing like a flowering
+# pot plant, and "not sure" beat 20 confident points in the wrong direction.
+# There is an `orchid` band now, so it can be answered instead of dodged.
 FAMILY_KINDS = {
-    "cactaceae": "succulent",
+    "cactaceae": "cactus",
     "crassulaceae": "succulent",
     "aizoaceae": "succulent",
     "asphodelaceae": "succulent",
@@ -1434,7 +1517,7 @@ FAMILY_KINDS = {
     "amaranthaceae": "vegetable",
     "araceae": "tropical",  # monstera, philodendron, pothos, peace lily
     "marantaceae": "tropical",
-    "arecaceae": "tropical",
+    "arecaceae": "palm",
     "musaceae": "tropical",
     "strelitziaceae": "tropical",
     "bromeliaceae": "tropical",
@@ -1446,6 +1529,17 @@ FAMILY_KINDS = {
     "rosaceae": "flower",
     "begoniaceae": "flower",
     "violaceae": "flower",
+    "orchidaceae": "orchid",
+    "droseraceae": "carnivorous",
+    "nepenthaceae": "carnivorous",
+    "sarraceniaceae": "carnivorous",
+    "cephalotaceae": "carnivorous",
+    "amaryllidaceae": "bulb",
+    "iridaceae": "bulb",
+    "liliaceae": "bulb",
+    "oleaceae": "mediterranean",
+    "cistaceae": "mediterranean",
+    "rutaceae": "mediterranean",  # the citruses
 }
 
 
@@ -1478,7 +1572,7 @@ HEIGHT_REF_RATIO = 1.5  # a 21 cm plant in a 14 cm pot: neither tall nor short
 BAND_PER_DOUBLING = 2.5  # percentage points per doubling
 # Three doublings of volume is twice the diameter, so a pot of 28 cm or
 # more moves the band as far as this model will take it. That is not a claim
-# that 28 cm and 60 cm want the same water — it is where a table of six
+# that 28 cm and 60 cm want the same water — it is where a table of a dozen
 # plant kinds stops being worth extrapolating, and a bounded wrong answer
 # beats an unbounded one.
 POT_DOUBLINGS_CAP = 3.0  # +-7.5 points
@@ -1496,37 +1590,6 @@ class Band(NamedTuple):
     low: int
     high: int
     why: str
-
-
-WHY_MAX = 24  # these fields are free text; a reason is a phrase, not an essay
-NEGATIONS = ("not", "no", "non", "without", "never")
-
-
-def _find(text: str | None, table) -> tuple[str, tuple[int, int]] | None:
-    """The first table entry that matches `text`, with the phrase to say so.
-
-    Soil is the last of these fields still typed rather than picked, so all
-    three rules stay, and each of them was a wrong answer free text produced.
-    A keyword counts only at the START of a word — the rule that kept a
-    cauliflower from being a flower back when the plant kind was typed too,
-    and that keeps "gritty" matching "grit" without "integrity" doing so. A
-    keyword directly after a negation does not count, because "not sandy" is
-    not sandy, and falling through to no modifier at all is the right answer
-    there rather than the opposite one. And the reason is given in the user's
-    own words when they are short enough to read ("sandy loam soil", not
-    "sand soil"), else in the keyword that actually matched, since half a
-    sentence cut mid-word explains nothing.
-    """
-    whole = normalise_species(text or "")
-    words = whole.split()
-    for word, value in table:
-        for i, seen in enumerate(words):
-            if not seen.startswith(word):
-                continue
-            if i and words[i - 1] in NEGATIONS:
-                continue
-            return (whole if len(whole) <= WHY_MAX else word), value
-    return None
 
 
 def _doublings(ratio: float, cap: float) -> float:
@@ -1600,12 +1663,10 @@ def target_band(
     # are three points that vanish one at a time.
     low, high = float(base[0]), float(base[1])
     why = [plant_type if plant_type in PLANT_KINDS else "unlabelled plant"]
-    hit = _find(soil, SOIL_SHIFTS)
-    if hit:
-        low, high = low + hit[1][0], high + hit[1][1]
-        # "sandy loam soil", not "sandy loam soil soil": the label is only
-        # there to say which field a bare word like "clay" came from.
-        why.append(hit[0] if "soil" in hit[0] else f"{hit[0]} soil")
+    shift = SOIL_SHIFTS.get(soil or "")
+    if shift:
+        low, high = low + shift[0], high + shift[1]
+        why.append(shift[2])
     size_low, size_high, size_why = size_shifts(diameter_cm, height_cm)
     low, high = low + size_low, high + size_high
     why.extend(size_why)
@@ -1936,13 +1997,24 @@ def create_app(
                 "FROM species_names WHERE query = ?",
                 (query,),
             ).fetchone()
-        if row and (row[0] is not None or now - row[3] < CARE_MISS_TTL_S):
+        # A hit is kept for ever only when it is COMPLETE. A row that
+        # resolved a name but carries no family is a row that can suggest no
+        # plant kind, and a cache hit never re-asks — so without this it
+        # would suggest nothing for the life of the database. Rows written
+        # before `family` existed are the loud case; a genus-level answer is
+        # the ordinary one. Re-asking is TTL-gated, so a name GBIF really has
+        # no family for costs one call a month, not one per screen open.
+        fresh = row and now - row[3] < CARE_MISS_TTL_S
+        complete = row and row[0] is not None and row[4] is not None
+        if row and (complete or fresh):
             return Taxon(row[0], row[1], row[2], row[4])
         payload = get_json(
             f"{GBIF_MATCH_URL}?{urlencode({'name': binomial_case(query)})}"
         )
         if payload is None:
-            return None
+            # A re-ask that cannot reach GBIF must not turn a name that
+            # resolved yesterday into "the lookup is not answering".
+            return Taxon(row[0], row[1], row[2], row[4]) if row and row[0] else None
         taxon = read_gbif(payload)
         with connect() as con:
             con.execute(
@@ -2120,7 +2192,7 @@ def create_app(
         person has already refused this exact offer. A different offer — a
         new season, a repot, another soil — is a new question and is asked.
         """
-        if not entry["enabled"]:
+        if not waters(entry["status"]):
             return None
         band = target_band(
             entry["plant_type"],
@@ -2144,7 +2216,7 @@ def create_app(
         with connect() as con:
             row = con.execute(
                 "SELECT id, plant_type, soil, pot_diameter_cm, plant_height_cm, "
-                "target_low_pct, target_high_pct, enabled FROM pots_now WHERE id = ?",
+                "target_low_pct, target_high_pct FROM pots_now WHERE id = ?",
                 (pot_id,),
             ).fetchone()
             if row is None:
@@ -2172,12 +2244,18 @@ def create_app(
         )
         if r.float_ok != 1 or r.pos != "ok":
             return  # no reservoir, no known position, no report field: dry
+        # This board's own beat, so "recent" below means the same number of
+        # reports whether it speaks every minute or every hour.
+        beat = con.execute(
+            "SELECT next_s FROM controllers WHERE controller = ?", (r.controller,)
+        ).fetchone()
+        cadence = (beat and beat[0]) or interval
         if in_quiet(time.localtime(now).tm_hour, *quiet_window):
             return
         candidates = con.execute(
             "SELECT id, channel, outlet, dry_raw, wet_raw, target_low_pct, "
             "dose_ml, mode, cooldown_h, daily_cap_ml FROM pots_now "
-            "WHERE enabled = 1 AND mode IN ('learning', 'auto') "
+            f"WHERE {live_sql()} AND mode IN ('learning', 'auto') "
             "AND controller = ? AND channel IS NOT NULL AND outlet IS NOT NULL "
             "AND dry_raw IS NOT NULL AND wet_raw IS NOT NULL "
             "AND target_low_pct IS NOT NULL AND dose_ml IS NOT NULL "
@@ -2201,13 +2279,23 @@ def create_app(
                 # float=: without it the window would freeze on stale values
                 # and water the pot at cooldown pace forever.
                 continue
+            # THIS pot's readings, not this channel's. A socket that has
+            # just changed hands still holds the last plant's rows, and four
+            # of a dead plant's drought readings under one fresh one make a
+            # median that opens a valve on a pot nobody has measured.
+            #
+            # And only recent ones, which the channel key gave for free and
+            # the pot key does not: a pot rewired after a month would
+            # otherwise decide on four month-old rows plus today's. Fewer
+            # than RULES_WINDOW inside the window means it waits — dry.
+            fresh = now - RULES_WINDOW * 3 * cadence
             window = [
                 raw
                 for (raw,) in con.execute(
                     "SELECT raw FROM readings "
-                    "WHERE controller = ? AND channel = ? "
+                    "WHERE pot_id = ? AND ts >= ? "
                     "ORDER BY ts DESC, rowid DESC LIMIT ?",
-                    (r.controller, channel, RULES_WINDOW),
+                    (pot_id, fresh, RULES_WINDOW),
                 )
             ]
             if len(window) < RULES_WINDOW:
@@ -2235,8 +2323,8 @@ def create_app(
             # the plant, and a remap that reset them would water it twice.
             cooldown_s = (cool_h if cool_h is not None else DEFAULT_COOLDOWN_H) * 3600
             watered = con.execute(
-                f"SELECT 1 FROM {WATERED_THE_POT} "
-                "WHERE COALESCE(c.acked_ts, c.sent_ts) > ? LIMIT 1",
+                "SELECT 1 FROM commands WHERE pot_id = ? AND sent_ts IS NOT NULL "
+                "AND COALESCE(acked_ts, sent_ts) > ? LIMIT 1",
                 (pot_id, now - cooldown_s),
             ).fetchone() or con.execute(
                 # ...and the hose underneath it. Attribution is a lookup and
@@ -2254,15 +2342,13 @@ def create_app(
             if watered:
                 continue
             cap = cap_ml if cap_ml is not None else DEFAULT_DAILY_CAP_DOSES * dose
-            # DISTINCT because a dose handed in the very second of a remap
-            # sits in the window that closed and the one that opened, and
-            # when the remap left the hose alone both of them are this
-            # pot's: the cooldown above only asks whether a row exists, but
-            # a SUM would spend one dose's millilitres twice.
+            # One row, one owner, one SUM. This used to need a DISTINCT over
+            # a join, because a dose handed in the very second of a remap sat
+            # in both the window that closed and the one that opened; a
+            # stamped row cannot be in two windows at once.
             (spent,) = con.execute(
-                "SELECT COALESCE(SUM(spent), 0) FROM ("
-                "SELECT DISTINCT c.id, COALESCE(c.flow_ml, c.ml) AS spent "
-                f"FROM {WATERED_THE_POT} WHERE c.sent_ts > ?)",
+                "SELECT COALESCE(SUM(COALESCE(flow_ml, ml)), 0) FROM commands "
+                "WHERE pot_id = ? AND sent_ts > ?",
                 (pot_id, now - 86400),
             ).fetchone()
             # The same floor as the cooldown's, for the same reason: what
@@ -2289,10 +2375,10 @@ def create_app(
                 state = "queued"
             cap_s = cap_for(dose)
             con.execute(
-                "INSERT INTO commands "
-                "(created_ts, controller, kind, outlet, ml, cap_s, state, source) "
-                "VALUES (?, ?, 'water', ?, ?, ?, ?, 'rules')",
-                (now, r.controller, outlet, dose, cap_s, state),
+                "INSERT INTO commands (created_ts, controller, kind, outlet, "
+                "ml, cap_s, state, source, pot_id) "
+                "VALUES (?, ?, 'water', ?, ?, ?, ?, 'rules', ?)",
+                (now, r.controller, outlet, dose, cap_s, state, pot_id),
             )
 
     def handle_report(r: Report) -> tuple[int, tuple | None]:
@@ -2379,11 +2465,27 @@ def create_app(
                 ).fetchone()
             )
             if not duplicate:
+                # Whose reading each channel is, resolved ONCE per report:
+                # pot_mappings is not written inside this transaction, so it
+                # cannot go stale between two channels of one report. A
+                # channel nobody is mapped to stamps NULL — an environment
+                # sensor, or a socket no plant has claimed — and that is a
+                # real answer, not a gap to fill in later. upsert_pot keeps
+                # at most one open window per (controller, channel), which
+                # is what makes this dict unambiguous.
+                owners = dict(
+                    con.execute(
+                        "SELECT channel, pot_id FROM pot_mappings "
+                        "WHERE controller = ? AND to_ts IS NULL "
+                        "AND channel IS NOT NULL",
+                        (r.controller,),
+                    )
+                )
                 con.executemany(
-                    "INSERT INTO readings (ts, controller, channel, raw, t) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO readings (ts, controller, channel, raw, t, pot_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
                     [
-                        (now, r.controller, ch, raw, r.t)
+                        (now, r.controller, ch, raw, r.t, owners.get(ch))
                         for ch, raw in sorted(r.channels.items())
                     ],
                 )
@@ -2394,9 +2496,28 @@ def create_app(
                 (r.controller,),
             ).fetchone()
             if handed:
+                # The stamp is re-read HERE, not kept from when the command
+                # was written. The board is handed an outlet, and the water
+                # goes to whoever is on that outlet at this moment — which
+                # is not always who was on it when the command was made:
+                # a manual dose queued before the pot was registered was
+                # stamped NULL, and a hose rearranged while a command waited
+                # would file the water under the pot that no longer holds it.
+                #
+                # Both cost more than a wrong name. A dose the pot half of
+                # the cooldown cannot see is a dose the HOSE floor stops
+                # covering the moment that pot is rewired, so both layers of
+                # DECISIONS #7 go at once and the plant is watered twice.
+                owner = con.execute(
+                    "SELECT pot_id FROM pot_mappings "
+                    "WHERE controller = ? AND outlet IS ? AND to_ts IS NULL "
+                    "ORDER BY rowid LIMIT 1",
+                    (r.controller, handed[2]),
+                ).fetchone()
                 con.execute(
-                    "UPDATE commands SET state = 'sent', sent_ts = ? WHERE id = ?",
-                    (now, handed[0]),
+                    "UPDATE commands SET state = 'sent', sent_ts = ?, pot_id = ? "
+                    "WHERE id = ?",
+                    (now, owner and owner[0], handed[0]),
                 )
             (override,) = con.execute(
                 "SELECT next_s FROM controllers WHERE controller = ?",
@@ -2423,11 +2544,27 @@ def create_app(
             ).fetchone()
             if busy:
                 return 0, busy
+            # Whom this dose is for. A manual command names a hose, not a
+            # pot, so the pot is the one on that hose right now — the same
+            # answer the read-time join used to compute, decided once here
+            # instead. A stop has no outlet and stamps NULL, and so does a
+            # hose nobody is on.
+            owner = (
+                con.execute(
+                    "SELECT pot_id FROM pot_mappings "
+                    "WHERE controller = ? AND outlet = ? AND to_ts IS NULL "
+                    "ORDER BY rowid LIMIT 1",
+                    (c.controller, c.outlet),
+                ).fetchone()
+                if c.outlet is not None
+                else None
+            )
             (cmd_id,) = con.execute(
-                "INSERT INTO commands "
-                "(created_ts, controller, kind, outlet, ml, cap_s, state, source) "
-                "VALUES (?, ?, ?, ?, ?, ?, 'queued', 'manual') RETURNING id",
-                (now, c.controller, c.kind, c.outlet, c.ml, c.cap_s),
+                "INSERT INTO commands (created_ts, controller, kind, outlet, "
+                "ml, cap_s, state, source, pot_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'queued', 'manual', ?) RETURNING id",
+                (now, c.controller, c.kind, c.outlet, c.ml, c.cap_s,
+                 owner and owner[0]),
             ).fetchone()
             return cmd_id, None
 
@@ -2441,6 +2578,129 @@ def create_app(
                 (controller, value or None),
             )
         return value or interval
+
+    def free_alerts(
+        con: sqlite3.Connection,
+        pot_id: str,
+        controller: str | None,
+        channel: int | None,
+        outlet: int | None,
+    ) -> None:
+        """Drop the hose-keyed alerts a pot leaves behind when it lets go of
+        its wiring — by being buried or by being erased.
+
+        `sensor:<c>:<ch>` is the one that matters, and it is unclearable
+        without this. Both its raise AND its clear live inside a loop over
+        pots_now (see the sensor rule), so once the pot is gone or buried
+        neither branch can ever run again: the row would sit in /health for
+        ever and keep inflating the daily up-probe count, which excludes
+        dose:, dosefail:, proposal: and meta: but not sensor:.
+        `proposal:<c>:<outlet>` is the same shape and cheap to take with it,
+        and without it the next pot on that hose inherits up to a day of
+        nudge silence.
+
+        Only when nobody alive is left on that pair — another pot may hold
+        the channel or the outlet, and its alarm is not this pot's to clear.
+
+        Removing a row is SILENT: no `cleared` goes to the phone, unlike
+        clear(). That is the right answer for a condition nobody owns any
+        more, and it is chosen here rather than discovered later.
+        """
+        for key, col, value in (
+            (f"sensor:{controller}:{channel}", "m.channel", channel),
+            (f"proposal:{controller}:{outlet}", "m.outlet", outlet),
+        ):
+            if controller is None or value is None:
+                continue
+            taken = con.execute(
+                "SELECT 1 FROM pot_mappings m JOIN pots p ON p.id = m.pot_id "
+                "WHERE m.to_ts IS NULL AND m.pot_id != ? AND m.controller = ? "
+                f"AND {col} = ? AND {live_sql('p.status')} LIMIT 1",
+                (pot_id, controller, value),
+            ).fetchone()
+            if not taken:
+                con.execute("DELETE FROM alerts WHERE key = ?", (key,))
+
+    def delete_pot(pot_id: str) -> None:
+        """Erase a pot and everything that is only about it.
+
+        The opposite of the graveyard, and deliberately not reachable from
+        the same request: the graveyard keeps the record and frees the
+        hardware, this keeps nothing. It overturns the command log's
+        "never pruned" rule for exactly one reason — the owner asked for
+        the plant to be gone — and it costs something real, recorded in
+        DECISIONS: a deleted pot's doses stop floating the hose-keyed
+        cooldown and cap floors, so the next pot on that hose can be
+        watered sooner than #5 would like, for up to a day.
+
+        Order is forced by reachability, not by foreign keys — there are
+        none in this database and nothing cascades. The verdicts and the
+        `dose:<id>` ledger rows must go BEFORE the commands they are found
+        through, and both must go at all: commands.id is a rowid alias with
+        no AUTOINCREMENT, so sqlite hands the same ids out again. A
+        leftover verdict would then label a stranger's dose, and a leftover
+        dose: row would make the judgement loop skip a real dose for ever
+        on its NOT EXISTS guard — a silent hole in "tell me when it's
+        wrong", which is the worst kind of leftover this file can have.
+        """
+        with connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            photo_ids = [
+                row[0]
+                for row in con.execute(
+                    "SELECT id FROM photos WHERE pot_id = ?", (pot_id,)
+                )
+            ]
+            # The board is holding a dose for this pot: it will pour, and
+            # it will ack an id that no longer exists. Deleting the row also
+            # frees the controller's one slot while the water is still
+            # running, so the next command goes out on top of it.
+            if con.execute(
+                "SELECT 1 FROM commands WHERE pot_id = ? AND state = 'sent' LIMIT 1",
+                (pot_id,),
+            ).fetchone():
+                raise ValueError(
+                    f"the board is holding a dose for {pot_id}: "
+                    "try again after its next report"
+                )
+            wiring = con.execute(
+                "SELECT controller, channel, outlet FROM pot_mappings "
+                "WHERE pot_id = ? AND to_ts IS NULL",
+                (pot_id,),
+            ).fetchone() or (None, None, None)
+            con.execute(
+                "DELETE FROM verdicts WHERE command_id IN "
+                "(SELECT id FROM commands WHERE pot_id = ?)",
+                (pot_id,),
+            )
+            con.execute(
+                "DELETE FROM alerts WHERE key IN "
+                "(SELECT 'dose:' || id FROM commands WHERE pot_id = ?)",
+                (pot_id,),
+            )
+            free_alerts(con, pot_id, *wiring)
+            for table in ("commands", "readings", "photos", "advice_dismissed"):
+                con.execute(f"DELETE FROM {table} WHERE pot_id = ?", (pot_id,))
+            con.execute("DELETE FROM pot_mappings WHERE pot_id = ?", (pot_id,))
+            # The DELETE decides, never a SELECT before it: a bare read takes
+            # no lock, so two concurrent deletes would both see the row and
+            # both answer ok. Raising here rolls the whole thing back, which
+            # is why the photograph files are only touched afterwards.
+            if con.execute("DELETE FROM pots WHERE id = ?", (pot_id,)).rowcount == 0:
+                raise ValueError(f"no such pot: {pot_id}")
+        # After the commit, with no connection held. A pot with 300
+        # photographs is 300 unlinks, and inside BEGIN IMMEDIATE that is 300
+        # unlinks of blocked /report. A file no row knows about is invisible
+        # and harmless; a row whose file has gone reads `missing` for ever —
+        # so the row goes first and the bytes follow, never the other way.
+        for photo_id in photo_ids:
+            with contextlib.suppress(OSError):
+                photo_path(pot_id, photo_id).unlink(missing_ok=True)
+        # rmdir, not rmtree: the directory is not the truth, and a tree
+        # delete would take bytes belonging to rows this transaction never
+        # selected — including one the keep_photo race can create.
+        with contextlib.suppress(OSError):
+            (photos / pot_id).rmdir()
 
     def upsert_pot(fields: dict) -> tuple[str, str]:
         """Create or partially update one pot, refusing inconsistent merges.
@@ -2480,7 +2740,7 @@ def create_app(
                 dict(zip(POT_COLUMNS, row))
                 if row
                 else dict.fromkeys(POT_COLUMNS)
-                | {"mode": "manual", "enabled": 1, "id": new_pot_id()}
+                | {"mode": "manual", "status": "alive", "id": new_pot_id()}
             )
             # The id is minted into `current` before the merge, so a create
             # and an edit take one path from here on.
@@ -2496,6 +2756,17 @@ def create_app(
                 and merged["target_low_pct"] >= merged["target_high_pct"]
             ):
                 raise ValueError("target_low_pct must be below target_high_pct")
+            if merged["status"] == "graveyard" and any(
+                k in sets for k in POT_MAP_FIELDS
+            ):
+                # parse_pot refuses the two in one body; this catches the two
+                # in two bodies, which is the same contradiction spread out.
+                # Asked of the MERGED status, so restoring and wiring
+                # together still goes through — that one is not a
+                # contradiction, it is how a plant comes back.
+                raise ValueError(
+                    "a graveyard pot holds no wiring: bring it back first"
+                )
             clash = con.execute(
                 "SELECT id FROM pots WHERE name = ? AND id != ?", (name, pot_id)
             ).fetchone()
@@ -2511,15 +2782,16 @@ def create_app(
             if merged["controller"] is not None:
                 # Two pots on one sensor or one hose is a config error that
                 # would misread or miswater — refuse loudly. Asked whatever
-                # this pot's own enabled is: a disabled pot parked on a
-                # working pot's hose still puts two open windows on it, and
-                # then one dose belongs to two pots at once.
+                # this pot's own status is: the point is the OTHER pot, and
+                # a graveyard pot has already let go of its window, so this
+                # clause is now the second line of defence rather than the
+                # first.
                 for col in ("channel", "outlet"):
                     if merged[col] is None:
                         continue
                     other = con.execute(
                         f"SELECT name FROM pots_now WHERE controller = ? AND {col} = ? "
-                        "AND enabled = 1 AND id != ? LIMIT 1",
+                        f"AND {live_sql()} AND id != ? LIMIT 1",
                         (merged["controller"], merged[col], pot_id),
                     ).fetchone()
                     if other:
@@ -2557,16 +2829,17 @@ def create_app(
                         "WHERE pot_id = ? AND to_ts IS NULL",
                         (edge, pot_id),
                     )
-                    # One hose, one pot. An enabled pot on this wiring was
-                    # refused above; a disabled one is still holding an open
-                    # window, because disabling a pot does not unplug it.
-                    # Leaving that window open would make this dose belong
-                    # to both pots at once — and it does not merely list
-                    # twice, it answers a different owner depending on which
-                    # query you ask. The newcomer displaces it, which is
-                    # what physically happened. Each displaced window closes
-                    # on its own edge, so a backwards clock cannot invert it
-                    # or orphan a dose it already holds.
+                    # One hose, one pot. A live pot on this wiring was
+                    # refused above, and a graveyard one let go of its window
+                    # when it was buried — so this should find nothing, and
+                    # it stays because it is the only thing that would. A
+                    # database that arrived with two open windows on one hose
+                    # (the defect fixed on 2026-09-03) now has no read-time
+                    # GROUP BY papering over it: the reading stamp would pick
+                    # one of the two arbitrarily and the pick would be
+                    # permanent. Each displaced window closes on its own
+                    # edge, so a backwards clock cannot invert it or orphan
+                    # a dose it already holds.
                     displaced = con.execute(
                         "SELECT DISTINCT m.pot_id FROM pot_mappings m "
                         "JOIN pots p ON p.id = m.pot_id "
@@ -2586,6 +2859,47 @@ def create_app(
                         "VALUES (?, ?, ?, ?, ?, NULL)",
                         (pot_id, *wiring, edge),
                     )
+                    # The socket it just left, for the same reason burying
+                    # one does it: `sensor:<c>:<ch>` is raised and cleared
+                    # inside a loop over the pot's CURRENT wiring, so an
+                    # alarm on the old channel has nobody left to clear it.
+                    free_alerts(
+                        con,
+                        pot_id,
+                        current["controller"],
+                        current["channel"],
+                        current["outlet"],
+                    )
+            if sets.get("status") == "graveyard" and current["status"] != "graveyard":
+                # Burying a pot is what UNPLUGS it, and that is the whole
+                # difference from the switch this replaced: the hose and the
+                # socket go back to the garden. window_edge, never `now` —
+                # a to_ts before a dose the window already holds orphans
+                # that dose's cooldown and cap for good.
+                edge = window_edge(con, pot_id, now)
+                con.execute(
+                    "UPDATE pot_mappings SET to_ts = ? "
+                    "WHERE pot_id = ? AND to_ts IS NULL",
+                    (edge, pot_id),
+                )
+                # No new window: it comes back unwired, because the plant
+                # that comes back is not in the socket the old one left.
+                # 'queued' as well as 'proposed': burial hands the outlet
+                # back to the garden, so a dose still waiting for the board
+                # would pour into whatever is wired there next. A 'sent' one
+                # is already with the board and expires on its next report.
+                con.execute(
+                    "UPDATE commands SET state = 'expired' "
+                    "WHERE pot_id = ? AND state IN ('proposed', 'queued')",
+                    (pot_id,),
+                )
+                free_alerts(
+                    con,
+                    pot_id,
+                    current["controller"],
+                    current["channel"],
+                    current["outlet"],
+                )
         return pot_id, name
 
     def approve(cmd_id: int) -> tuple | None:
@@ -2780,7 +3094,7 @@ def create_app(
         # dead-man. Same threshold and observation window as the silent
         # rule; a controller that is itself silent already pages there.
         for name, controller, channel in con.execute(
-            "SELECT name, controller, channel FROM pots_now WHERE enabled = 1 "
+            f"SELECT name, controller, channel FROM pots_now WHERE {live_sql()} "
             "AND controller IS NOT NULL AND channel IS NOT NULL ORDER BY name"
         ):
             pulse = heartbeat.get(controller)
@@ -2941,9 +3255,10 @@ def create_app(
             _,
             sent_ts,
             acked_ts,
+            owner,
         ) in con.execute(
             "SELECT id, controller, outlet, ml, flow_ml, state, sent_ts, "
-            "acked_ts FROM commands "
+            "acked_ts, pot_id FROM commands "
             "WHERE kind = 'water' AND sent_ts IS NOT NULL "
             "AND state IN ('acked', 'expired') "
             "AND COALESCE(acked_ts, sent_ts) >= ? "
@@ -2961,17 +3276,33 @@ def create_app(
             if acked_ts is not None and now < judge_at:
                 continue  # still soaking in; an expiry needs no wait
             key = f"dose:{cmd_id}"
-            # Whose dose this was: the pot on that hose when the board was
-            # handed it, not whoever hangs there now. After a remap the
-            # current occupant would put the wrong name on the page and
-            # have the rise judged against its own, undosed sensor.
-            pot = con.execute(
-                "SELECT p.name, m.channel, p.dry_raw, p.wet_raw "
-                "FROM pot_mappings m JOIN pots p ON p.id = m.pot_id "
-                "WHERE m.controller = ? AND m.outlet = ? AND p.enabled = 1 "
-                "AND ? >= m.from_ts AND (m.to_ts IS NULL OR ? < m.to_ts)",
-                (controller, outlet, sent_ts, sent_ts),
-            ).fetchone()
+            # Two questions that used to be one join, and they have
+            # different answers. WHOSE dose it was is the stamp on the row,
+            # decided when the command was written. WHICH SENSOR it should
+            # be judged on is still a window question — the pot may have
+            # been rewired between the dose and the soak, and the rise
+            # belongs to the probe that was in that soil at the time.
+            #
+            # No status filter: a dose that happened is a dose worth
+            # judging and naming, even if the plant has since been buried.
+            pot = (
+                con.execute(
+                    "SELECT name, dry_raw, wet_raw FROM pots WHERE id = ?",
+                    (owner,),
+                ).fetchone()
+                if owner
+                else None
+            )
+            channel_row = (
+                con.execute(
+                    "SELECT channel FROM pot_mappings WHERE pot_id = ? "
+                    "AND ? >= from_ts AND (to_ts IS NULL OR ? < to_ts)",
+                    (owner, sent_ts, sent_ts),
+                ).fetchone()
+                if owner
+                else None
+            )
+            channel = channel_row[0] if channel_row else None
             name = pot[0] if pot else f"outlet {outlet}"
             symptoms: list[str] = []
             priority = "default"
@@ -2988,11 +3319,11 @@ def create_app(
             if (
                 pot is not None
                 and acked_ts is not None
+                and channel is not None
                 and pot[1] is not None
                 and pot[2] is not None
-                and pot[3] is not None
             ):
-                _, channel, dry, wet = pot
+                _, dry, wet = pot
                 before = median_window_pct(
                     con, controller, channel, dry, wet, "ts <= ?", (sent_ts,)
                 )
@@ -3085,7 +3416,7 @@ def create_app(
             "JOIN pot_mappings m ON m.controller = c.controller "
             "AND m.outlet = c.outlet AND m.to_ts IS NULL "
             f"AND c.created_ts >= {_hose_since('m.pot_id', 'm.controller', 'm.outlet')} "
-            "JOIN pots p ON p.id = m.pot_id AND p.enabled = 1 "
+            f"JOIN pots p ON p.id = m.pot_id AND {live_sql('p.status')} "
             "WHERE c.state = 'proposed' AND c.created_ts >= ? ORDER BY c.id",
             (now - PROPOSAL_TTL_S,),
         ):
@@ -3333,6 +3664,29 @@ def create_app(
             return PlainTextResponse(f"try again: {why}\n", status_code=503)
         return PlainTextResponse(f"pot={pot_id} name={name}\n")
 
+    @app.post("/pot/delete")
+    async def erase_pot(request: Request):
+        """`id=<pot id>`. Its own route rather than a field on /pot, for the
+        same reason /photo/delete is: a save that lost its body must never
+        become an erasure. Total and with no undo — the graveyard is the
+        reversible one."""
+        if bad_token(request):
+            return PlainTextResponse("bad token\n", status_code=401)
+        body = await slurp(request)
+        if isinstance(body, PlainTextResponse):
+            return body
+        try:
+            pot_id = parse_pot_delete(body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=400)
+        try:
+            await run_in_threadpool(delete_pot, pot_id)
+        except ValueError as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=400)
+        except sqlite3.OperationalError as why:
+            return PlainTextResponse(f"try again: {why}\n", status_code=503)
+        return PlainTextResponse("ok\n")
+
     @app.post("/approve")
     async def approve_proposal(request: Request):
         if bad_token(request):
@@ -3386,11 +3740,15 @@ def create_app(
                     entry = dict(zip(POT_COLUMNS, row))
                     entry["raw"] = entry["read_ts"] = entry["pct"] = None
                     if entry["controller"] is not None and entry["channel"] is not None:
+                        # By pot, not by channel: after a remap the newest
+                        # row on the new channel was taken while another
+                        # plant sat there. The guard above stays on the
+                        # WIRING, because a percentage on the card is a
+                        # now-fact and an unwired pot has no now.
                         latest = con.execute(
-                            "SELECT raw, ts FROM readings "
-                            "WHERE controller = ? AND channel = ? "
+                            "SELECT raw, ts FROM readings WHERE pot_id = ? "
                             "ORDER BY ts DESC LIMIT 1",
-                            (entry["controller"], entry["channel"]),
+                            (entry["id"],),
                         ).fetchone()
                         if latest:
                             entry["raw"], entry["read_ts"] = latest
@@ -3427,17 +3785,20 @@ def create_app(
                             )
                     # The newest dose this pot was ever handed, with its
                     # human verdict: the id POST /verdict needs was
-                    # otherwise visible only in the log. Through the pot's
-                    # own windows, so moving a hose takes the history with
-                    # it instead of filing it under the next pot along —
-                    # which would judge one pot's soil against another
-                    # pot's dose, in the table the learning log is made of.
+                    # otherwise visible only in the log. By the stamp, so
+                    # moving a hose takes the history with it instead of
+                    # filing it under the next pot along — which would judge
+                    # one pot's soil against another pot's dose, in the
+                    # table the learning log is made of. `sent_ts IS NOT
+                    # NULL` was implicit in the old join (NULL >= from_ts is
+                    # never true) and has to be said now.
                     dose = con.execute(
-                        f"SELECT c.id, c.ml, c.cap_s, c.flow_ml, c.state, "
-                        f"c.source, c.sent_ts, c.acked_ts, v.verdict "
-                        f"FROM {HANDED_TO_POT} "
+                        "SELECT c.id, c.ml, c.cap_s, c.flow_ml, c.state, "
+                        "c.source, c.sent_ts, c.acked_ts, v.verdict "
+                        "FROM commands c "
                         "LEFT JOIN verdicts v ON v.command_id = c.id "
-                        "WHERE c.kind = 'water' "
+                        "WHERE c.pot_id = ? AND c.kind = 'water' "
+                        "AND c.sent_ts IS NOT NULL "
                         "ORDER BY c.sent_ts DESC, c.id DESC LIMIT 1",
                         (entry["id"],),
                     ).fetchone()
@@ -3563,30 +3924,26 @@ def create_app(
             )
             cursor = (before, before, before_id)
         tail = (
-            f"AND c.kind = 'water' AND c.state != 'proposed' {page}GROUP BY c.id "
+            f"AND c.kind = 'water' AND c.state != 'proposed' {page}"
             "ORDER BY COALESCE(c.sent_ts, c.created_ts) DESC, c.id DESC LIMIT ?"
         )
-        # GROUP BY c.id, not because a dose has many rows but because two
-        # overlapping windows on one hose would list it twice. That is a
-        # configuration error either way; showing the dose once is the
-        # better of the two wrong answers.
+        # No GROUP BY any more. It was there because two overlapping windows
+        # on one hose would list one dose twice; a stamped row has exactly
+        # one owner and cannot.
         if pot_id is None:
             sql = (
                 f"SELECT {columns} FROM commands c "
-                "LEFT JOIN pot_mappings m ON m.controller = c.controller "
-                "AND m.outlet = c.outlet AND c.sent_ts >= m.from_ts "
-                "AND (m.to_ts IS NULL OR c.sent_ts < m.to_ts) "
-                "LEFT JOIN pots p ON p.id = m.pot_id "
+                "LEFT JOIN pots p ON p.id = c.pot_id AND c.sent_ts IS NOT NULL "
                 "LEFT JOIN verdicts v ON v.command_id = c.id "
                 f"WHERE 1 {tail}"
             )
             args: tuple = (*cursor, limit)
         else:
             sql = (
-                f"SELECT {columns} FROM {HANDED_TO_POT} "
-                "JOIN pots p ON p.id = m.pot_id "
+                f"SELECT {columns} FROM commands c "
+                "JOIN pots p ON p.id = c.pot_id "
                 "LEFT JOIN verdicts v ON v.command_id = c.id "
-                f"WHERE 1 {tail}"
+                f"WHERE c.pot_id = ? AND c.sent_ts IS NOT NULL {tail}"
             )
             args = (pot_id, *cursor, limit)
         try:
@@ -3598,12 +3955,23 @@ def create_app(
 
     @app.get("/history")
     def history(request: Request):
-        """Bucketed raw counts for one (controller, channel): the chart's
-        wire. Raw only, so the app derives % from the pot's current
-        calibration and a recalibration re-reads the whole curve; `to` is
-        the server's clock so the axis never trusts the phone's."""
+        """Bucketed raw counts for one POT: the chart's wire. Raw only, so
+        the app derives % from the pot's current calibration and a
+        recalibration re-reads the whole curve; `to` is the server's clock
+        so the axis never trusts the phone's.
+
+        By pot rather than by channel, which is what stops a plant wired
+        into a dead one's socket opening its chart onto somebody else's
+        moisture curve. Two consequences, both accepted rather than
+        overlooked. This route takes no token — it never has — so it now
+        confirms to an unauthenticated caller which pot ids exist; it
+        answers 200 with no points for one that does not, so the confirmation
+        is of the id, not of anything about the plant. And readings stamped
+        with no pot (an environment channel, a socket nobody claimed) are no
+        longer reachable through any route.
+        """
         try:
-            controller, channel, hours, bucket_s = parse_history(request.query_params)
+            pot_id, hours, bucket_s = parse_history(request.query_params)
         except ValueError as why:
             return PlainTextResponse(f"refused: {why}\n", status_code=400)
         now = int(time.time())
@@ -3616,17 +3984,16 @@ def create_app(
                     {"ts": bucket, "raw": round(avg), "lo": lo, "hi": hi, "n": n}
                     for bucket, avg, lo, hi, n in con.execute(
                         "SELECT (ts / ?) * ?, AVG(raw), MIN(raw), MAX(raw), COUNT(*) "
-                        "FROM readings WHERE controller = ? AND channel = ? "
-                        "AND ts >= ? GROUP BY 1 ORDER BY 1",
-                        (bucket_s, bucket_s, controller, channel, since),
+                        "FROM readings WHERE pot_id = ? AND ts >= ? "
+                        "GROUP BY 1 ORDER BY 1",
+                        (bucket_s, bucket_s, pot_id, since),
                     )
                 ]
         except sqlite3.OperationalError as why:
             return PlainTextResponse(f"try again: {why}\n", status_code=503)
         return JSONResponse(
             {
-                "controller": controller,
-                "channel": channel,
+                "pot": pot_id,
                 "since": since,
                 "to": now,
                 "bucket_s": bucket_s,
