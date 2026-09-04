@@ -89,6 +89,61 @@ the pot's mapping windows and not through whoever hangs on that hose today, so m
 takes the dose history with it. That is what the app judges from; a manual water-now replaces
 it only while the pot still holds the hose it was sent down.
 
+## What does this plant want?
+
+Type a name and the butler resolves it before asking anybody about it. GBIF turns the typing into
+the accepted binomial — free, no key, and it is what makes an old name find the plant it was
+renamed to — and then Trefle answers about that name, if `BUTLER_TREFLE_TOKEN` is set and if it
+has ever heard of it:
+
+```bash
+curl -s -G http://localhost:8000/species -H 'X-Token: dev' --data-urlencode 'q=Sansevieria trifasciata'
+# -> {"matched": "exact", "accepted": "Dracaena trifasciata", "rank": "SPECIES",
+#     "care": {"found": true, "light": null, ...},
+#     "note": "Trefle knows Dracaena trifasciata but has no numbers for it"}
+```
+
+`note` is the sentence to put on screen, because most of the answers are unhappy ones and each is
+unhappy in its own way: a genus needs a species, a typo is corrected out loud, and a plant Trefle
+has never heard of is the *ordinary* case for houseplants rather than an error. Every one of them
+ends the same way — you type the numbers in. Both hops are cached: hits forever, misses for a
+month, so the second lookup asks nobody and `GET /pots` never touches the network at all.
+
+A name nobody can place is not the end of it, because GBIF only knows scientific ones. Trefle's own
+search takes the typing as a common name, survives a typo, and answers with pictures:
+
+```bash
+curl -s -G http://localhost:8000/species -H 'X-Token: dev' --data-urlencode 'q=tomatoe'
+# -> {"matched": "none", "accepted": null,
+#     "candidates": [{"name": "Solanum lycopersicum", "common": "Tomato", "image": "https://…"},
+#                    {"name": "Solanum betaceum", "common": "Tree-tomato", "image": "https://…"}],
+#     "note": "not sure which one — pick the plant you recognise"}
+```
+
+Ask again with a candidate's name and it resolves exactly. `q=basil` skips even that: among Trefle's
+basil thymes and African basils exactly one is called Basil, and one is not a guess — that answers
+`"matched": "common"` with the care already filled in. Two are (`q=peace lily` finds a "Peace lily"
+and a "Peace-lily"), so those come back as two pictures and a question. A name GBIF *did* place is
+never second-guessed with a shortlist: Trefle has never heard of Ficus lyrata, and offering other
+figs would be worse than saying so.
+
+No watering number comes from any of this. Trefle carries no watering regime — `soil_humidity` was
+NULL for every species probed — so the target band is proposed locally, from the kind of plant, the
+soil, the pot size and the month, and it arrives as an offer on each pot in `GET /pots`:
+
+```bash
+# "advice": {"kind": "target", "low": 30, "high": 50,
+#            "why": "culinary herb, sandy loam soil, small pot"}
+curl -s -X POST http://localhost:8000/pot -H 'X-Token: dev' \
+  --data-binary 'id=pot-3f9a21 target_low_pct=30 target_high_pct=50'   # accepting it
+curl -s -X POST http://localhost:8000/advice -H 'X-Token: dev' \
+  --data-binary 'pot=pot-3f9a21 dismiss=1'                             # refusing it
+```
+
+Accepting is an ordinary pot edit, so no number is ever written except by the person writing it.
+A refusal is remembered against the numbers that were refused: change the soil, repot, or let the
+season turn, and the new band is a new question and is asked again.
+
 Or skip curl and let a fake board do the whole dance — report, receive, water, ack:
 
 ```bash

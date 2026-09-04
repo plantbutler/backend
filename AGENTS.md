@@ -24,7 +24,9 @@ watering.
 
 - `butler.py` — the whole service: `create_app` factory (env: `BUTLER_TOKEN` required,
   `BUTLER_DB`, `BUTLER_NEXT_S`, `BUTLER_CMD_TTL_S`, `BUTLER_QUIET`,
-  `BUTLER_NTFY_TOPIC`, `BUTLER_NTFY_URL`, `BUTLER_DEADMAN_URL`, `BUTLER_SILENT_S`), `POST /report` (k=v body, `X-Token`
+  `BUTLER_NTFY_TOPIC`, `BUTLER_NTFY_URL`, `BUTLER_DEADMAN_URL`, `BUTLER_SILENT_S`,
+  `BUTLER_TREFLE_TOKEN` — unset means every care number is typed in, which is a working path and
+  not an error), `POST /report` (k=v body, `X-Token`
   header, refuses whole on malformed channels, ignores unknown keys, stamps arrival time,
   answers `next=` plus at most one `cmd=` line), `POST /command` (queue `water=<outlet>
   ml= [cap_s=]` or `stop=1`, one slot per controller, 409 when busy; a missing cap_s is sized
@@ -48,6 +50,13 @@ watering.
   to a pot from the moment the board is given it. `before=`/`before_id=` are the last row you have,
   both together because several doses can share a second and a timestamp-only cursor would skip or
   repeat them — the table is never pruned, so the older history has to stay reachable),
+  `GET /species` (`q=`: the taxonomy hop through GBIF then Trefle for the accepted binomial,
+  both cached — `matched` is exact|fuzzy|common|genus|none|unavailable, `care` is null when
+  nothing could be asked, `candidates` is the shortlist with pictures when no name could be
+  placed, and `note` is the sentence for the screen. No watering number comes back: see the band
+  below), `POST /advice` (`pot= kind=target dismiss=1`: this offer was refused, keyed on
+  a fingerprint of the numbers refused, so a different offer is asked again. There is no accept —
+  accepting is an ordinary `POST /pot`),
   `POST /approve` (proposed -> queued, slot permitting), `POST /verdict` (ok | too_much |
   too_little per executed dose), `GET /health` (count, last ts, the default interval, per-controller
   heartbeat/knob/open command/safety fields, raised alerts).
@@ -69,6 +78,20 @@ watering.
   `meta:tick` row. `status` and `alerts` tables carry the state; `/health` shows `float`/`pos`
   per controller and what stands raised; one "butler is up" probe, at most daily, 10 min after
   a start.
+- The care lookup and the band it does not come from. GBIF normalises what was typed (free, no
+  key) and Trefle answers about the accepted binomial; `species_names` and `species_care` cache
+  both hops, hits forever and misses for a month, so `GET /pots` reads caches only and never the
+  network. GBIF knows scientific names only, so a name it cannot place falls to Trefle's own
+  search, which matches common names, survives a typo and answers with pictures (`species_search`,
+  cached the same way); exactly one candidate bearing the typed common name is followed
+  (`matched: common`), two are a question with two pictures, and a name GBIF *did* place is never
+  second-guessed with a shortlist. Two things the live services taught, both now in the code as comments: GBIF sends
+  `matchType: NONE` with `confidence: 100`, so confidence alone means nothing; and GBIF matches a
+  lowercase binomial but not a lowercase genus, so the cache key is lowercased and the question
+  goes out in botanical case. Trefle has no watering regime at all (`soil_humidity` NULL for every
+  species probed on 2026-09-04) and no houseplant coverage worth the name, so `target_band()`
+  proposes the band locally from plant type, soil, pot size and month, `GET /pots` carries it as
+  `advice`, and applying it is a human's `POST /pot`.
 - The command slot: queued → handed exactly once in a report response (sent) → acked by the
   next report's `ack=<id> flow_ml=`; a no-ack report or the TTL expires it. Expired is gone —
   ask again. The commands table is never pruned: it doubles as the watering history.
@@ -80,7 +103,8 @@ watering.
   make one dose belong to two pots at once — differently depending on which query you ask. A
   displaced window keeps every dose it held.
 - `schema.sql` — additive-only DDL: `readings`, `commands`, `controllers`, `pots`,
-  `pot_mappings`, the `pots_now` view, `verdicts`, `status`, `alerts` + indexes. Proposals are
+  `pot_mappings`, the `pots_now` view, `verdicts`, `status`, `alerts`, `species_names`,
+  `species_care`, `species_search`, `advice_dismissed` + indexes. Proposals are
   commands in state 'proposed'; the verdict log is the dataset adaptive dosing will one day fit
   on. A pot is a `pot-xxxxxx` id and a nickname; its wiring (controller, channel, outlet) is NOT
   in `pots` but in `pot_mappings`, one row per period with a half-open [from_ts, to_ts) window,
@@ -121,7 +145,9 @@ watering.
 4. **Rules that water**, then **Tell me when it's wrong** (a public ntfy.sh topic).
 
 Not in scope for any of them: Postgres, a migrations framework, TLS, a reverse proxy, Grafana,
-Home Assistant, weather, ML, a species database.
+Home Assistant, weather, ML. (A species *lookup* did arrive later, in "What does this plant
+want?" — a cache in front of GBIF and Trefle, not a database of our own, and it decides no
+watering numbers.)
 
 ## Design sketch (brainstormed 2026-08-31)
 

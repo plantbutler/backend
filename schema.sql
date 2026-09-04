@@ -174,3 +174,66 @@ CREATE TABLE IF NOT EXISTS alerts (
   cleared_ts INTEGER,           -- NULL while the condition stands
   detail     TEXT               -- dose judgements: 'ok'|'failed'|'unverified'
 );
+
+-- What does this plant want? (cycle 2). Two caches, because the two hops
+-- have different lifetimes: many spellings resolve to one accepted name,
+-- and one accepted name has one answer from the care source. Both keep the
+-- date they were fetched, so an answer can always be told from a fresh one.
+
+-- The taxonomy hop, GBIF. `query` is what the user typed, normalised;
+-- `accepted` is the binomial to ask a care source about, NULL when GBIF
+-- recognised nothing (or only a genus, which is not enough to look up).
+
+CREATE TABLE IF NOT EXISTS species_names (
+  query      TEXT PRIMARY KEY,  -- lowercased, whitespace-collapsed typing
+  fetched_ts INTEGER NOT NULL,
+  accepted   TEXT,
+  rank       TEXT,              -- SPECIES, GENUS, ... as GBIF reports it
+  matched    TEXT NOT NULL      -- exact | fuzzy | genus | none
+);
+
+-- The care source's answer for one accepted binomial. `found = 0` is a
+-- real answer and is cached too: Trefle's houseplant coverage is empty,
+-- not thin, so "nothing known" is the common case and must not re-ask on
+-- every screen open. Nothing here is a watering number — Trefle has none
+-- (soil_humidity was NULL for every species probed on 2026-09-04). The
+-- target band comes from the local table, and only from there.
+
+CREATE TABLE IF NOT EXISTS species_care (
+  species     TEXT PRIMARY KEY,  -- the accepted binomial, lowercased
+  fetched_ts  INTEGER NOT NULL,
+  source      TEXT    NOT NULL,  -- 'trefle'
+  found       INTEGER NOT NULL,
+  common_name TEXT,
+  light       INTEGER,  -- 0-10, the source's own scale, not a percentage
+  humidity    INTEGER,  -- 0-10, atmospheric
+  ph_min      REAL,
+  ph_max      REAL,
+  temp_min_c  REAL,
+  image_url   TEXT
+);
+
+-- A target band the user said no to. One row per pot and kind, overwritten
+-- in place — state, not history, like `alerts`. The fingerprint is the
+-- numbers that were refused: propose something different (a new season, a
+-- repot, a different soil) and it is a new offer, so it is raised again.
+
+CREATE TABLE IF NOT EXISTS advice_dismissed (
+  pot_id      TEXT    NOT NULL,
+  kind        TEXT    NOT NULL,  -- 'target'
+  fingerprint TEXT    NOT NULL,
+  ts          INTEGER NOT NULL,
+  PRIMARY KEY (pot_id, kind)
+);
+
+-- The fuzzy half of the lookup. GBIF only knows scientific names, so
+-- "basil", "peace lily" and "tomatoe" resolve to nothing there; Trefle's own
+-- search matches common names and tolerates a typo, and its results already
+-- carry a picture, which is how a person confirms they found their plant.
+-- One row per typing, since that is what was searched for.
+
+CREATE TABLE IF NOT EXISTS species_search (
+  query      TEXT PRIMARY KEY,
+  fetched_ts INTEGER NOT NULL,
+  candidates TEXT NOT NULL  -- JSON array of {name, common, image, slug}
+);
