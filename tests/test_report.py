@@ -10,7 +10,7 @@ from butler import create_app, parse_report
 
 TOKEN = "test-token"
 
-REPORT = "c=butler1 t=123456\nch0=8123 ch1=7902 ch2=15\n"
+REPORT = "c=0 t=123456\nch0=8123 ch1=7902 ch2=15\n"
 
 
 @pytest.fixture
@@ -49,13 +49,47 @@ def pot(client, body):
     return answer.text.split()[0].removeprefix("pot=")
 
 
+def test_the_controller_is_an_integer_and_zero_is_a_real_board(client, db):
+    """`c=` was free text until 0.17.0, which made it the one field a typo
+    could turn into a whole second garden: a report from "bench1 " opened
+    its own controller row, its own heartbeat and its own alerts, and
+    nothing said the two were the same board.
+
+    Board 0 is the trap inside the trap — it is falsy, and it is the number
+    the app fills in by default, so a `if not controller` check would refuse
+    the commonest board there is.
+    """
+    assert post(client, "c=0 ch0=8000").status_code == 200
+    with sqlite3.connect(db) as con:
+        assert con.execute("SELECT controller FROM readings").fetchone() == (0,)
+
+
+@pytest.mark.parametrize(
+    "body, why",
+    [
+        ("c=bench1 ch0=1", "c= is not an integer"),
+        ("c= ch0=1", "c= is not an integer"),
+        ("c=-1 ch0=1", "c= is not an integer"),  # the minus is not a digit
+        ("c=256 ch0=1", "c= out of range"),
+        ("c=0x10 ch0=1", "c= is not an integer"),
+        ("c=٣ ch0=1", "c= is not an integer"),  # Arabic-Indic 3: int() would take it
+    ],
+)
+def test_a_controller_that_is_not_a_number_is_refused(client, db, body, why):
+    answer = post(client, body)
+    assert answer.status_code == 400
+    assert answer.text.startswith("refused: " + why), answer.text
+    with sqlite3.connect(db) as con:
+        assert con.execute("SELECT COUNT(*) FROM readings").fetchone() == (0,)
+
+
 # --------------------------------------------------------------------------- #
 # Whose reading it is: stamped as the row lands
 # --------------------------------------------------------------------------- #
 
 
 def test_a_reading_carries_the_pot_that_was_on_that_channel(client, db):
-    basil = pot(client, "name=basil controller=butler1 channel=0")
+    basil = pot(client, "name=basil controller=0 channel=0")
     post(client, REPORT)
     # ch0 is basil's; ch1 and ch2 are sockets nobody has claimed, and NULL
     # is the honest answer for them rather than a gap to fill in later.
@@ -66,11 +100,11 @@ def test_a_remap_changes_what_is_stamped_next_and_leaves_the_past_alone(client, 
     """The whole point of stamping: a plant moved to another socket takes
     its old readings with it, and the pot that arrives on the socket it
     left does not inherit them."""
-    basil = pot(client, "name=basil controller=butler1 channel=0")
-    post(client, "c=butler1 t=1\nch0=8000\n")
+    basil = pot(client, "name=basil controller=0 channel=0")
+    post(client, "c=0 t=1\nch0=8000\n")
     pot(client, f"id={basil} channel=1")
-    mint = pot(client, "name=mint controller=butler1 channel=0")
-    post(client, "c=butler1 t=2\nch0=7000 ch1=6000\n")
+    mint = pot(client, "name=mint controller=0 channel=0")
+    post(client, "c=0 t=2\nch0=7000 ch1=6000\n")
 
     assert stamps(db) == [(0, basil), (0, mint), (1, basil)]
 
@@ -78,12 +112,12 @@ def test_a_remap_changes_what_is_stamped_next_and_leaves_the_past_alone(client, 
 def test_a_buried_pots_channel_stamps_nobody(client, db):
     """Burying a pot closes its window, and the socket goes back to the
     garden — so a reading that arrives afterwards belongs to no plant."""
-    basil = pot(client, "name=basil controller=butler1 channel=0")
-    post(client, "c=butler1 t=1\nch0=8000\n")
+    basil = pot(client, "name=basil controller=0 channel=0")
+    post(client, "c=0 t=1\nch0=8000\n")
     client.post(
         "/pot", content=f"id={basil} status=graveyard", headers={"X-Token": TOKEN}
     )
-    post(client, "c=butler1 t=2\nch0=8000\n")
+    post(client, "c=0 t=2\nch0=8000\n")
 
     assert stamps(db) == [(0, basil), (0, None)]
 
@@ -106,7 +140,7 @@ def test_a_report_lands_whole_and_answers_the_next_interval(client, db):
 
     assert answer.status_code == 200
     assert answer.text == "next=60\n"
-    assert rows(db) == [("butler1", 0, 8123), ("butler1", 1, 7902), ("butler1", 2, 15)]
+    assert rows(db) == [(0, 0, 8123), (0, 1, 7902), (0, 2, 15)]
 
 
 def test_the_server_stamps_arrival_time_itself(client, db):
@@ -118,21 +152,21 @@ def test_the_server_stamps_arrival_time_itself(client, db):
 
 
 def test_keys_this_version_does_not_know_are_ignored(client, db):
-    body = "c=butler1 float=1 pos=ok last=ok zz=9 ch0=8123\n"
+    body = "c=0 float=1 pos=ok last=ok zz=9 ch0=8123\n"
     answer = post(client, body)
 
     assert answer.status_code == 200
-    assert rows(db) == [("butler1", 0, 8123)]
+    assert rows(db) == [(0, 0, 8123)]
 
 
 def test_reports_append_and_health_counts_them(client, db):
-    post(client, "c=butler1 t=60000 ch0=1\n")
-    post(client, "c=butler1 t=120000 ch0=2\n")
+    post(client, "c=0 t=60000 ch0=1\n")
+    post(client, "c=0 t=120000 ch0=2\n")
 
     health = client.get("/health").json()
     assert health["ok"] is True
     assert health["readings"] == 2
-    assert [c["controller"] for c in health["controllers"]] == ["butler1"]
+    assert [c["controller"] for c in health["controllers"]] == [0]
     assert health["last_ts"] is not None
 
 
@@ -147,8 +181,8 @@ def test_health_reports_the_default_interval_not_an_override(db):
     client = TestClient(
         create_app(db_path=str(db), token=TOKEN, next_s=45, cmd_ttl_s=900)
     )
-    post(client, "c=b1 ch0=1\n")
-    knob = client.post("/interval", content="c=b1 next=120", headers={"X-Token": TOKEN})
+    post(client, "c=0 ch0=1\n")
+    knob = client.post("/interval", content="c=0 next=120", headers={"X-Token": TOKEN})
     assert knob.status_code == 200
     health = client.get("/health").json()
     assert health["next_default"] == 45
@@ -166,18 +200,18 @@ def test_an_identical_retry_is_answered_200_and_stored_once(client, db):
 
 
 def test_a_report_after_a_reboot_reuses_old_uptimes_and_still_lands(client, db):
-    post(client, "c=butler1 t=60000 ch0=1\n")
+    post(client, "c=0 t=60000 ch0=1\n")
     with sqlite3.connect(db) as con:  # age the first report past the window
         con.execute("UPDATE readings SET ts = ts - 3600")
-    answer = post(client, "c=butler1 t=60000 ch0=2\n")
+    answer = post(client, "c=0 t=60000 ch0=2\n")
 
     assert answer.status_code == 200
     assert [r[2] for r in rows(db)] == [1, 2]
 
 
 def test_a_report_without_t_never_dedups(client, db):
-    post(client, "c=butler1 ch0=1\n")
-    post(client, "c=butler1 ch0=1\n")
+    post(client, "c=0 ch0=1\n")
+    post(client, "c=0 ch0=1\n")
 
     assert len(rows(db)) == 2
 
@@ -214,19 +248,19 @@ def test_a_non_ascii_token_is_a_401_not_a_500(client, db):
     "body",
     [
         "ch0=8123\n",  # no controller
-        "c=butler1\n",  # no channels: a silent 200 would hide a dead board
-        "c=butler1 ch0=8123 ch1=garbage\n",  # non-integer value
-        "c=butler1 ch0=9223372036854775808\n",  # 2**63: would overflow sqlite
-        "c=butler1 ch999=1\n",  # channel index out of range
-        "c=butler1 ch0=1 ch0=2\n",  # duplicate channel: last-wins hides bugs
-        "c=butler1 c=butler2 ch0=1\n",  # two controllers in one report
-        "c=butler1 ch0=1 notakv\n",  # not k=v
-        "c=butler1 t=abc ch0=1\n",  # t= not an integer
+        "c=0\n",  # no channels: a silent 200 would hide a dead board
+        "c=0 ch0=8123 ch1=garbage\n",  # non-integer value
+        "c=0 ch0=9223372036854775808\n",  # 2**63: would overflow sqlite
+        "c=0 ch999=1\n",  # channel index out of range
+        "c=0 ch0=1 ch0=2\n",  # duplicate channel: last-wins hides bugs
+        "c=0 c=2 ch0=1\n",  # two controllers in one report
+        "c=0 ch0=1 notakv\n",  # not k=v
+        "c=0 t=abc ch0=1\n",  # t= not an integer
         "c= c=evil ch0=1\n",  # empty c= must not open the door to a second
-        "c=butler1 ch0=1 =5\n",  # empty key
-        "c=butler1 ch0=١٢٣\n",  # Unicode digits: refusal, not repair
-        "c=butler1 t=1_000 ch0=5\n",  # int() underscores are not board output
-        "c=butler1 ch0=+5\n",  # neither is a leading +
+        "c=0 ch0=1 =5\n",  # empty key
+        "c=0 ch0=١٢٣\n",  # Unicode digits: refusal, not repair
+        "c=0 t=1_000 ch0=5\n",  # int() underscores are not board output
+        "c=0 ch0=+5\n",  # neither is a leading +
     ],
 )
 def test_a_malformed_report_is_refused_whole(client, db, body):
@@ -247,7 +281,7 @@ def test_invalid_utf8_is_refused_not_repaired(client, db):
 
 
 def test_an_oversized_body_is_cut_off_with_413(client, db):
-    body = "c=butler1 " + " ".join(f"ch{i % 200}=1" for i in range(2000))
+    body = "c=0 " + " ".join(f"ch{i % 200}=1" for i in range(2000))
     answer = post(client, body)
 
     assert answer.status_code == 413
@@ -255,11 +289,11 @@ def test_an_oversized_body_is_cut_off_with_413(client, db):
 
 
 def test_unicode_digits_do_not_alias_onto_ascii_channels(client, db):
-    body = "c=butler1 ch٧=7 ch0=1\n"  # Arabic-Indic seven: unknown key, skipped
+    body = "c=0 ch٧=7 ch0=1\n"  # Arabic-Indic seven: unknown key, skipped
     answer = post(client, body)
 
     assert answer.status_code == 200
-    assert rows(db) == [("butler1", 0, 1)]
+    assert rows(db) == [(0, 0, 1)]
 
 
 # --------------------------------------------------------------------------- #
@@ -292,7 +326,7 @@ def test_a_data_path_without_a_data_mount_refuses_to_serve():
 
 
 def test_parse_is_strict_about_shape_and_silent_about_unknowns():
-    report = parse_report("c=x unknown=1 t=99 ch7=99")
-    assert report[:3] == ("x", {7: 99}, 99)
+    report = parse_report("c=7 unknown=1 t=99 ch7=99")
+    assert report[:3] == (7, {7: 99}, 99)
     with pytest.raises(ValueError):
-        parse_report("c=x notakv")
+        parse_report("c=7 notakv")

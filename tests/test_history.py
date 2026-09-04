@@ -43,13 +43,13 @@ def test_readings_are_bucketed_with_average_extremes_and_count(client, db):
     plant(
         db,
         [
-            (b + 10, "b1", 0, 8000, "pot-aaaaaa"),
-            (b + 70, "b1", 0, 8100, "pot-aaaaaa"),
-            (b + 130, "b1", 0, 8300, "pot-aaaaaa"),
-            (b + 310, "b1", 0, 7000, "pot-aaaaaa"),  # next bucket
-            (b + 320, "b1", 1, 1, "pot-bbbbbb"),  # another pot
-            (b + 330, "b1", 0, 2, None),  # the same socket, nobody on it
-            (b + 340, "b2", 0, 2, "pot-bbbbbb"),  # the other pot, elsewhere
+            (b + 10, 0, 0, 8000, "pot-aaaaaa"),
+            (b + 70, 0, 0, 8100, "pot-aaaaaa"),
+            (b + 130, 0, 0, 8300, "pot-aaaaaa"),
+            (b + 310, 0, 0, 7000, "pot-aaaaaa"),  # next bucket
+            (b + 320, 0, 1, 1, "pot-bbbbbb"),  # another pot
+            (b + 330, 0, 0, 2, None),  # the same socket, nobody on it
+            (b + 340, 1, 0, 2, "pot-bbbbbb"),  # the other pot, elsewhere
         ],
     )
     answer = client.get("/history?pot=pot-aaaaaa")
@@ -70,8 +70,8 @@ def test_the_window_and_the_bucket_size_are_knobs(client, db):
     plant(
         db,
         [
-            (now - 3 * 3600, "b1", 0, 5000, "pot-aaaaaa"),
-            (now - 30 * 60, "b1", 0, 6000, "pot-aaaaaa"),
+            (now - 3 * 3600, 0, 0, 5000, "pot-aaaaaa"),
+            (now - 30 * 60, 0, 0, 6000, "pot-aaaaaa"),
         ],
     )
     hour = client.get("/history?pot=pot-aaaaaa&hours=1&bucket_s=60").json()
@@ -93,12 +93,12 @@ def test_a_pot_nobody_reported_for_is_an_empty_list(client):
 def test_a_reading_nobody_was_mapped_for_belongs_to_no_chart(client, db):
     """An environment channel, or a socket nobody has claimed. The row is
     kept — raw counts always are — and no pot's chart shows it."""
-    plant(db, [(int(time.time()) - 60, "b1", 0, 5000, None)])
+    plant(db, [(int(time.time()) - 60, 0, 0, 5000, None)])
     assert client.get("/history?pot=pot-aaaaaa").json()["points"] == []
 
 
 def test_history_needs_no_token(client, db):
-    plant(db, [(int(time.time()) - 60, "b1", 0, 5000, "pot-aaaaaa")])
+    plant(db, [(int(time.time()) - 60, 0, 0, 5000, "pot-aaaaaa")])
     assert client.get("/history?pot=pot-aaaaaa").status_code == 200
 
 
@@ -155,8 +155,8 @@ def test_a_month_back_is_askable_at_a_sane_bucket(client, db):
     plant(
         db,
         [
-            (now - 25 * 24 * 3600, "b1", 0, 8000, "pot-aaaaaa"),
-            (now - 60, "b1", 0, 9000, "pot-aaaaaa"),
+            (now - 25 * 24 * 3600, 0, 0, 8000, "pot-aaaaaa"),
+            (now - 60, 0, 0, 9000, "pot-aaaaaa"),
         ],
     )
     answer = client.get(

@@ -33,7 +33,7 @@ def old_db(tmp_path):
     con.execute(
         "INSERT INTO pots (name, controller, channel, outlet, dry_raw, wet_raw, mode, "
         "plant_size, pot_size) "
-        "VALUES ('basil', 'butler1', 3, 1, 13000, 4200, 'auto', '40', '14cm')"
+        "VALUES ('basil', 0, 3, 1, 13000, 4200, 'auto', '40', '14cm')"
     )
     con.execute(
         "INSERT INTO pots (name, plant_size, pot_size) "
@@ -61,7 +61,7 @@ def test_migrate_mints_ids_and_moves_the_mapping(tmp_path):
     mapping = con.execute(
         "SELECT pot_id, controller, channel, outlet, from_ts, to_ts FROM pot_mappings"
     ).fetchall()
-    assert mapping == [(rows["basil"], "butler1", 3, 1, 0, None)]
+    assert mapping == [(rows["basil"], 0, 3, 1, 0, None)]
     assert con.execute("SELECT dry_raw, mode FROM pots WHERE name = 'basil'").fetchone() == (13000, "auto")
 
 
@@ -142,8 +142,11 @@ def test_the_backup_carries_what_is_still_in_the_wal(tmp_path):
     con = sqlite3.connect(path)
     con.execute("PRAGMA journal_mode=WAL")
     con.executescript(OLD_POTS)
+    # '0' as TEXT, because that column really was TEXT: the controller only
+    # became an integer in 0.17.0, and this fixture is a database from before
+    # the rebuild that predates even that.
     con.execute(
-        "INSERT INTO pots (name, controller, channel) VALUES ('basil', 'butler1', 3)"
+        "INSERT INTO pots (name, controller, channel) VALUES ('basil', '0', 3)"
     )
     con.commit()
 
@@ -152,7 +155,12 @@ def test_the_backup_carries_what_is_still_in_the_wal(tmp_path):
     backup = sqlite3.connect(str(tmp_path / "wal.db.pre-identity.bak"))
     assert backup.execute(
         "SELECT name, controller, channel FROM pots"
-    ).fetchall() == [("basil", "butler1", 3)]
+    ).fetchall() == [("basil", "0", 3)]
+    # ...and the rebuilt mapping holds it as a number, because pot_mappings
+    # declares INTEGER and sqlite's affinity converts a string that is one.
+    assert con.execute(
+        "SELECT controller, channel FROM pot_mappings"
+    ).fetchall() == [(0, 3)]
 
 
 def test_a_rebuild_killed_half_way_leaves_the_old_table_intact(tmp_path, monkeypatch):
@@ -231,14 +239,14 @@ def test_starting_on_a_live_old_database_rebuilds_it(tmp_path):
     assert [p["name"] for p in pots] == ["basil", "unmapped"]
     basil = pots[0]
     assert basil["id"].startswith("pot-")
-    assert (basil["controller"], basil["channel"], basil["outlet"]) == ("butler1", 3, 1)
+    assert (basil["controller"], basil["channel"], basil["outlet"]) == (0, 3, 1)
     assert (basil["dry_raw"], basil["wet_raw"], basil["mode"]) == (13000, 4200, "auto")
     with sqlite3.connect(path) as check:
         assert check.execute(
             "SELECT controller, channel, outlet, from_ts, to_ts FROM pot_mappings "
             "WHERE pot_id = ?",
             (basil["id"],),
-        ).fetchall() == [("butler1", 3, 1, 0, None)]
+        ).fetchall() == [(0, 3, 1, 0, None)]
     assert (tmp_path / "old.db.pre-identity.bak").exists()
 
     # The restart that matters in production: a second container start on

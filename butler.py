@@ -92,7 +92,7 @@ from starlette.requests import ClientDisconnect
 # metadata because the container installs no package — it copies butler.py
 # beside fastapi and runs it. A test asserts this and pyproject.toml agree,
 # which is the only thing that keeps the two honest.
-VERSION = "0.16.0"
+VERSION = "0.17.0"
 
 BODY_CAP = 4096  # a full 15-channel report is ~200 bytes; 4 KB is generous
 # Photographs are the first thing here that is not small. The phone caps the
@@ -113,6 +113,12 @@ PHOTO_ID_TRIES = 4
 SAFE_ID = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
 RETRY_WINDOW_S = 300  # how long an identical (controller, t) counts as a retry
 MAX_CHANNEL = 255
+# The board's own number, and an integer like every other identifier on the
+# wire. It was free text until 0.17.0, which made `c=` the one field a typo
+# could turn into a whole second garden: a report from "bench1 " or "Bench1"
+# opened its own controller row, its own heartbeat and its own alerts, and
+# nothing anywhere said the two were the same board.
+MAX_CONTROLLER = 255
 MAX_RAW = 2**31  # 14-bit ADC today; headroom without letting 2**63 near sqlite
 MAX_DOSE_ML = 1000  # a liter in one command is already implausible for a pot
 MAX_CAP_S = 60  # the firmware enforces its own cap; this bounds what we ask
@@ -544,7 +550,7 @@ def parse_report(text: str) -> Report:
         if key == "c":
             if controller is not None:
                 raise ValueError("c= given twice")
-            controller = value
+            controller = _int_in(value, "c", 0, MAX_CONTROLLER + 1)
         elif key == "t":
             if t is not None:
                 raise ValueError("t= given twice")
@@ -574,7 +580,9 @@ def parse_report(text: str) -> Report:
             if channel in channels:
                 raise ValueError(f"channel given twice: {key}")
             channels[channel] = _int_in(value, key, 0, MAX_RAW)
-    if not controller:
+    # `is None`, not falsiness: board 0 is a real board, and it is the one
+    # the app fills in by default.
+    if controller is None:
         raise ValueError("no c= in the report")
     if not channels:
         raise ValueError("no chN= in the report")
@@ -609,7 +617,7 @@ def parse_command(text: str) -> Command:
         if key == "c":
             if controller is not None:
                 raise ValueError("c= given twice")
-            controller = value
+            controller = _int_in(value, "c", 0, MAX_CONTROLLER + 1)
         elif key == "water":
             if outlet is not None:
                 raise ValueError("water= given twice")
@@ -628,7 +636,7 @@ def parse_command(text: str) -> Command:
             if value != "1":
                 raise ValueError(f"stop= must be 1, got {value!r}")
             stop = True
-    if not controller:
+    if controller is None:  # board 0 is a real board
         raise ValueError("no c= in the command")
     if stop and not (outlet is None and ml is None and cap_s is None):
         raise ValueError("stop takes no dose")
@@ -657,14 +665,14 @@ def parse_interval(text: str) -> tuple[str, int]:
         if key == "c":
             if controller is not None:
                 raise ValueError("c= given twice")
-            controller = value
+            controller = _int_in(value, "c", 0, MAX_CONTROLLER + 1)
         elif key == "next":
             if next_s is not None:
                 raise ValueError("next= given twice")
             next_s = _int_in(value, "next", 0, MAX_NEXT_S + 1)
             if 0 < next_s < MIN_NEXT_S:
                 raise ValueError(f"next= below {MIN_NEXT_S}s: {value}")
-    if not controller:
+    if controller is None:  # board 0 is a real board
         raise ValueError("no c= in the request")
     if next_s is None:
         raise ValueError("no next= in the request")
@@ -742,6 +750,7 @@ def parse_history(params: QueryParams) -> tuple[str, int, int]:
 
 
 POT_INT_FIELDS = {  # half-open bounds, like every other field
+    "controller": (0, MAX_CONTROLLER + 1),
     "channel": (0, MAX_CHANNEL + 1),
     "outlet": (0, MAX_CHANNEL + 1),
     "dry_raw": (0, MAX_RAW),
@@ -911,7 +920,6 @@ def parse_pot(text: str) -> dict:
         "plant_type",
         "soil",
         "status",
-        "controller",
         *POT_TEXT_FIELDS,
         *POT_CM_FIELDS,
         *POT_INT_FIELDS,
@@ -3808,6 +3816,22 @@ def create_app(
                     # on every screen open and a care source in the middle
                     # of that would make the app as slow as the internet.
                     entry["advice"] = advice_for(con, entry, int(time.time()))
+                    # The newest picture, for the thumbnail beside the name
+                    # in the list. The id only — the bytes come from
+                    # GET /photo/<id>, which the app already caches, so the
+                    # garden answer stays a page of text.
+                    #
+                    # The disk is NOT asked here, unlike the strip: /pots is
+                    # fetched on every screen open and one stat() per pot on
+                    # a NAS bind mount is a cost the list should not carry.
+                    # A row whose file has gone gives a thumbnail that does
+                    # not load, and the strip is where that is diagnosed.
+                    newest = con.execute(
+                        "SELECT id FROM photos WHERE pot_id = ? "
+                        "ORDER BY ts DESC, rowid DESC LIMIT 1",
+                        (entry["id"],),
+                    ).fetchone()
+                    entry["photo"] = newest and newest[0]
                     entry["care"] = None
                     if entry["species"]:
                         # The pot usually stores the accepted binomial — the

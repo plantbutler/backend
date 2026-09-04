@@ -639,7 +639,7 @@ def test_the_garden_can_still_report_while_a_lookup_is_waiting(db):
             with sqlite3.connect(db, timeout=0.2) as other:
                 other.execute(
                     "INSERT INTO readings (ts, controller, channel, raw) "
-                    "VALUES (1, 'b1', 0, 8000)"
+                    "VALUES (1, 0, 0, 8000)"
                 )
             wrote.append(url)
             return super().__call__(url)

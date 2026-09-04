@@ -207,7 +207,7 @@ def test_a_report_sized_body_still_fits_the_report_cap(client):
     """The photo cap is the photo route's own; raising it must not have
     quietly raised everybody else's."""
     answer = client.post(
-        "/report", content="c=b1 " + "x" * butler.BODY_CAP, headers=auth()
+        "/report", content="c=0 " + "x" * butler.BODY_CAP, headers=auth()
     )
     assert answer.status_code == 413
 
@@ -395,7 +395,7 @@ def test_the_write_lock_is_not_held_across_the_disk_write(client, db, monkeypatc
         with sqlite3.connect(db, timeout=0.2) as other:
             other.execute(
                 "INSERT INTO readings (ts, controller, channel, raw) "
-                "VALUES (1, 'b1', 0, 8000)"
+                "VALUES (1, 0, 0, 8000)"
             )
         wrote.append(len(blob))
         real(path, blob)
@@ -538,3 +538,39 @@ def test_an_empty_photos_dir_falls_back_like_an_empty_db_path(tmp_path):
     pot = make_pot(client)
     pid = photo_id(upload(client, pot))
     assert (tmp_path / "here" / "photos" / pot / f"{pid}.jpg").exists()
+
+
+def garden(client):
+    answer = client.get("/pots", headers=auth())
+    assert answer.status_code == 200, answer.text
+    return answer.json()["pots"]
+
+
+def test_the_garden_carries_the_newest_picture_for_the_thumbnail(client, db):
+    """The list shows a small picture beside each name, so /pots has to say
+    which one — the id only, since the bytes come from GET /photo/<id> and
+    the app caches those. Newest, because a plant's most recent portrait is
+    the one that says what it looks like now."""
+    pot_id = make_pot(client)
+    assert garden(client)[0]["photo"] is None, "nothing photographed yet"
+
+    first = photo_id(upload(client, pot_id))
+    assert garden(client)[0]["photo"] == first
+
+    second = photo_id(upload(client, pot_id))
+    assert garden(client)[0]["photo"] == second, "the newest one"
+
+    # Forgetting it falls back to the one before, rather than to a broken
+    # picture: the row is the truth, and there is another row.
+    client.post("/photo/delete", content=f"photo={second}", headers=auth())
+    assert garden(client)[0]["photo"] == first
+
+
+def test_a_thumbnail_belongs_to_its_own_pot(client, db):
+    basil = make_pot(client)
+    mint = make_pot(client, "name=mint")
+    shot = photo_id(upload(client, basil))
+
+    by_name = {p["id"]: p["photo"] for p in garden(client)}
+    assert by_name[basil] == shot
+    assert by_name[mint] is None
