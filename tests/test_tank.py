@@ -220,3 +220,20 @@ def test_a_dose_the_board_never_acknowledged_is_not_charged_to_the_day(client, d
     report(client, f"c=0 ch0={DRY} float=1 pos=ok ack=2 flow_ml=100")
     dry_reports(client)
     assert [row[0] for row in commands(db)] == [1, 2]  # 100 acked + 100 > 150: the cap holds
+
+
+# --------------------------------------------------------------------------- #
+# pos: waits for a board that has ever known its position (spec D11)
+# --------------------------------------------------------------------------- #
+
+
+def test_no_pos_page_before_a_board_has_ever_said_pos_ok(app, client, sent):
+    report(client, "c=0 ch0=1 float=1 pos=unknown")
+    report(client, "c=0 ch0=1 float=1 pos=unknown")
+    tick(app)
+    assert "pos:0" not in keys(sent)  # PB_REPORT_POS_UNKNOWN=1 ships this way
+    report(client, "c=0 ch0=1 float=1 pos=ok")
+    report(client, "c=0 ch0=1 float=1 pos=unknown")
+    report(client, "c=0 ch0=1 float=1 pos=unknown")
+    tick(app)
+    assert "pos:0" in keys(sent)

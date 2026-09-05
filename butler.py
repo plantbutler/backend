@@ -3209,13 +3209,28 @@ def create_app(
             float_bad_prev,
             pos_bad,
             pos_bad_prev,
+            pos_ok_seen,
         ) in con.execute(
             "SELECT controller, ts, float_ok, float_since, pos, pos_since, "
             "float_seen, pos_seen, float_bad, float_bad_prev, pos_bad, "
-            "pos_bad_prev FROM status"
+            "pos_bad_prev, pos_ok_seen FROM status"
         ):
             pos_value = {"ok": 1, "unknown": 0}.get(pos)
-            for kind, value, value_since, seen, bad, bad_prev, trouble, relief in (
+            # A board that has never said pos=ok is one shipped with the flag
+            # that forces pos=unknown; paging on it would raise once, two
+            # minutes after first boot, and then stand deaf for the whole
+            # bench programme.
+            for (
+                kind,
+                value,
+                value_since,
+                seen,
+                bad,
+                bad_prev,
+                trouble,
+                relief,
+                armed,
+            ) in (
                 (
                     "float",
                     float_ok,
@@ -3228,6 +3243,7 @@ def create_app(
                         "waterline: watering is on hold"
                     ),
                     f"the reservoir on {controller} is full again",
+                    True,
                 ),
                 (
                     "pos",
@@ -3241,6 +3257,7 @@ def create_app(
                         "watering is on hold"
                     ),
                     f"{controller} knows its manifold position again",
+                    pos_ok_seen is not None,
                 ),
             ):
                 key = f"{kind}:{controller}"
@@ -3250,7 +3267,7 @@ def create_app(
                     and now - bad <= FLAP_WINDOW_S
                     and now - bad_prev <= FLAP_WINDOW_S
                 )
-                if flapped:
+                if flapped and armed:
                     if not raised(key) and floor_ok(key):
                         found.append(Alert(key, "high", "warning", trouble, mark(key)))
                 elif (
