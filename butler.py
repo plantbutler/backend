@@ -3661,6 +3661,8 @@ def create_app(
             "(SELECT 1 FROM alerts WHERE key = 'dose:' || commands.id)",
             (now - DOSE_LOOKBACK_S,),
         ).fetchall():
+            if controller in retired:
+                continue  # judged once the board is back, inside the lookback
             row = con.execute(
                 "SELECT next_s FROM controllers WHERE controller = ?", (controller,)
             ).fetchone()

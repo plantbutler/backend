@@ -375,6 +375,20 @@ def test_a_retired_board_is_handed_no_water(client, db):
     assert post(client, "/command", "c=0 water=3 ml=50").text == "cmd=4\n"
 
 
+def test_a_retired_boards_lost_dose_is_not_judged_while_it_is_retired(app, client, db, sent):
+    assert post(client, "/command", "c=0 water=3 ml=50").text == "cmd=1\n"
+    assert "cmd=1 water=3 ml=50" in report(client, "c=0 ch0=1").text  # handed
+    post(client, "/controller", "c=0 retired=1")
+    report(client, "c=0 ch0=1")  # no ack: expired, never acknowledged
+    assert commands(db) == [(1, "expired", None)]
+    tick(app)
+    assert keys(sent) == []
+    # Skipped, not forgotten: back in service, the hand-off is judged.
+    post(client, "/controller", "c=0 retired=0")
+    tick(app)
+    assert keys(sent) == ["dose:1"]
+
+
 # --------------------------------------------------------------------------- #
 # The durable latch (spec D2-D4)
 # --------------------------------------------------------------------------- #
