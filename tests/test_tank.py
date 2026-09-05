@@ -348,6 +348,25 @@ def test_the_latch_outlives_the_board_forgetting_it(client, db):
     assert commands(db) == []  # the rules stayed dry for the whole window
 
 
+def test_the_latch_keeps_its_first_stamp_and_reason_while_it_stands(client, db):
+    report(client, "c=0 ch0=1 float=1 pos=ok ch207=1")
+    # The reports below land in the same second as the first, so a stamp
+    # rewritten on every latching report would equal the one that should
+    # have stayed put. Push it back a minute first, so kept and rewritten
+    # can differ.
+    run_sql(db, "UPDATE status SET latched_ts = latched_ts - 60")
+    stamp = health(client)["latched"]["since"]
+    report(client, "c=0 ch0=1 float=1 pos=ok ch207=1")  # the board still says so
+    report(client, "c=0 ch0=1 float=1 pos=ok err=resetmid")  # a second fault on top
+    assert health(client)["latched"] == {"since": stamp, "reason": "contra"}
+    # `since` is when the trouble began: resume ends this latch, and the
+    # next one is a new one, with its own onset and its own reason.
+    assert post(client, "/resume", "c=0").text == "resumed=0\n"
+    report(client, "c=0 ch0=1 float=1 pos=ok err=resetmid")
+    fresh = health(client)["latched"]
+    assert fresh["reason"] == "resetmid" and fresh["since"] > stamp
+
+
 def test_a_latch_expires_what_was_waiting_and_refuses_new_water(client, db):
     assert post(client, "/command", "c=0 water=3 ml=50").status_code == 200
     report(client, "c=0 ch0=1 float=1 pos=ok ch207=1 ack=99")  # the queued one is NOT handed
