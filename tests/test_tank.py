@@ -150,3 +150,21 @@ def test_an_old_database_grows_the_columns_at_startup(db):
     assert entry["retired"] == 0 and entry["latched"] is None and entry["err"] is None
     report(client, "c=0 ch0=1 err=noflow")
     assert health(client)["err"] == "noflow"
+
+
+# --------------------------------------------------------------------------- #
+# The dose ceiling is the board's (spec D10)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_dose_above_the_rig_ceiling_is_refused_before_it_is_queued(client):
+    assert butler.MAX_DOSE_ML == 250
+    assert post(client, "/command", "c=0 water=3 ml=250").status_code == 200
+    answer = post(client, "/command", "c=1 water=3 ml=251")
+    assert answer.status_code == 400 and "ml=" in answer.text
+
+
+def test_a_pot_cannot_be_saved_with_a_dose_the_board_would_refuse(client):
+    answer = post(client, "/pot", "name=basil dose_ml=251")
+    assert answer.status_code == 400 and "dose_ml" in answer.text
+    assert post(client, "/pot", "name=basil dose_ml=250").status_code == 200

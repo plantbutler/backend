@@ -124,7 +124,13 @@ MAX_CHANNEL = 255
 # nothing anywhere said the two were the same board.
 MAX_CONTROLLER = 255
 MAX_RAW = 2**31  # 14-bit ADC today; headroom without letting 2**63 near sqlite
-MAX_DOSE_ML = 1000  # a liter in one command is already implausible for a pot
+# The board's own PB_DOSE_RIG_MAX_ML, and the two move together: a pot
+# above it is refused by the firmware with err=range, acked with flow_ml=0,
+# charged nothing, cooled down and paged high once per cooldown, forever,
+# and never watered. Refusing here, at /command and at pot save, is what
+# keeps that loop unreachable. (DECISIONS #7: a full dump is a mop-up; a
+# quarter of the bench reservoir per dose is the number that makes it one.)
+MAX_DOSE_ML = 250
 MAX_CAP_S = 60  # the firmware enforces its own cap; this bounds what we ask
 MIN_NEXT_S, MAX_NEXT_S = 5, 3600  # the interval knob's sane range
 RULES_WINDOW = 5  # median of this many readings is the whole smoothing story
