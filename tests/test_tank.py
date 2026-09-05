@@ -300,6 +300,62 @@ def test_retiring_a_board_clears_its_sensor_page_too(app, client, db, sent):
     assert keys(sent) == ["sensor:0:0"]  # neither cleared aloud nor raised again
 
 
+def raise_every_page_a_board_can_earn(app, client, db, sent):
+    """The six pages the ticker raises for a board's own condition, all at
+    once: an empty tank and a lost manifold twice inside the flap window, the
+    contradiction latch, a float that never moved across a refill, then both
+    safety fields vanishing for PERSIST_S."""
+    report(client, "c=0 ch0=1 float=1 pos=ok")
+    report(client, "c=0 ch0=1 float=0 pos=unknown ch207=1")
+    report(client, "c=0 ch0=1 float=0 pos=unknown")
+    plant_float_history(db, refill_ago=600, read_ago=60, age=4200)
+    report(client, "c=0 ch0=1")
+    run_sql(
+        db,
+        "UPDATE status SET float_since = float_since - ?, pos_since = pos_since - ?",
+        PERSIST_S,
+        PERSIST_S,
+    )
+    tick(app)
+    assert sorted(keys(sent)) == [
+        "fields:float:0",
+        "fields:pos:0",
+        "float:0",
+        "latch:0",
+        "pos:0",
+        "stale:0",
+    ]
+
+
+def test_a_retired_board_pages_nothing_whatever_its_reports_say(app, client, db, sent):
+    report(client, "c=0 ch0=1 float=1 pos=ok")
+    post(client, "/controller", "c=0 retired=1")
+    # Everything a live board would page for: the tank empty twice, the
+    # manifold lost twice, the contradiction latch, and a float that never
+    # moved across a refill.
+    report(client, "c=0 ch0=1 float=0 pos=unknown ch207=1")
+    report(client, "c=0 ch0=1 float=0 pos=unknown")
+    plant_float_history(db, refill_ago=600, read_ago=60, age=4200)
+    tick(app)
+    assert keys(sent) == []
+    assert health(client)["latched"]["reason"] == "contra"  # the report landed
+    assert health(client)["float"] == 0
+    # Back in service, the board's standing trouble is heard at once.
+    post(client, "/controller", "c=0 retired=0")
+    tick(app)
+    assert sorted(keys(sent)) == ["float:0", "latch:0", "pos:0", "stale:0"]
+
+
+def test_retiring_a_board_clears_every_page_that_stood_for_it(app, client, db, sent):
+    raise_every_page_a_board_can_earn(app, client, db, sent)
+    post(client, "/controller", "c=0 retired=1")
+    assert client.get("/health").json()["alerts"] == []
+    assert run_sql(db, "SELECT COUNT(*) FROM alerts WHERE cleared_ts IS NULL AND key NOT LIKE 'meta:%'") == [(0,)]
+    assert health(client)["latched"]["reason"] == "contra"  # the page went, the row stays
+    tick(app)
+    assert len(sent) == 6  # neither cleared aloud nor raised again
+
+
 def test_a_retired_board_is_handed_no_water(client, db):
     make_pot(client, mode="learning", cooldown_h=0)
     dry_reports(client)  # cmd 1: the rules' proposal, waiting on a human

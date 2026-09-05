@@ -2791,9 +2791,11 @@ def create_app(
         Retiring drops the water still waiting for the board — a proposal
         or a queued dose would otherwise be handed out on its next report,
         so it goes the way burial sends one; a 'sent' one is with the board
-        and expires on that report. It also clears a standing silence page
-        and the board's sensor pages: both rules skip the board from now
-        on, so nobody else would ever clear them."""
+        and expires on that report. It also clears whatever page stands for
+        the board — silence, a sensor, the float, the position, a field that
+        vanished, the latch, a stuck float: every rule skips the board from
+        now on, so nobody else would ever clear them. The latch row itself
+        stays: nobody checked that tank, and the board comes back with it."""
         now = int(time.time())
         with connect() as con:
             con.execute("BEGIN IMMEDIATE")
@@ -2811,8 +2813,18 @@ def create_app(
                 )
                 con.execute(
                     "UPDATE alerts SET cleared_ts = ? WHERE cleared_ts IS NULL "
-                    "AND (key = ? OR key LIKE ?)",
-                    (now, f"silent:{controller}", f"sensor:{controller}:%"),
+                    "AND (key IN (?, ?, ?, ?, ?, ?, ?) OR key LIKE ?)",
+                    (
+                        now,
+                        f"silent:{controller}",
+                        f"float:{controller}",
+                        f"pos:{controller}",
+                        f"fields:float:{controller}",
+                        f"fields:pos:{controller}",
+                        f"latch:{controller}",
+                        f"stale:{controller}",
+                        f"sensor:{controller}:%",
+                    ),
                 )
 
     def resume(controller: int) -> None:
@@ -3286,6 +3298,18 @@ def create_app(
             )
         }
 
+        # A retired board is a quiet one, not a rejected one: its reports
+        # land, and every rule below that speaks for a board's own condition
+        # leaves it out. Nothing waters from it, so "watering is on hold" has
+        # nothing to tell; and the pages that stood when it was retired were
+        # cleared by set_retired, since nobody here would ever clear them.
+        retired = {
+            controller
+            for (controller,) in con.execute(
+                "SELECT controller FROM controllers WHERE retired = 1"
+            )
+        }
+
         def raised(key: str) -> bool:
             row = standing.get(key)
             return row is not None and row[1] is None
@@ -3425,6 +3449,8 @@ def create_app(
             "float_seen, pos_seen, float_bad, float_bad_prev, pos_bad, "
             "pos_bad_prev, pos_ok_seen FROM status"
         ):
+            if controller in retired:
+                continue
             pos_value = {"ok": 1, "unknown": 0}.get(pos)
             # A board that has never said pos=ok is one shipped with the flag
             # that forces pos=unknown; paging on it would raise once, two
@@ -3527,6 +3553,8 @@ def create_app(
             "SELECT controller, latched_ts, latch_reason FROM status "
             "WHERE latched_ts IS NOT NULL"
         ):
+            if controller in retired:
+                continue  # the row stands and comes back with the board
             key = f"latch:{controller}"
             if not raised(key):
                 found.append(
@@ -3546,6 +3574,8 @@ def create_app(
         # or stuck to the hall). Only the backend knows both the refill and
         # ch204, so the rule lives here and nowhere on the board.
         for (controller,) in con.execute("SELECT DISTINCT controller FROM refills"):
+            if controller in retired:
+                continue
             key = f"stale:{controller}"
             refill = float_frozen(con, controller, now)
             if refill is not None:

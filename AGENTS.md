@@ -138,10 +138,11 @@ watering.
   reader for the ticker and the rules — presumes the float stuck when the latest `ch204` says it
   last moved before the latest refill and `PERSIST_S` has passed: `stale:<c>` pages and the rules
   stay dry, manual water is not gated. `POST /controller c= retired=1` retires a board: reports
-  land, nothing pages or waters, a standing silence page is cleared. `MAX_DOSE_ML` is 250, the
-  board's own ceiling, at `/command` and at pot save. The daily cap charges acked water only (a
-  lost response is likelier than a lost ack; the cooldown still counts the handed dose). `pos:<c>`
-  pages only once a board has ever said `pos=ok`.
+  land (the latch row included — it comes back with the board), nothing pages or waters, and
+  whatever page stood for it is cleared, since no rule would ever clear it now. `MAX_DOSE_ML` is
+  250, the board's own ceiling, at `/command` and at pot save. The daily cap charges acked water
+  only (a lost response is likelier than a lost ack; the cooldown still counts the handed dose).
+  `pos:<c>` pages only once a board has ever said `pos=ok`.
 - The controller is an INTEGER on the wire and in every column, 0..255 (`MAX_CONTROLLER`), since
   0.17.0. It was free text, which made `c=` the one field a typo could turn into a second garden:
   a report from `bench1 ` opened its own controller row, heartbeat and alerts and nothing said the
