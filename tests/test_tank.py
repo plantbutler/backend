@@ -459,8 +459,16 @@ def test_the_float_gets_its_grace_after_a_refill_and_needs_a_refill_at_all(app, 
     plant_float_history(db, refill_ago=100, read_ago=10, age=4000)  # 90 s < PERSIST_S
     tick(app)
     assert keys(sent) == []
-    with sqlite3.connect(db) as con:
-        con.execute("DELETE FROM refills")
-        con.execute("INSERT INTO readings (ts, controller, channel, raw) VALUES (?, 0, 204, 99999)", (int(time.time()),))
+    # A board that has never been refilled is never stale, whatever ch204
+    # says. The ticker never asks about such a board (it walks the refills
+    # table), so the one path that does is the rules, on every report: send
+    # the largest count the wire accepts — older than the epoch, so a guard
+    # that stood in a refill at time zero would still read "stuck" — and the
+    # fifth dry report must water.
+    run_sql(db, "DELETE FROM refills")
+    make_pot(client, cooldown_h=0)
+    handed = dry_reports(client, extra=f"ch204={butler.MAX_RAW - 1}")
+    assert "cmd=1 water=3 ml=100" in handed
+    assert commands(db) == [(1, "sent", None)]
     tick(app)
     assert keys(sent) == []
