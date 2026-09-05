@@ -123,6 +123,15 @@ MAX_CHANNEL = 255
 # opened its own controller row, its own heartbeat and its own alerts, and
 # nothing anywhere said the two were the same board.
 MAX_CONTROLLER = 255
+# The board's diagnostic channels this file reads. ch207 is its contradiction
+# latch (float said full, meter saw nothing), 0 or 1 in every report while it
+# stands; it lives in .noinit on the board and a power cycle erases it, which
+# is why the durable half is here.
+CONTRA_CHANNEL = 207
+LATCH_TEXT = {
+    "contra": "the float said full and the meter saw nothing",
+    "resetmid": "it reset with the pump running",
+}
 MAX_RAW = 2**31  # 14-bit ADC today; headroom without letting 2**63 near sqlite
 # The board's own PB_DOSE_RIG_MAX_ML, and the two move together: a pot
 # above it is refused by the firmware with err=range, acked with flow_ml=0,
@@ -727,6 +736,22 @@ def parse_controller(text: str) -> tuple[int, int]:
     return controller, retired
 
 
+def parse_board(text: str) -> int:
+    """A body that names a board and nothing else: `c=<controller>`."""
+    controller = None
+    for token in text.split():
+        key, sep, value = token.partition("=")
+        if not sep or not key:
+            raise ValueError(f"not a k=v token: {token!r}")
+        if key == "c":
+            if controller is not None:
+                raise ValueError("c= given twice")
+            controller = _int_in(value, "c", 0, MAX_CONTROLLER + 1)
+    if controller is None:  # board 0 is a real board
+        raise ValueError("no c= in the body")
+    return controller
+
+
 class Retired(Exception):
     """POST /command's refusal of water for a retired board."""
 
@@ -739,6 +764,35 @@ def is_retired(con: sqlite3.Connection, controller: int) -> bool:
         "SELECT retired FROM controllers WHERE controller = ?", (controller,)
     ).fetchone()
     return bool(row and row[0])
+
+
+class Latched(Exception):
+    """POST /command's refusal while a board's durable latch stands."""
+
+    def __init__(self, controller: int, since: int, reason: str):
+        super().__init__(
+            f"board {controller} stopped watering ({reason} since {hhmm(since)}): "
+            "check the tank, type clear contra on the board, then resume"
+        )
+
+
+def latch_reason(r: Report) -> str | None:
+    """What in this report latches the backend, if anything. The float going
+    empty is deliberately not here: the rules already refuse on float=0, and
+    a refill is the human event for that (spec D2)."""
+    if r.channels.get(CONTRA_CHANNEL) == 1 or r.err == "contra":
+        return "contra"
+    if r.err == "resetmid":
+        return "resetmid"
+    return None
+
+
+def latch_of(con: sqlite3.Connection, controller: int) -> tuple[int, str] | None:
+    row = con.execute(
+        "SELECT latched_ts, latch_reason FROM status WHERE controller = ?",
+        (controller,),
+    ).fetchone()
+    return (row[0], row[1]) if row and row[0] is not None else None
 
 
 # The whole window at the default bucket (2016); a week at a minute would
@@ -2314,6 +2368,8 @@ def create_app(
         )
         if is_retired(con, r.controller):
             return  # a retired board keeps its readings and never waters
+        if latch_of(con, r.controller) is not None:
+            return  # the durable half of the board's latch: dry until a human resumes
         if r.float_ok != 1 or r.pos != "ok":
             return  # no reservoir, no known position, no report field: dry
         # This board's own beat, so "recent" below means the same number of
@@ -2531,6 +2587,22 @@ def create_app(
                     now if r.pos == "ok" else None,
                 ),
             )
+            reason = latch_reason(r)
+            if reason is not None:
+                # Set once, never refreshed while it stands: `since` is when
+                # the trouble began. A dose still waiting would pour into a
+                # tank nobody has looked at, so it goes the way burial sends
+                # one; a 'sent' one is with the board, whose own latch holds.
+                con.execute(
+                    "UPDATE status SET latched_ts = COALESCE(latched_ts, ?), "
+                    "latch_reason = COALESCE(latch_reason, ?) WHERE controller = ?",
+                    (now, reason, r.controller),
+                )
+                con.execute(
+                    "UPDATE commands SET state = 'expired' WHERE controller = ? "
+                    "AND kind = 'water' AND state IN ('proposed', 'queued')",
+                    (r.controller,),
+                )
             if r.ack is not None:
                 con.execute(
                     "UPDATE commands SET state = 'acked', acked_ts = ?, flow_ml = ? "
@@ -2636,6 +2708,10 @@ def create_app(
             # direction, and the board may be mid-dose from before.
             if c.kind == "water" and is_retired(con, c.controller):
                 raise Retired(c.controller)
+            if c.kind == "water":
+                standing = latch_of(con, c.controller)
+                if standing is not None:
+                    raise Latched(c.controller, *standing)
             busy = con.execute(
                 "SELECT id, state FROM commands "
                 "WHERE controller = ? AND state IN ('queued', 'sent') LIMIT 1",
@@ -2707,6 +2783,23 @@ def create_app(
                     "AND (key = ? OR key LIKE ?)",
                     (now, f"silent:{controller}", f"sensor:{controller}:%"),
                 )
+
+    def resume(controller: int) -> None:
+        """The human's half: the tank was checked. Clears the row and the
+        page together, so /health and the phone agree the moment it answers;
+        idempotent on a board that was not latched."""
+        now = int(time.time())
+        with connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            con.execute(
+                "UPDATE status SET latched_ts = NULL, latch_reason = NULL "
+                "WHERE controller = ?",
+                (controller,),
+            )
+            con.execute(
+                "UPDATE alerts SET cleared_ts = ? WHERE key = ? AND cleared_ts IS NULL",
+                (now, f"latch:{controller}"),
+            )
 
     def free_alerts(
         con: sqlite3.Connection,
@@ -3387,6 +3480,27 @@ def create_app(
                         )
                     )
 
+        # The durable latch. High, and without the re-alert floor: a board
+        # that latches again ten minutes after a human resumed it is exactly
+        # the repeat that must not wait an hour to be heard.
+        for controller, latched_ts, reason in con.execute(
+            "SELECT controller, latched_ts, latch_reason FROM status "
+            "WHERE latched_ts IS NOT NULL"
+        ):
+            key = f"latch:{controller}"
+            if not raised(key):
+                found.append(
+                    Alert(
+                        key,
+                        "high",
+                        "warning",
+                        f"board {controller} stopped watering: "
+                        f"{LATCH_TEXT.get(reason, reason)} — check the tank, type "
+                        "clear contra on the board, then resume in the app",
+                        mark(key),
+                    )
+                )
+
         # Every dose the board was handed gets judged exactly once: never
         # acked (judged immediately — the loss is proven the moment the next
         # report failed to ack), short on the meter, or no moisture rise
@@ -3765,6 +3879,8 @@ def create_app(
             cmd_id, busy = await run_in_threadpool(enqueue, parsed)
         except Retired as why:
             return PlainTextResponse(f"refused: {why}\n", status_code=409)
+        except Latched as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=409)
         except sqlite3.OperationalError as why:
             return PlainTextResponse(f"try again: {why}\n", status_code=503)
         if busy:
@@ -3812,6 +3928,23 @@ def create_app(
         except sqlite3.OperationalError as why:
             return PlainTextResponse(f"try again: {why}\n", status_code=503)
         return PlainTextResponse(f"controller={controller} retired={retired}\n")
+
+    @app.post("/resume")
+    async def resume_board(request: Request):
+        if bad_token(request):
+            return PlainTextResponse("bad token\n", status_code=401)
+        body = await slurp(request)
+        if isinstance(body, PlainTextResponse):
+            return body
+        try:
+            controller = parse_board(body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=400)
+        try:
+            await run_in_threadpool(resume, controller)
+        except sqlite3.OperationalError as why:
+            return PlainTextResponse(f"try again: {why}\n", status_code=503)
+        return PlainTextResponse(f"resumed={controller}\n")
 
     @app.post("/pot")
     async def pot(request: Request):

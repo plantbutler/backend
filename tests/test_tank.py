@@ -317,3 +317,64 @@ def test_a_retired_board_is_handed_no_water(client, db):
     report(client, "c=0 ch0=1 ack=3")
     post(client, "/controller", "c=0 retired=0")
     assert post(client, "/command", "c=0 water=3 ml=50").text == "cmd=4\n"
+
+
+# --------------------------------------------------------------------------- #
+# The durable latch (spec D2-D4)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_board_latches_the_backend_through_ch207_or_err(client):
+    report(client, "c=0 ch0=1 float=1 pos=ok ch207=1")
+    latched = health(client)["latched"]
+    assert latched["reason"] == "contra" and latched["since"] > 0
+    report(client, "c=1 ch0=1 float=1 pos=ok err=contra")
+    assert health(client, 1)["latched"]["reason"] == "contra"
+    report(client, "c=2 ch0=1 float=1 pos=ok err=resetmid")
+    assert health(client, 2)["latched"]["reason"] == "resetmid"
+    # An empty tank is not a latch (D2's deviation): the rules refuse on it.
+    report(client, "c=3 ch0=1 float=1 pos=ok")
+    report(client, "c=3 ch0=1 float=0 pos=ok")
+    assert health(client, 3)["latched"] is None
+
+
+def test_the_latch_outlives_the_board_forgetting_it(client, db):
+    make_pot(client, cooldown_h=0)
+    report(client, f"c=0 ch0={DRY} float=1 pos=ok ch207=1")
+    since = health(client)["latched"]["since"]
+    # A power cycle: the board comes back clean and keeps saying so.
+    dry_reports(client, extra="ch207=0")
+    assert health(client)["latched"] == {"since": since, "reason": "contra"}
+    assert commands(db) == []  # the rules stayed dry for the whole window
+
+
+def test_a_latch_expires_what_was_waiting_and_refuses_new_water(client, db):
+    assert post(client, "/command", "c=0 water=3 ml=50").status_code == 200
+    report(client, "c=0 ch0=1 float=1 pos=ok ch207=1 ack=99")  # the queued one is NOT handed
+    assert commands(db) == [(1, "expired", None)]
+    answer = post(client, "/command", "c=0 water=3 ml=50")
+    assert answer.status_code == 409
+    assert answer.text.startswith("refused: board 0 stopped watering (contra since ")
+    assert answer.text.rstrip().endswith("check the tank, type clear contra on the board, then resume")
+    assert post(client, "/command", "c=0 stop=1").status_code == 200
+
+
+def test_the_latch_pages_once_and_resume_clears_row_and_page(app, client, db, sent):
+    report(client, "c=0 ch0=1 float=1 pos=ok err=contra")
+    tick(app)
+    tick(app)
+    assert keys(sent) == ["latch:0"]
+    (alert,) = [a for a in sent if a.key == "latch:0"]
+    assert alert.priority == "high" and "float said full and the meter saw nothing" in alert.message
+    assert client.get("/health").json()["alerts"][0]["key"] == "latch:0"
+    answer = post(client, "/resume", "c=0")
+    assert answer.status_code == 200 and answer.text == "resumed=0\n"
+    assert health(client)["latched"] is None
+    assert client.get("/health").json()["alerts"] == []
+    assert post(client, "/command", "c=0 water=3 ml=50").status_code == 200
+    # A re-latch inside the hour pages again: no re-alert floor on this one.
+    report(client, "c=0 ch0=1 float=1 pos=ok ch207=1")
+    tick(app)
+    assert keys(sent) == ["latch:0", "latch:0"]
+    assert post(client, "/resume", "c=0").text == "resumed=0\n"  # idempotent on a clean board
+    assert post(client, "/resume", "c=0").text == "resumed=0\n"
