@@ -25,15 +25,30 @@ FULL_SCALE = 16383  # 14-bit, like the real ADC
 
 
 def build_report(
-    controller, t_ms, values, ack=None, flow_ml=None, float_ok=None, pos=None
+    controller,
+    t_ms,
+    values,
+    ack=None,
+    flow_ml=None,
+    float_ok=None,
+    pos=None,
+    err=None,
+    contra=False,
+    float_age=None,
 ):
     """One report body, exactly as the board would write it."""
     tokens = [f"c={controller}", f"t={t_ms}"]
     tokens += [f"ch{i}={v}" for i, v in enumerate(values)]
+    if float_age is not None:
+        tokens.append(f"ch204={float_age}")
+    if contra:
+        tokens.append("ch207=1")
     if float_ok is not None:
         tokens.append(f"float={float_ok}")
     if pos is not None:
         tokens.append(f"pos={pos}")
+    if err is not None:
+        tokens.append(f"err={err}")
     if ack is not None:
         tokens += [f"ack={ack}", f"flow_ml={flow_ml}"]
     return " ".join(tokens) + "\n"
@@ -85,6 +100,23 @@ def main():
         default="ok",
         help="manifold position status",
     )
+    ap.add_argument(
+        "--err",
+        metavar="TOKEN",
+        help="the board's last safety error, on every report (contra latches the backend)",
+    )
+    ap.add_argument(
+        "--contra",
+        action="store_true",
+        help="the board's contradiction latch stands (ch207=1 on every report)",
+    )
+    ap.add_argument(
+        "--float-age",
+        type=int,
+        dest="float_age",
+        metavar="N",
+        help="seconds since the float last moved (ch204=N on every report)",
+    )
     args = ap.parse_args()
     if not args.token:
         ap.error("--token or BUTLER_TOKEN is required")
@@ -106,7 +138,16 @@ def main():
             ack, flow_ml = pending if pending else (None, None)
             pending = None
             body = build_report(
-                args.controller, t_ms, values, ack, flow_ml, args.float_ok, args.pos
+                args.controller,
+                t_ms,
+                values,
+                ack,
+                flow_ml,
+                args.float_ok,
+                args.pos,
+                err=args.err,
+                contra=args.contra,
+                float_age=args.float_age,
             )
             attempts = 0
         attempts += 1

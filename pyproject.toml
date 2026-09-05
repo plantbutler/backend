@@ -1,6 +1,6 @@
 [project]
 name = "plantbutler-backend"
-version = "0.17.0"
+version = "0.18.0"
 description = "Plant Butler backend: raw readings land here, commands leave from here"
 requires-python = ">=3.12"
 dependencies = [

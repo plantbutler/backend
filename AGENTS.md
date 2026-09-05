@@ -32,7 +32,10 @@ watering.
   answers `next=` plus at most one `cmd=` line), `POST /command` (queue `water=<outlet>
   ml= [cap_s=]` or `stop=1`, one slot per controller, 409 when busy; a missing cap_s is sized
   by `cap_for`, the one owner of FLOW_FLOOR_ML_S), `POST /interval`
-  (per-controller `next=` override, 0 clears), `POST /pot` (partial edit keyed on `id=`, the
+  (per-controller `next=` override, 0 clears), `POST /controller` (`c= retired=`: retire a board
+  or bring it back; answers `controller=<c> retired=<0|1>`), `POST /refill` (`c=`: a human
+  refilled that board's tank; answers `refill=<ts>`), `POST /resume` (`c=`: lift the latch;
+  answers `resumed=<c>`, idempotent), `POST /pot` (partial edit keyed on `id=`, the
   `pot-xxxxxx` a bare `name=` create mints and every answer carries; mapping, calibration,
   Planta-style fields, rules knobs. A post without an `id=` is always a CREATE: a taken name is
   refused, not quietly edited, so a stale client cannot overwrite a pot it could not see. Which
@@ -67,7 +70,8 @@ watering.
   accepting is an ordinary `POST /pot`),
   `POST /approve` (proposed -> queued, slot permitting), `POST /verdict` (ok | too_much |
   too_little per executed dose), `GET /health` (count, last ts, the default interval, per-controller
-  heartbeat/knob/open command/safety fields, raised alerts), `GET /hello` (`butler=<VERSION>`, or
+  heartbeat/knob/open command/safety fields — since 0.18.0 also `err`, `err_ts`, `pos_ok_seen`,
+  `retired`, `latched` (`{since, reason}` or null) and `last_refill` — raised alerts), `GET /hello` (`butler=<VERSION>`, or
   401 — the one gated route that neither writes nor reads the database, so a phone being set up can
   tell a wrong address from a wrong token, and a butler whose volume came unmounted can still say
   the token was wrong. `VERSION` lives in butler.py because the container installs no package; a
@@ -125,6 +129,19 @@ watering.
 - The command slot: queued → handed exactly once in a report response (sent) → acked by the
   next report's `ack=<id> flow_ml=`; a no-ack report or the TTL expires it. Expired is gone —
   ask again. The commands table is never pruned: it doubles as the watering history.
+- **The tank (0.18.0, pitch "Trust the tank").** The board's `err=` is stored on `status` (last
+  value and when). `ch207=1` or `err=contra` latches the backend (`resetmid` too): `water_rules`
+  goes dry, `POST /command water=` answers 409, the queued dose expires, and `latch:<c>` pages
+  high without the re-alert floor — until `POST /resume`, the human's half, which the app offers
+  beside the words "type `clear contra` on the board". The float going empty does not latch: the
+  rules already refuse on it. `POST /refill` records a human refill; `float_frozen()` — one
+  reader for the ticker and the rules — presumes the float stuck when the latest `ch204` says it
+  last moved before the latest refill and `PERSIST_S` has passed: `stale:<c>` pages and the rules
+  stay dry, manual water is not gated. `POST /controller c= retired=1` retires a board: reports
+  land, nothing pages or waters, a standing silence page is cleared. `MAX_DOSE_ML` is 250, the
+  board's own ceiling, at `/command` and at pot save. The daily cap charges acked water only (a
+  lost response is likelier than a lost ack; the cooldown still counts the handed dose). `pos:<c>`
+  pages only once a board has ever said `pos=ok`.
 - The controller is an INTEGER on the wire and in every column, 0..255 (`MAX_CONTROLLER`), since
   0.17.0. It was free text, which made `c=` the one field a typo could turn into a second garden:
   a report from `bench1 ` opened its own controller row, heartbeat and alerts and nothing said the
@@ -196,7 +213,8 @@ watering.
   does not exist refused without writing anything; 0.15.0 on 2026-09-04 turns `plant_type` into a
   closed set of six kinds, replaces the two free-text sizes with `pot_diameter_cm` and
   `plant_height_cm` and reads them as a water buffer and the demand on it, and answers `kind` from
-  GBIF's family so the dropdown opens pre-selected): container `plantbutler`
+  GBIF's family so the dropdown opens pre-selected; 0.18.0 on 2026-09-05 with the tank): container
+  `plantbutler`
   on the NAS, port 9380, image `plantbutler-backend:0.15.0` shipped via `docker save | ssh docker load` over the tailnet, database on `/volume1/docker/plantbutler/data`, secrets in `deploy.env` beside it
   (600, not in git: the token, the ntfy topic, the healthchecks.io ping URL, the Trefle token),
   `-e TZ=Europe/Zurich` so BUTLER_QUIET means local night. Photographs share that volume —

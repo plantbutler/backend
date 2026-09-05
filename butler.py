@@ -92,7 +92,7 @@ from starlette.requests import ClientDisconnect
 # metadata because the container installs no package — it copies butler.py
 # beside fastapi and runs it. A test asserts this and pyproject.toml agree,
 # which is the only thing that keeps the two honest.
-VERSION = "0.17.0"
+VERSION = "0.18.0"
 
 BODY_CAP = 4096  # a full 15-channel report is ~200 bytes; 4 KB is generous
 # Photographs are the first thing here that is not small. The phone caps the
