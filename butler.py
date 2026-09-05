@@ -781,13 +781,20 @@ class Latched(Exception):
         )
 
 
-def latch_reason(r: Report) -> str | None:
-    """What in this report latches the backend, if anything. The float going
-    empty is deliberately not here: the rules already refuse on float=0, and
-    a refill is the human event for that (spec D2)."""
-    if r.channels.get(CONTRA_CHANNEL) == 1 or r.err == "contra":
+def latch_reason(r: Report, prev_err: str | None) -> str | None:
+    """What in this report latches the backend, if anything; `prev_err` is
+    the stored status.err before this report. ch207 is a level: the board
+    sends it on every report while its latch stands, and `clear contra` on
+    the console drops it. err= is the board's sticky last error, repeated
+    on every report until a later dose ends with something else and never
+    touched by the console, so `err=contra` is not a trigger — it would
+    re-latch a resumed board forever — and resetmid is an edge: the value
+    turning into it in this report. The float going empty is deliberately
+    not here either: the rules already refuse on float=0, and a refill is
+    the human event for that (spec D2)."""
+    if r.channels.get(CONTRA_CHANNEL) == 1:
         return "contra"
-    if r.err == "resetmid":
+    if r.err == "resetmid" and prev_err != "resetmid":
         return "resetmid"
     return None
 
@@ -2563,13 +2570,21 @@ def create_app(
                 "ON CONFLICT(controller) DO UPDATE SET last_seen = excluded.last_seen",
                 (r.controller, now),
             )
+            # The board's error before this report: the resetmid latch is
+            # an edge on it, and the upsert below overwrites it.
+            prev = con.execute(
+                "SELECT err FROM status WHERE controller = ?", (r.controller,)
+            ).fetchone()
+            prev_err = prev[0] if prev else None
             # The latest safety fields, with enough history for the alert
             # rules: when each value last changed (`since`), when each was
             # last sent at all (`seen` — its vanishing is an alarm), and the
             # last two bad sightings (`bad`, `bad_prev` — a float flapping
             # at the waterline must still page). Plus the board's last error
-            # (`err`, `err_ts`: a last-error field, left alone by a report
-            # without one) and the last pos=ok ever seen (`pos_ok_seen`).
+            # (`err`, left alone by a report without one, and `err_ts`, when
+            # it last changed value — the board repeats its last error on
+            # every report, so "last seen" would just be the report clock)
+            # and the last pos=ok ever seen (`pos_ok_seen`).
             # All SET expressions read the pre-update row, so the ordering
             # below is safe. latched_ts/latch_reason are deliberately not
             # here: the latch is set and cleared on its own, never through
@@ -2599,6 +2614,7 @@ def create_app(
                 "THEN excluded.ts ELSE status.pos_bad END, "
                 "err = COALESCE(excluded.err, status.err), "
                 "err_ts = CASE WHEN excluded.err IS NOT NULL "
+                "AND status.err IS NOT excluded.err "
                 "THEN excluded.ts ELSE status.err_ts END, "
                 "pos_ok_seen = CASE WHEN excluded.pos = 'ok' "
                 "THEN excluded.ts ELSE status.pos_ok_seen END",
@@ -2618,7 +2634,7 @@ def create_app(
                     now if r.pos == "ok" else None,
                 ),
             )
-            reason = latch_reason(r)
+            reason = latch_reason(r, prev_err)
             if reason is not None:
                 # Set once, never refreshed while it stands: `since` is when
                 # the trouble began. A dose still waiting would pour into a

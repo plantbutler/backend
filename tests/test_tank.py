@@ -380,18 +380,66 @@ def test_a_retired_board_is_handed_no_water(client, db):
 # --------------------------------------------------------------------------- #
 
 
-def test_the_board_latches_the_backend_through_ch207_or_err(client):
+def test_the_board_latches_the_backend_through_ch207_or_the_resetmid_edge(client):
     report(client, "c=0 ch0=1 float=1 pos=ok ch207=1")
     latched = health(client)["latched"]
     assert latched["reason"] == "contra" and latched["since"] > 0
+    # err= is the board's sticky last error, sent on every report until a
+    # later dose ends otherwise; `clear contra` on the console never touches
+    # it. ch207 is the level the console clears, and the only contra trigger.
     report(client, "c=1 ch0=1 float=1 pos=ok err=contra")
-    assert health(client, 1)["latched"]["reason"] == "contra"
+    assert health(client, 1)["latched"] is None
     report(client, "c=2 ch0=1 float=1 pos=ok err=resetmid")
     assert health(client, 2)["latched"]["reason"] == "resetmid"
     # An empty tank is not a latch (D2's deviation): the rules refuse on it.
     report(client, "c=3 ch0=1 float=1 pos=ok")
     report(client, "c=3 ch0=1 float=0 pos=ok")
     assert health(client, 3)["latched"] is None
+
+
+def test_the_sticky_err_contra_cannot_relatch_a_resumed_board(client):
+    report(client, "c=0 ch0=1 float=1 pos=ok ch207=1 err=contra")
+    assert health(client)["latched"]["reason"] == "contra"
+    assert post(client, "/resume", "c=0").text == "resumed=0\n"
+    # `clear contra` on the board dropped ch207; err= still says contra, and
+    # will until the next dose ends with something else.
+    report(client, "c=0 ch0=1 float=1 pos=ok ch207=0 err=contra")
+    report(client, "c=0 ch0=1 float=1 pos=ok ch207=0 err=contra")
+    assert health(client)["latched"] is None
+    assert post(client, "/command", "c=0 water=3 ml=50").status_code == 200
+
+
+def test_resetmid_latches_on_its_edge_and_not_on_every_repeat(client):
+    report(client, "c=0 ch0=1 float=1 pos=ok err=range")
+    assert health(client)["latched"] is None
+    report(client, "c=0 ch0=1 float=1 pos=ok err=resetmid")
+    assert health(client)["latched"]["reason"] == "resetmid"
+    assert post(client, "/resume", "c=0").text == "resumed=0\n"
+    # The board keeps saying so: the same error, not a new one.
+    report(client, "c=0 ch0=1 float=1 pos=ok err=resetmid")
+    report(client, "c=0 ch0=1 float=1 pos=ok err=resetmid")
+    assert health(client)["latched"] is None
+    # A later transition into it is a new reset with the pump running.
+    report(client, "c=0 ch0=1 float=1 pos=ok err=none")
+    report(client, "c=0 ch0=1 float=1 pos=ok err=resetmid")
+    assert health(client)["latched"]["reason"] == "resetmid"
+    # A board's first report ever saying it latches: nothing stored before.
+    report(client, "c=1 ch0=1 float=1 pos=ok err=resetmid")
+    assert health(client, 1)["latched"]["reason"] == "resetmid"
+
+
+def test_err_ts_is_when_the_error_changed_not_when_it_was_last_seen(client, db):
+    report(client, "c=0 ch0=1 err=heap")
+    # Same second as the reports below: backdate so kept and rewritten differ.
+    run_sql(db, "UPDATE status SET err_ts = err_ts - 60")
+    stamp = health(client)["err_ts"]
+    report(client, "c=0 ch0=1 err=heap")
+    report(client, "c=0 ch0=1 err=heap")
+    kept = health(client)
+    assert kept["err"] == "heap" and kept["err_ts"] == stamp
+    report(client, "c=0 ch0=1 err=none")
+    changed = health(client)
+    assert changed["err"] == "none" and changed["err_ts"] > stamp
 
 
 def test_the_latch_outlives_the_board_forgetting_it(client, db):
@@ -416,8 +464,10 @@ def test_the_latch_keeps_its_first_stamp_and_reason_while_it_stands(client, db):
     report(client, "c=0 ch0=1 float=1 pos=ok err=resetmid")  # a second fault on top
     assert health(client)["latched"] == {"since": stamp, "reason": "contra"}
     # `since` is when the trouble began: resume ends this latch, and the
-    # next one is a new one, with its own onset and its own reason.
+    # next one is a new one, with its own onset and its own reason — here
+    # a fresh reset with the pump running, err= turning to resetmid again.
     assert post(client, "/resume", "c=0").text == "resumed=0\n"
+    report(client, "c=0 ch0=1 float=1 pos=ok err=none")
     report(client, "c=0 ch0=1 float=1 pos=ok err=resetmid")
     fresh = health(client)["latched"]
     assert fresh["reason"] == "resetmid" and fresh["since"] > stamp
@@ -435,7 +485,7 @@ def test_a_latch_expires_what_was_waiting_and_refuses_new_water(client, db):
 
 
 def test_the_latch_pages_once_and_resume_clears_row_and_page(app, client, db, sent):
-    report(client, "c=0 ch0=1 float=1 pos=ok err=contra")
+    report(client, "c=0 ch0=1 float=1 pos=ok ch207=1 err=contra")
     tick(app)
     tick(app)
     assert keys(sent) == ["latch:0"]
