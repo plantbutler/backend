@@ -2375,12 +2375,20 @@ def create_app(
             if watered:
                 continue
             cap = cap_ml if cap_ml is not None else DEFAULT_DAILY_CAP_DOSES * dose
+            # Acked water only. A handed command the board never acked is far
+            # likelier a response that never arrived than an ack that was
+            # lost — the firmware never retries once any response bytes came
+            # back — and charging its full dose starved the pot for the day
+            # on nothing. The cooldown above still counts it: spacing errs
+            # dry, the cap counts water. (Jacopo, 2026-09-05.)
+            #
             # One row, one owner, one SUM. This used to need a DISTINCT over
             # a join, because a dose handed in the very second of a remap sat
             # in both the window that closed and the one that opened; a
             # stamped row cannot be in two windows at once.
             (spent,) = con.execute(
-                "SELECT COALESCE(SUM(COALESCE(flow_ml, ml)), 0) FROM commands "
+                "SELECT COALESCE(SUM(CASE WHEN acked_ts IS NOT NULL "
+                "THEN COALESCE(flow_ml, ml) ELSE 0 END), 0) FROM commands "
                 "WHERE pot_id = ? AND sent_ts > ?",
                 (pot_id, now - 86400),
             ).fetchone()
@@ -2389,7 +2397,8 @@ def create_app(
             # to. MAX rather than a sum, because an attributed dose is
             # counted by both queries and must be spent once.
             (hose_spent,) = con.execute(
-                "SELECT COALESCE(SUM(COALESCE(flow_ml, ml)), 0) FROM commands "
+                "SELECT COALESCE(SUM(CASE WHEN acked_ts IS NOT NULL "
+                "THEN COALESCE(flow_ml, ml) ELSE 0 END), 0) FROM commands "
                 "WHERE controller = ? AND outlet = ? AND sent_ts > ?",
                 (r.controller, outlet, now - 86400),
             ).fetchone()

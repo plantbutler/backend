@@ -168,3 +168,55 @@ def test_a_pot_cannot_be_saved_with_a_dose_the_board_would_refuse(client):
     answer = post(client, "/pot", "name=basil dose_ml=251")
     assert answer.status_code == 400 and "dose_ml" in answer.text
     assert post(client, "/pot", "name=basil dose_ml=250").status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# The daily cap counts water the board acknowledged (spec D9)
+# --------------------------------------------------------------------------- #
+
+
+def make_pot(client, **over):
+    fields = {
+        "name": "basil",
+        "controller": 0,
+        "channel": 0,
+        "outlet": 3,
+        "dry_raw": 12000,
+        "wet_raw": 4000,
+        "target_low_pct": 30,
+        "target_high_pct": 60,
+        "dose_ml": 100,
+        "mode": "auto",
+    } | over
+    body = " ".join(f"{k}={v}" for k, v in fields.items())
+    answer = post(client, "/pot", body)
+    assert answer.status_code == 200, answer.text
+    return answer.text.split()[0].removeprefix("pot=")
+
+
+def dry_reports(client, n=5, extra=""):
+    """n dry reports with the safety fields the rules need; no t=, so none
+    is a retry of another. Returns the last response text."""
+    text = ""
+    for _ in range(n):
+        text = report(client, f"c=0 ch0={DRY} float=1 pos=ok {extra}".strip()).text
+    return text
+
+
+def commands(db):
+    return run_sql(db, "SELECT id, state, flow_ml FROM commands ORDER BY id")
+
+
+def test_a_dose_the_board_never_acknowledged_is_not_charged_to_the_day(client, db):
+    make_pot(client, cooldown_h=0, daily_cap_ml=150)
+    assert "cmd=1 water=3 ml=100" in dry_reports(client)  # handed on the fifth
+    # No ack: cmd 1 expires, never acked. Before this change its phantom
+    # 100 ml counted, 100 + 100 > 150, and the pot went thirsty for the day
+    # on a response that never arrived. The window is already five dry
+    # readings deep, so the rules take the freed slot on this very report.
+    unacked = report(client, f"c=0 ch0={DRY} float=1 pos=ok")
+    assert "cmd=2 water=3 ml=100" in unacked.text
+    assert commands(db) == [(1, "expired", None), (2, "sent", None)]
+    report(client, f"c=0 ch0={DRY} float=1 pos=ok ack=2 flow_ml=100")
+    dry_reports(client)
+    assert [row[0] for row in commands(db)] == [1, 2]  # 100 acked + 100 > 150: the cap holds
