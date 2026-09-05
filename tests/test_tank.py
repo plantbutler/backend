@@ -87,23 +87,36 @@ def test_err_is_parsed_once_and_as_a_short_token():
         parse_report("c=0 ch0=1 err=" + "x" * 17)
 
 
-def test_the_last_err_is_kept_until_the_board_sends_another(client):
+def test_the_last_err_is_kept_until_the_board_sends_another(client, db):
     report(client, "c=0 ch0=1 err=heap")
     first = health(client)
     assert first["err"] == "heap" and first["err_ts"] > 0
+    # The reports below land in the same second as the first, so a stamp
+    # rewritten on every report would equal the one that should have stayed
+    # put. Push it back a minute first, so kept and rewritten can differ.
+    run_sql(db, "UPDATE status SET err_ts = err_ts - 60")
+    stamp = first["err_ts"] - 60
     report(client, "c=0 ch0=1")
-    assert health(client)["err"] == "heap"
+    kept = health(client)
+    assert kept["err"] == "heap" and kept["err_ts"] == stamp
     report(client, "c=0 ch0=1 err=range")
-    assert health(client)["err"] == "range"
+    replaced = health(client)
+    assert replaced["err"] == "range" and replaced["err_ts"] > stamp
 
 
-def test_pos_ok_seen_remembers_that_the_board_once_knew_its_position(client):
+def test_pos_ok_seen_remembers_that_the_board_once_knew_its_position(client, db):
     report(client, "c=0 ch0=1 pos=unknown")
     assert health(client)["pos_ok_seen"] is None
     report(client, "c=0 ch0=1 pos=ok")
     assert health(client)["pos_ok_seen"] > 0
+    # Same second as the report above: backdate the stamp so "frozen at the
+    # last pos=ok" and "refreshed by any pos=" give different numbers.
+    run_sql(db, "UPDATE status SET pos_ok_seen = pos_ok_seen - 60")
+    stamp = health(client)["pos_ok_seen"]
     report(client, "c=0 ch0=1 pos=unknown")
-    assert health(client)["pos_ok_seen"] > 0
+    assert health(client)["pos_ok_seen"] == stamp
+    report(client, "c=0 ch0=1 pos=ok")
+    assert health(client)["pos_ok_seen"] > stamp
 
 
 def test_health_carries_the_new_fields_with_their_defaults(client):
