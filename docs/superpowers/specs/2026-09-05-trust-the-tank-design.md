@@ -143,5 +143,5 @@ dose ceiling is one number in two places, and what latches the backend (D2, with
 - `refills` needs its own index; the stale rule reads the latest row per controller every tick.
 - The app's `Json` ignores unknown keys and every new field defaults, so a phone against 0.17.0
   still parses; a 0.18.0 backend against the old phone just carries fields it never reads.
-- Test the two writers of the latch (`ch207` and `err=contra`) and the two readers
+- Test the two writers of the latch (`ch207`, and the `resetmid` edge) and the two readers
   (`water_rules`, `/command`) separately; and prove `resume` clears the alert, not just the row.
