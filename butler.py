@@ -111,6 +111,10 @@ PHOTO_ID_TRIES = 4
 # is a `pot=../../etc` writing outside the photo store, which no amount of
 # "but the pot has to exist" reasoning further down would catch on its own.
 SAFE_ID = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
+# err= is the board's last safety error: one of its own short lowercase
+# tokens (contra, resetmid, range, heap, ...). Bounded like every other
+# field, so a stray value cannot become an unbounded TEXT on status.
+ERR_TOKEN = re.compile(r"\A[a-z_]{1,16}\Z")
 RETRY_WINDOW_S = 300  # how long an identical (controller, t) counts as a retry
 MAX_CHANNEL = 255
 # The board's own number, and an integer like every other identifier on the
@@ -152,6 +156,7 @@ class Report(NamedTuple):
     flow_ml: int | None  # what the flow meter counted while executing it
     float_ok: int | None  # reservoir float switch: 1 floats, 0 empty
     pos: str | None  # manifold position: 'ok' or 'unknown'
+    err: str | None  # the board's last safety error token, when it sent one
 
 
 class Command(NamedTuple):
@@ -283,6 +288,14 @@ ADDED_COLUMNS = (
     ),
     ("readings", "pot_id", "TEXT", None, None),
     ("commands", "pot_id", "TEXT", None, None),
+    # Trust the tank (0.18.0): a board's own last error, its durable latch,
+    # whether it ever knew its position, and whether it is retired.
+    ("controllers", "retired", "INTEGER NOT NULL DEFAULT 0", None, None),
+    ("status", "err", "TEXT", None, None),
+    ("status", "err_ts", "INTEGER", None, None),
+    ("status", "latched_ts", "INTEGER", None, None),
+    ("status", "latch_reason", "TEXT", None, None),
+    ("status", "pos_ok_seen", "INTEGER", None, None),
 )
 
 
@@ -542,7 +555,7 @@ def parse_report(text: str) -> Report:
     """
     controller = None
     channels: dict[int, int] = {}
-    t = ack = flow_ml = float_ok = pos = None
+    t = ack = flow_ml = float_ok = pos = err = None
     for token in text.split():
         key, sep, value = token.partition("=")
         if not sep or not key:
@@ -573,6 +586,12 @@ def parse_report(text: str) -> Report:
             if value not in ("ok", "unknown"):
                 raise ValueError(f"pos= must be ok or unknown, got {value!r}")
             pos = value
+        elif key == "err":
+            if err is not None:
+                raise ValueError("err= given twice")
+            if not ERR_TOKEN.match(value):
+                raise ValueError(f"err= must be a short lowercase token, got {value!r}")
+            err = value
         elif key.startswith("ch") and key[2:].isascii() and key[2:].isdigit():
             channel = int(key[2:])
             if channel > MAX_CHANNEL:
@@ -588,7 +607,7 @@ def parse_report(text: str) -> Report:
         raise ValueError("no chN= in the report")
     if flow_ml is not None and ack is None:
         raise ValueError("flow_ml= without ack=")
-    return Report(controller, channels, t, ack, flow_ml, float_ok, pos)
+    return Report(controller, channels, t, ack, flow_ml, float_ok, pos, err)
 
 
 def cap_for(ml: int) -> int:
@@ -2407,13 +2426,18 @@ def create_app(
             # rules: when each value last changed (`since`), when each was
             # last sent at all (`seen` — its vanishing is an alarm), and the
             # last two bad sightings (`bad`, `bad_prev` — a float flapping
-            # at the waterline must still page). All SET expressions read
-            # the pre-update row, so the ordering below is safe.
+            # at the waterline must still page). Plus the board's last error
+            # (`err`, `err_ts`: a last-error field, left alone by a report
+            # without one) and the last pos=ok ever seen (`pos_ok_seen`).
+            # All SET expressions read the pre-update row, so the ordering
+            # below is safe. latched_ts/latch_reason are deliberately not
+            # here: the latch is set and cleared on its own, never through
+            # this upsert, so no report can overwrite it.
             con.execute(
                 "INSERT INTO status (controller, ts, float_ok, float_since, "
                 "pos, pos_since, float_seen, pos_seen, float_bad, "
-                "float_bad_prev, pos_bad, pos_bad_prev) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL) "
+                "float_bad_prev, pos_bad, pos_bad_prev, err, err_ts, pos_ok_seen) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?) "
                 "ON CONFLICT(controller) DO UPDATE SET ts = excluded.ts, "
                 "float_ok = excluded.float_ok, pos = excluded.pos, "
                 "float_since = CASE WHEN status.float_ok IS excluded.float_ok "
@@ -2431,7 +2455,12 @@ def create_app(
                 "pos_bad_prev = CASE WHEN excluded.pos = 'unknown' "
                 "THEN status.pos_bad ELSE status.pos_bad_prev END, "
                 "pos_bad = CASE WHEN excluded.pos = 'unknown' "
-                "THEN excluded.ts ELSE status.pos_bad END",
+                "THEN excluded.ts ELSE status.pos_bad END, "
+                "err = COALESCE(excluded.err, status.err), "
+                "err_ts = CASE WHEN excluded.err IS NOT NULL "
+                "THEN excluded.ts ELSE status.err_ts END, "
+                "pos_ok_seen = CASE WHEN excluded.pos = 'ok' "
+                "THEN excluded.ts ELSE status.pos_ok_seen END",
                 (
                     r.controller,
                     now,
@@ -2443,6 +2472,9 @@ def create_app(
                     now if r.pos is not None else None,
                     now if r.float_ok == 0 else None,
                     now if r.pos == "unknown" else None,
+                    r.err,
+                    now if r.err is not None else None,
+                    now if r.pos == "ok" else None,
                 ),
             )
             if r.ack is not None:
@@ -4180,6 +4212,12 @@ def create_app(
                         "command": None,
                         "float": None,
                         "pos": None,
+                        "err": None,
+                        "err_ts": None,
+                        "pos_ok_seen": None,
+                        "retired": 0,
+                        "latched": None,
+                        "last_refill": None,
                     }
 
                 known: dict[str, dict] = {}
@@ -4187,18 +4225,34 @@ def create_app(
                     "SELECT controller, MAX(ts) FROM readings GROUP BY controller"
                 ):
                     known.setdefault(controller, entry(controller))["last_seen"] = seen
-                for controller, seen, override in con.execute(
-                    "SELECT controller, last_seen, next_s FROM controllers"
+                for controller, seen, override, retired in con.execute(
+                    "SELECT controller, last_seen, next_s, retired FROM controllers"
                 ):
                     e = known.setdefault(controller, entry(controller))
                     e["last_seen"] = max(e["last_seen"], seen)
                     e["next_s"] = override
-                for controller, float_ok, pos in con.execute(
-                    "SELECT controller, float_ok, pos FROM status"
+                    e["retired"] = retired
+                for (
+                    controller, float_ok, pos, err, err_ts, pos_ok_seen, latched_ts, reason,
+                ) in con.execute(
+                    "SELECT controller, float_ok, pos, err, err_ts, pos_ok_seen, "
+                    "latched_ts, latch_reason FROM status"
                 ):
                     e = known.setdefault(controller, entry(controller))
                     e["float"] = float_ok
                     e["pos"] = pos
+                    e["err"] = err
+                    e["err_ts"] = err_ts
+                    e["pos_ok_seen"] = pos_ok_seen
+                    e["latched"] = (
+                        {"since": latched_ts, "reason": reason}
+                        if latched_ts is not None
+                        else None
+                    )
+                for controller, ts in con.execute(
+                    "SELECT controller, MAX(ts) FROM refills GROUP BY controller"
+                ):
+                    known.setdefault(controller, entry(controller))["last_refill"] = ts
                 raised = [
                     {"key": key, "raised_ts": ts}
                     for key, ts in con.execute(

@@ -213,6 +213,12 @@ def test_health_lists_a_configured_but_never_seen_controller(client, db):
         "command": None,
         "float": None,
         "pos": None,
+        "err": None,
+        "err_ts": None,
+        "pos_ok_seen": None,
+        "retired": 0,
+        "latched": None,
+        "last_refill": None,
     }
 
 
