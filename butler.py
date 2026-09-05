@@ -128,6 +128,11 @@ MAX_CONTROLLER = 255
 # stands; it lives in .noinit on the board and a power cycle erases it, which
 # is why the durable half is here.
 CONTRA_CHANNEL = 207
+# ch204 = seconds since the float last changed state, a bare count that
+# restarts at boot: after a reboot `ts - ch204` is the boot time, later than
+# any refill, and the rule below reads "moved" until the float really does.
+# A false negative after a reboot, never a page.
+FLOAT_AGE_CHANNEL = 204
 LATCH_TEXT = {
     "contra": "the float said full and the meter saw nothing",
     "resetmid": "it reset with the pump running",
@@ -793,6 +798,30 @@ def latch_of(con: sqlite3.Connection, controller: int) -> tuple[int, str] | None
         (controller,),
     ).fetchone()
     return (row[0], row[1]) if row and row[0] is not None else None
+
+
+def float_frozen(con: sqlite3.Connection, controller: int, now: int) -> int | None:
+    """The refill the float has not moved across, or None. One reader for the
+    ticker and the rules, so the page and the refusal cannot disagree: the
+    latest ch204 reading says when the float last moved; if that is before
+    the latest refill and the reading is PERSIST_S past the refill — the
+    float had its minutes to settle — the float is presumed stuck."""
+    row = con.execute(
+        "SELECT ts, raw FROM readings WHERE controller = ? AND channel = ? "
+        "ORDER BY ts DESC, rowid DESC LIMIT 1",
+        (controller, FLOAT_AGE_CHANNEL),
+    ).fetchone()
+    if row is None:
+        return None
+    read_ts, age = row
+    (refill,) = con.execute(
+        "SELECT MAX(ts) FROM refills WHERE controller = ?", (controller,)
+    ).fetchone()
+    if refill is None:
+        return None
+    if read_ts - age < refill and read_ts - refill >= PERSIST_S:
+        return refill
+    return None
 
 
 # The whole window at the default bucket (2016); a week at a minute would
@@ -2370,6 +2399,8 @@ def create_app(
             return  # a retired board keeps its readings and never waters
         if latch_of(con, r.controller) is not None:
             return  # the durable half of the board's latch: dry until a human resumes
+        if float_frozen(con, r.controller, now) is not None:
+            return  # presumed stuck: the wiring README's rule, enforced here
         if r.float_ok != 1 or r.pos != "ok":
             return  # no reservoir, no known position, no report field: dry
         # This board's own beat, so "recent" below means the same number of
@@ -2800,6 +2831,15 @@ def create_app(
                 "UPDATE alerts SET cleared_ts = ? WHERE key = ? AND cleared_ts IS NULL",
                 (now, f"latch:{controller}"),
             )
+
+    def record_refill(controller: int) -> int:
+        now = int(time.time())
+        with connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            con.execute(
+                "INSERT INTO refills (ts, controller) VALUES (?, ?)", (now, controller)
+            )
+        return now
 
     def free_alerts(
         con: sqlite3.Connection,
@@ -3501,6 +3541,37 @@ def create_app(
                     )
                 )
 
+        # A float that has not moved across a refill is presumed stuck — the
+        # one float fault the wiring cannot catch (the magnet off the float,
+        # or stuck to the hall). Only the backend knows both the refill and
+        # ch204, so the rule lives here and nowhere on the board.
+        for (controller,) in con.execute("SELECT DISTINCT controller FROM refills"):
+            key = f"stale:{controller}"
+            refill = float_frozen(con, controller, now)
+            if refill is not None:
+                if not raised(key) and floor_ok(key):
+                    found.append(
+                        Alert(
+                            key,
+                            "high",
+                            "warning",
+                            f"the float on board {controller} has not moved since "
+                            f"before the refill at {hhmm(refill)}: presumed stuck, "
+                            "the rules will not water until it moves",
+                            mark(key),
+                        )
+                    )
+            elif raised(key):
+                found.append(
+                    Alert(
+                        key,
+                        "default",
+                        "white_check_mark",
+                        f"the float on board {controller} moved",
+                        clear(key),
+                    )
+                )
+
         # Every dose the board was handed gets judged exactly once: never
         # acked (judged immediately — the loss is proven the moment the next
         # report failed to ack), short on the meter, or no moisture rise
@@ -3945,6 +4016,23 @@ def create_app(
         except sqlite3.OperationalError as why:
             return PlainTextResponse(f"try again: {why}\n", status_code=503)
         return PlainTextResponse(f"resumed={controller}\n")
+
+    @app.post("/refill")
+    async def refill(request: Request):
+        if bad_token(request):
+            return PlainTextResponse("bad token\n", status_code=401)
+        body = await slurp(request)
+        if isinstance(body, PlainTextResponse):
+            return body
+        try:
+            controller = parse_board(body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=400)
+        try:
+            ts = await run_in_threadpool(record_refill, controller)
+        except sqlite3.OperationalError as why:
+            return PlainTextResponse(f"try again: {why}\n", status_code=503)
+        return PlainTextResponse(f"refill={ts}\n")
 
     @app.post("/pot")
     async def pot(request: Request):

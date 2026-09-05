@@ -397,3 +397,70 @@ def test_the_latch_pages_once_and_resume_clears_row_and_page(app, client, db, se
     assert keys(sent) == ["latch:0", "latch:0"]
     assert post(client, "/resume", "c=0").text == "resumed=0\n"  # idempotent on a clean board
     assert post(client, "/resume", "c=0").text == "resumed=0\n"
+
+
+# --------------------------------------------------------------------------- #
+# Refills and the stuck float (spec D5, D6)
+# --------------------------------------------------------------------------- #
+
+
+def plant_float_history(db, *, refill_ago, read_ago, age, controller=0):
+    """A refill and one ch204 reading, timestamps controlled: the float last
+    moved `age` seconds before the reading."""
+    now = int(time.time())
+    with sqlite3.connect(db) as con:
+        con.execute(
+            "INSERT INTO refills (ts, controller) VALUES (?, ?)",
+            (now - refill_ago, controller),
+        )
+        con.execute(
+            "INSERT INTO readings (ts, controller, channel, raw) VALUES (?, ?, ?, ?)",
+            (now - read_ago, controller, butler.FLOAT_AGE_CHANNEL, age),
+        )
+
+
+def test_a_refill_is_recorded_and_shown(client, db):
+    before = int(time.time())
+    answer = post(client, "/refill", "c=0")
+    assert answer.status_code == 200
+    ts = int(answer.text.removeprefix("refill=").strip())
+    assert ts >= before
+    assert run_sql(db, "SELECT controller FROM refills") == [(0,)]
+    assert health(client)["last_refill"] == ts
+    assert post(client, "/refill", "retired=1").status_code == 400
+
+
+def test_a_float_that_never_moved_across_a_refill_pages_and_holds_the_water(
+    app, client, db, sent
+):
+    make_pot(client, cooldown_h=0)
+    # Refilled ten minutes ago; the float last moved an hour before that.
+    plant_float_history(db, refill_ago=600, read_ago=60, age=4200)
+    tick(app)
+    assert keys(sent) == ["stale:0"]
+    (alert,) = sent
+    assert alert.priority == "high" and "has not moved since before the refill" in alert.message
+    # Each report carries ch204 itself: still frozen, so the rules stay dry.
+    dry_reports(client, extra="ch204=5000")
+    assert commands(db) == []
+    # Then the float moves: cleared, and the next report waters — the window
+    # is already five dry readings deep. One report, not a window of them:
+    # with cooldown 0 every further unacked report would expire the last
+    # dose and hand another, and page it as never acknowledged.
+    dry_reports(client, n=1, extra="ch204=5")
+    tick(app)
+    assert keys(sent) == ["stale:0", "stale:0"]
+    assert sent[-1].priority == "default"
+    assert client.get("/health").json()["alerts"] == []
+    assert len(commands(db)) == 1
+
+
+def test_the_float_gets_its_grace_after_a_refill_and_needs_a_refill_at_all(app, client, db, sent):
+    plant_float_history(db, refill_ago=100, read_ago=10, age=4000)  # 90 s < PERSIST_S
+    tick(app)
+    assert keys(sent) == []
+    with sqlite3.connect(db) as con:
+        con.execute("DELETE FROM refills")
+        con.execute("INSERT INTO readings (ts, controller, channel, raw) VALUES (?, 0, 204, 99999)", (int(time.time()),))
+    tick(app)
+    assert keys(sent) == []
