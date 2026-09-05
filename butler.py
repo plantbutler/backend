@@ -51,8 +51,10 @@ alert rules from database state alone — controller silent, a mapped
 sensor's channel gone missing, reservoir empty, manifold position lost, a
 safety field that vanished after the board had been sending it, a dose
 that was never acked or came up short on the meter or did not raise
-moisture, a learning proposal waiting — posts the transitions to a public
-ntfy.sh topic (BUTLER_NTFY_TOPIC; the topic name is the secret), and only
+moisture, a learning proposal waiting, a board that stopped itself and
+waits for a human to resume it, a float that never moved across a
+refill — posts the transitions to a public ntfy.sh topic
+(BUTLER_NTFY_TOPIC; the topic name is the secret), and only
 after a fully clean pass GETs BUTLER_DEADMAN_URL. A pass with nothing to
 send must first prove ntfy reachable, so the butler dying and the butler
 losing ntfy both stop the pings. Raising is debounced (two bad sightings

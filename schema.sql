@@ -221,7 +221,9 @@ CREATE INDEX IF NOT EXISTS refills_by_controller ON refills (controller, ts);
 CREATE TABLE IF NOT EXISTS alerts (
   key        TEXT PRIMARY KEY,  -- silent:<c> | sensor:<c>:<ch> | float:<c> |
                                 -- pos:<c> | fields:<kind>:<c> | dose:<id> |
-                                -- dosefail:<c> | proposal:<c>:<outlet>, plus
+                                -- dosefail:<c> | proposal:<c>:<outlet> |
+                                -- latch:<c> (the board stopped itself) |
+                                -- stale:<c> (float never moved across a refill), plus
                                 -- meta:tick / meta:up bookkeeping rows
   raised_ts  INTEGER NOT NULL,
   cleared_ts INTEGER,           -- NULL while the condition stands

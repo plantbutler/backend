@@ -35,6 +35,7 @@ def client(db, photos):
             token=TOKEN,
             next_s=60,
             cmd_ttl_s=900,
+            quiet="0-0",  # the tests must not care what time it is
             photos_dir=str(photos),
         )
     )

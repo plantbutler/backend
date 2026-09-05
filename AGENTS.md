@@ -130,15 +130,21 @@ watering.
   next report's `ack=<id> flow_ml=`; a no-ack report or the TTL expires it. Expired is gone —
   ask again. The commands table is never pruned: it doubles as the watering history.
 - **The tank (0.18.0, pitch "Trust the tank").** The board's `err=` is stored on `status` (last
-  value and when). `ch207=1` or `err=contra` latches the backend (`resetmid` too): `water_rules`
-  goes dry, `POST /command water=` answers 409, the queued dose expires, and `latch:<c>` pages
-  high without the re-alert floor — until `POST /resume`, the human's half, which the app offers
-  beside the words "type `clear contra` on the board". The float going empty does not latch: the
-  rules already refuse on it. `POST /refill` records a human refill; `float_frozen()` — one
-  reader for the ticker and the rules — presumes the float stuck when the latest `ch204` says it
-  last moved before the latest refill and `PERSIST_S` has passed: `stale:<c>` pages and the rules
-  stay dry, manual water is not gated. `POST /controller c= retired=1` retires a board: reports
-  land (the latch row included — it comes back with the board), nothing pages or waters, and
+  value, and `err_ts` = when it last *changed*: the board repeats its last error on every report).
+  `ch207=1` latches the backend, and so does `err=` *turning to* `resetmid` — an edge, never a
+  level, and `err=contra` never latches: `err=` is sticky and `clear contra` on the console never
+  touches it, so a level would re-latch a resumed board forever. A latch: `water_rules` goes dry,
+  `POST /command water=` answers 409, the queued dose expires, and `latch:<c>` pages high without
+  the re-alert floor — until `POST /resume`, the human's half, which the app offers beside the
+  words "type `clear contra` on the board". The float going empty does not latch: the rules
+  already refuse on it. `POST /refill` records a human refill; `float_state()` — one reader for
+  the ticker and the rules — answers none, moved, waiting or frozen from the latest `ch204` and
+  the latest refill: moved at or after the refill, or within `REFILL_SLACK_S` (ten minutes)
+  before the tap, is *moved* (you pour first and tap second); not moved and inside `PERSIST_S` of
+  the tap is *waiting*; after that, *frozen*. `stale:<c>` pages on frozen and clears on moved
+  only (a second tap is waiting, not moved), the rules stay dry on frozen, manual water is not
+  gated. `POST /controller c= retired=1` retires a board: reports land (the latch row included —
+  it comes back with the board), nothing pages or waters — the dose judgement included — and
   whatever page stood for it is cleared, since no rule would ever clear it now. `MAX_DOSE_ML` is
   250, the board's own ceiling, at `/command` and at pot save. The daily cap charges acked water
   only (a lost response is likelier than a lost ack; the cooldown still counts the handed dose).

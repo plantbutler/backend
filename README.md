@@ -251,15 +251,17 @@ empty) or `pos=unknown` (manifold lost) seen twice inside ten minutes — one bl
 is an empty tank; a safety field that vanished after the board had been sending it; a dose that
 was never acked (immediately), came up short on the meter, or did not raise moisture a soak
 later; a learning proposal waiting for approval (one nudge per hose per day); a board that
-stopped itself — `ch207=1` or `err=contra`, the float said full and the meter saw nothing, or
-`err=resetmid`, it reset with the pump running — which latches the butler too: no rule waters it
-and `POST /command` refuses a dose until `POST /resume`, and that one pages high every time, floor
-or no floor; a float that never moved across a refill — the board's `ch204` says it last moved
-before the refill you recorded, and the three minutes are up — presumed stuck, so the rules will
-not water that board until it moves (a dose typed at the phone still goes: the board's own float
-check runs). A cleared condition re-raises at most hourly and correlated dose failures page once
-per controller per hour — a muted phone is worse than a late alert — and a dose that worked is
-recorded silently: this tells you when it's *wrong*.
+stopped itself — `ch207=1`, the float said full and the meter saw nothing, or `err=` turning to
+`resetmid`, it reset with the pump running (`err=` is the board's sticky last error, so only the
+change counts) — which latches the butler too: no rule waters it and `POST /command` refuses a
+dose until `POST /resume`, and that one pages high every time, floor or no floor; a float that
+never moved across a refill — the board's `ch204` says it last moved more than ten minutes before
+the refill you recorded (you pour first and tap second), and the three minutes are up — presumed
+stuck, so the rules will not water that board until it moves, and tapping "refilled" again does
+not count as moving (a dose typed at the phone still goes: the board's own float check runs). A
+cleared condition re-raises at most hourly and correlated dose failures page once per controller
+per hour — a muted phone is worse than a late alert — and a dose that worked is recorded
+silently: this tells you when it's *wrong*.
 
 Set `BUTLER_DEADMAN_URL` (a healthchecks.io ping URL, say) and every clean pass GETs it — a
 pass with nothing to send first proves ntfy reachable — so the butler dying and the butler
