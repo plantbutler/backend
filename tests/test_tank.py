@@ -578,3 +578,63 @@ def test_the_float_gets_its_grace_after_a_refill_and_needs_a_refill_at_all(app, 
     assert commands(db) == [(1, "sent", None)]
     tick(app)
     assert keys(sent) == []
+
+
+def test_a_float_that_rose_while_the_water_was_poured_is_not_stuck(app, client, db, sent):
+    # The natural order: pour, watch the float rise, then tap "refilled".
+    # The float moved 30 s before the tap; the reading is ten minutes after.
+    make_pot(client, cooldown_h=0)
+    plant_float_history(db, refill_ago=600, read_ago=0, age=630)
+    tick(app)
+    assert keys(sent) == []
+    handed = dry_reports(client, extra="ch204=640")
+    assert "cmd=1 water=3 ml=100" in handed
+    tick(app)
+    assert keys(sent) == []
+
+
+def test_a_second_refill_tap_neither_clears_the_page_nor_frees_the_water(
+    app, client, db, sent
+):
+    make_pot(client, cooldown_h=0)
+    plant_float_history(db, refill_ago=600, read_ago=60, age=4200)
+    tick(app)
+    assert keys(sent) == ["stale:0"]
+    # Tapped again, no new reading: the float is waiting for its minutes,
+    # which is not the same as having moved. The page stands.
+    assert post(client, "/refill", "c=0").status_code == 200
+    tick(app)
+    assert keys(sent) == ["stale:0"]
+    assert [a["key"] for a in client.get("/health").json()["alerts"]] == ["stale:0"]
+    # The grace runs out with the float still where it was: the rules refuse.
+    run_sql(db, "UPDATE refills SET ts = ts - ?", PERSIST_S + 60)
+    dry_reports(client, extra="ch204=5000")
+    assert commands(db) == []
+    tick(app)
+    assert keys(sent) == ["stale:0"]
+
+
+def test_float_state_answers_none_moved_waiting_or_frozen(app, db):
+    refill = 1_000_000
+    with sqlite3.connect(db) as con:
+        state = lambda: butler.float_state(con, 0, refill + 3600)  # noqa: E731
+        assert state() == "none"  # no reading, no refill
+        con.execute("INSERT INTO refills (ts, controller) VALUES (?, 0)", (refill,))
+        assert state() == "none"  # no reading yet
+        con.execute(
+            "INSERT INTO readings (ts, controller, channel, raw) VALUES (?, 0, ?, ?)",
+            (refill + 600, butler.FLOAT_AGE_CHANNEL, 0),
+        )
+        assert state() == "moved"  # moved at the reading, after the refill
+
+        def read(ts, age):
+            con.execute("UPDATE readings SET ts = ?, raw = ?", (ts, age))
+            return state()
+
+        slack = butler.REFILL_SLACK_S
+        assert read(refill + 600, 600 + slack) == "moved"  # moved exactly slack before
+        assert read(refill + 600, 600 + slack + 1) == ("frozen", refill)  # a second earlier
+        assert read(refill + PERSIST_S - 1, 5000) == "waiting"  # not yet its minutes
+        assert read(refill + PERSIST_S, 5000) == ("frozen", refill)
+        con.execute("DELETE FROM refills")
+        assert read(refill + 600, 5000) == "none"  # never refilled: never stuck

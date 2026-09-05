@@ -156,6 +156,7 @@ VERDICT_VALUES = ("ok", "too_much", "too_little")
 ALERT_TICK_S = 60  # the alert ticker's beat; a create_app parameter in tests
 SILENT_AFTER_S = 600  # BUTLER_SILENT_S default; the floor is 3x the interval
 PERSIST_S = 180  # a status must hold this long before it raises or clears
+REFILL_SLACK_S = 600  # a float that moved this long before the refill tap moved for it
 REALERT_FLOOR_S = 3600  # a cleared condition sounds again at most hourly
 SOAK_S = 1800  # water needs this long to reach the sensor before judging
 MIN_RISE_PCT = 5  # a dose that raised moisture less than this did not work
@@ -807,28 +808,38 @@ def latch_of(con: sqlite3.Connection, controller: int) -> tuple[int, str] | None
     return (row[0], row[1]) if row and row[0] is not None else None
 
 
-def float_frozen(con: sqlite3.Connection, controller: int, now: int) -> int | None:
-    """The refill the float has not moved across, or None. One reader for the
-    ticker and the rules, so the page and the refusal cannot disagree: the
-    latest ch204 reading says when the float last moved; if that is before
-    the latest refill and the reading is PERSIST_S past the refill — the
-    float had its minutes to settle — the float is presumed stuck."""
+def float_state(
+    con: sqlite3.Connection, controller: int, now: int
+) -> str | tuple[str, int]:
+    """Where the float stands against the latest refill: "none" (no ch204
+    reading, or never refilled), "moved", "waiting" or ("frozen", refill).
+    One reader for the ticker and the rules, so the page and the refusal
+    cannot disagree. The latest ch204 reading says when the float last
+    moved. At or after the refill, or within REFILL_SLACK_S before the tap,
+    is "moved": a person pours first and taps second, and the tap is not
+    the moment the water arrived. Otherwise the float is "waiting" until
+    the reading is PERSIST_S past the refill — it had its minutes to settle
+    — and "frozen" from then on, with the refill as the evidence. Waiting is
+    not moved: a second tap while the float is stuck must not read as the
+    float moving (spec D6)."""
     row = con.execute(
         "SELECT ts, raw FROM readings WHERE controller = ? AND channel = ? "
         "ORDER BY ts DESC, rowid DESC LIMIT 1",
         (controller, FLOAT_AGE_CHANNEL),
     ).fetchone()
     if row is None:
-        return None
+        return "none"
     read_ts, age = row
     (refill,) = con.execute(
         "SELECT MAX(ts) FROM refills WHERE controller = ?", (controller,)
     ).fetchone()
     if refill is None:
-        return None
-    if read_ts - age < refill and read_ts - refill >= PERSIST_S:
-        return refill
-    return None
+        return "none"
+    if read_ts - age >= refill - REFILL_SLACK_S:
+        return "moved"
+    if read_ts - refill < PERSIST_S:
+        return "waiting"
+    return ("frozen", refill)
 
 
 # The whole window at the default bucket (2016); a week at a minute would
@@ -2406,8 +2417,8 @@ def create_app(
             return  # a retired board keeps its readings and never waters
         if latch_of(con, r.controller) is not None:
             return  # the durable half of the board's latch: dry until a human resumes
-        if float_frozen(con, r.controller, now) is not None:
-            return  # presumed stuck: the wiring README's rule, enforced here
+        if isinstance(float_state(con, r.controller, now), tuple):
+            return  # frozen: presumed stuck, the wiring README's rule, enforced here
         if r.float_ok != 1 or r.pos != "ok":
             return  # no reservoir, no known position, no report field: dry
         # This board's own beat, so "recent" below means the same number of
@@ -3588,13 +3599,17 @@ def create_app(
         # A float that has not moved across a refill is presumed stuck — the
         # one float fault the wiring cannot catch (the magnet off the float,
         # or stuck to the hall). Only the backend knows both the refill and
-        # ch204, so the rule lives here and nowhere on the board.
+        # ch204, so the rule lives here and nowhere on the board. Cleared on
+        # "moved" only: a second tap of the button while the float is still
+        # stuck is "waiting", and must not send a false "moved" that hides
+        # the fault behind the re-alert floor.
         for (controller,) in con.execute("SELECT DISTINCT controller FROM refills"):
             if controller in retired:
                 continue
             key = f"stale:{controller}"
-            refill = float_frozen(con, controller, now)
-            if refill is not None:
+            state = float_state(con, controller, now)
+            if isinstance(state, tuple):
+                _, refill = state
                 if not raised(key) and floor_ok(key):
                     found.append(
                         Alert(
@@ -3607,7 +3622,7 @@ def create_app(
                             mark(key),
                         )
                     )
-            elif raised(key):
+            elif state == "moved" and raised(key):
                 found.append(
                     Alert(
                         key,
