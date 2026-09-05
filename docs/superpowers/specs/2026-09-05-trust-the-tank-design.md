@@ -32,11 +32,20 @@ sits with the interval knob. On `status`: `err TEXT`, `err_ts INTEGER`, `latched
 appended to a CREATE that already ran never reaches an existing database). Trap: `status` rows
 exist only once a controller has reported.
 
-**D2 — What latches.** `ch207=1` or `err=contra` → reason `contra`; `err=resetmid` → reason
+**D2 — What latches.** `ch207=1` → reason `contra`. `err=` *changing to* `resetmid` → reason
 `resetmid` (the board reset with the pump on and latched itself dry; that deserves a human look
 too, and a power cycle would erase it). `latched_ts` is set once and never overwritten while it
 stands. Setting the latch expires that controller's `proposed` and `queued` water commands, as
 burying a pot does — a dose still waiting would pour into a tank nobody has looked at.
+
+*Amended 2026-09-06, after the whole-branch review.* The first draft also latched on
+`err=contra`. It cannot: `err=` is the board's **sticky last error**, sent on every report until
+a later dose ends with something else, and `clear contra` on the console clears only the
+`.noinit` flag that `ch207` reflects — never that token. So after `clear contra` + `/resume` the
+next report still said `err=contra`, re-latched, expired anything queued in between, and paged
+again, forever. `ch207` is the level the console clears; it is the only contra trigger. For the
+same reason `resetmid` is an **edge** (the value changed to it in this report), never a level,
+and `err_ts` means "since `err=` last changed value", not "last seen".
 
 *Deviation, recorded:* the firmware spec §2.7 also lists "`float=0` persisting from a controller
 that was reporting `float=1`". Not a trigger here. The rules already refuse on `float=0`; a float
@@ -57,25 +66,41 @@ tells the operator to type `clear contra` on the board as well — the backend c
 **D5 — `POST /refill`**, body `c=<controller>`, token. Inserts `refills(now, c)`; answers
 `refill=<ts>`. `/health` carries `last_refill` per controller.
 
-**D6 — The stuck-float rule.** One helper, `float_frozen(con, controller, now) -> int | None`,
-used by the ticker and by `water_rules` so the two cannot disagree: take the controller's latest
-`ch204` reading `(ts, v)` and its latest refill `r`; the float last moved at `ts − v`; if `r`
-exists, `ts − v < r` and `ts − r >= PERSIST_S` (the float had its three minutes), answer `r`. The
-ticker raises `stale:<c>` (high): "the float on board N has not moved since before the refill at
-HH:MM: presumed stuck, the rules will not water", and clears it once the float has moved after the
-refill. `water_rules` skips the controller while it answers (dry, decision #5). `POST /command` is
-**not** gated: a human is at the phone, and the board's own float check still runs. This is the
-whole enforcement of the wiring README's rule; the firmware never refuses on staleness.
+**D6 — The stuck-float rule.** One helper, `float_state(con, controller, now)`, used by the
+ticker and by `water_rules` so the two cannot disagree. Take the controller's latest `ch204`
+reading `(ts, v)` and its latest refill `r`; the float last moved at `moved = ts − v`. Four
+answers: **none** (no reading, or no refill yet); **moved** — `moved >= r − REFILL_SLACK_S`, the
+float changed state at or after the refill, or within the ten minutes before the tap (a person
+pours first and taps second; the tap is not the moment the water arrived); **waiting** — not moved,
+but `ts − r < PERSIST_S` (the float has not had its three minutes); **frozen** — not moved and the
+three minutes are up, with `r` as the evidence. The ticker raises `stale:<c>` (high, with the
+re-alert floor) on **frozen**: "the float on board N has not moved since before the refill at
+HH:MM: presumed stuck, the rules will not water", and clears it on **moved** only — never on
+*waiting*, so a second tap of the button while the float is still stuck cannot send a false "the
+float moved" and hide the fault behind the hour-long floor. `water_rules` skips the controller
+while it is *frozen* (dry, decision #5). `POST /command` is **not** gated: a human is at the
+phone, and the board's own float check still runs. This is the whole enforcement of the wiring
+README's rule; the firmware never refuses on staleness.
+
+*Amended 2026-09-06, after the whole-branch review.* The first draft's helper answered only
+"frozen or not", which conflated *moved* with *waiting*, and it had no slack before the tap, so the
+natural order — pour, watch the float rise, tap "refilled" — was "presumed stuck" three minutes
+later. `REFILL_SLACK_S = 600`.
 
 **D7 — Retirement.** `POST /controller`, body `c=<controller> retired=0|1`, token; answers
-`controller=<c> retired=<0|1>`. The silence rule, the sensor rule and `water_rules` skip a
-retired controller; its reports are still accepted and stored (a retired board is a quiet one,
-not a rejected one). `/health` carries `retired`.
+`controller=<c> retired=<0|1>`. A retired board is a quiet one, not a rejected one: its reports
+are still accepted and stored, but **every** ticker rule that speaks for it — silence, sensor,
+float/pos, latch, stale, and the dose judgement of its commands — skips it, retiring clears
+whatever page stands for it, `water_rules` never waters it, and `POST /command water=` answers
+409 `refused: board N is retired: un-retire it first` (`stop=1` still passes; the board may be
+mid-dose). `/health` carries `retired`. *(Amended 2026-09-06: the first draft gated only the
+rules and two of the alert loops.)*
 
 **D8 — `err=` is stored.** `parse_report` accepts `err=<token>`, `[a-z_]{1,16}`, at most once. When
-present the report writes `status.err`/`err_ts`; when absent they are left alone (it is a
-last-error field). `/health` carries `err` and `err_ts`. No alert of its own: `latch:` covers
-`contra`/`resetmid`, and the rest is for the report view.
+present the report writes `status.err`, and `err_ts` moves only when the **value changed** — the
+board repeats its last error on every report, so "last seen" would just be the report clock; when
+absent both are left alone. `/health` carries `err` and `err_ts`. No alert of its own: `latch:`
+covers the board's latch, and the rest is for the report view.
 
 **D9 — The daily cap charges acked water only.** Both sums in `water_rules` become
 `SUM(CASE WHEN acked_ts IS NOT NULL THEN COALESCE(flow_ml, ml) ELSE 0 END)`. Jacopo's call
