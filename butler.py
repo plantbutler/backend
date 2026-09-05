@@ -727,6 +727,20 @@ def parse_controller(text: str) -> tuple[int, int]:
     return controller, retired
 
 
+class Retired(Exception):
+    """POST /command's refusal of water for a retired board."""
+
+    def __init__(self, controller: int):
+        super().__init__(f"board {controller} is retired: un-retire it first")
+
+
+def is_retired(con: sqlite3.Connection, controller: int) -> bool:
+    row = con.execute(
+        "SELECT retired FROM controllers WHERE controller = ?", (controller,)
+    ).fetchone()
+    return bool(row and row[0])
+
+
 # The whole window at the default bucket (2016); a week at a minute would
 # be 10080 rows of JSON.
 # A month back, which is what the app's widest chart window asks for. The
@@ -2298,10 +2312,7 @@ def create_app(
             "WHERE controller = ? AND state = 'proposed' AND created_ts < ?",
             (r.controller, now - PROPOSAL_TTL_S),
         )
-        retired = con.execute(
-            "SELECT retired FROM controllers WHERE controller = ?", (r.controller,)
-        ).fetchone()
-        if retired and retired[0]:
+        if is_retired(con, r.controller):
             return  # a retired board keeps its readings and never waters
         if r.float_ok != 1 or r.pos != "ok":
             return  # no reservoir, no known position, no report field: dry
@@ -2620,6 +2631,11 @@ def create_app(
                 "AND COALESCE(sent_ts, created_ts) < ?",
                 (c.controller, now - cmd_ttl),
             )
+            # Water for a retired board is refused here, the only door the
+            # rules do not guard. A stop still goes: it is the safe
+            # direction, and the board may be mid-dose from before.
+            if c.kind == "water" and is_retired(con, c.controller):
+                raise Retired(c.controller)
             busy = con.execute(
                 "SELECT id, state FROM commands "
                 "WHERE controller = ? AND state IN ('queued', 'sent') LIMIT 1",
@@ -2665,8 +2681,12 @@ def create_app(
     def set_retired(controller: int, flag: int) -> None:
         """A retired board is a quiet one, not a rejected one: its reports
         still land, but nothing pages for it and nothing waters from it.
-        Retiring also clears a standing silence page — that rule skips the
-        board from now on, so nobody else would ever clear it."""
+        Retiring drops the water still waiting for the board — a proposal
+        or a queued dose would otherwise be handed out on its next report,
+        so it goes the way burial sends one; a 'sent' one is with the board
+        and expires on that report. It also clears a standing silence page
+        and the board's sensor pages: both rules skip the board from now
+        on, so nobody else would ever clear them."""
         now = int(time.time())
         with connect() as con:
             con.execute("BEGIN IMMEDIATE")
@@ -2678,9 +2698,14 @@ def create_app(
             )
             if flag:
                 con.execute(
-                    "UPDATE alerts SET cleared_ts = ? "
-                    "WHERE key = ? AND cleared_ts IS NULL",
-                    (now, f"silent:{controller}"),
+                    "UPDATE commands SET state = 'expired' WHERE controller = ? "
+                    "AND kind = 'water' AND state IN ('proposed', 'queued')",
+                    (controller,),
+                )
+                con.execute(
+                    "UPDATE alerts SET cleared_ts = ? WHERE cleared_ts IS NULL "
+                    "AND (key = ? OR key LIKE ?)",
+                    (now, f"silent:{controller}", f"sensor:{controller}:%"),
                 )
 
     def free_alerts(
@@ -3738,6 +3763,8 @@ def create_app(
             return PlainTextResponse(f"refused: {why}\n", status_code=400)
         try:
             cmd_id, busy = await run_in_threadpool(enqueue, parsed)
+        except Retired as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=409)
         except sqlite3.OperationalError as why:
             return PlainTextResponse(f"try again: {why}\n", status_code=503)
         if busy:

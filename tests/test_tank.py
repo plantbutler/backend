@@ -284,3 +284,36 @@ def test_retiring_a_paged_board_clears_its_silence_page(app, client, db, sent):
     post(client, "/controller", "c=0 retired=1")
     assert run_sql(db, "SELECT cleared_ts IS NOT NULL FROM alerts WHERE key = 'silent:0'") == [(1,)]
     assert client.get("/health").json()["alerts"] == []
+
+
+def test_retiring_a_board_clears_its_sensor_page_too(app, client, db, sent):
+    make_pot(client, mode="manual")
+    report(client, "c=0 ch0=1")
+    app.state.observed["since"] = 0
+    run_sql(db, "UPDATE readings SET ts = ts - 700")  # the wire comes loose
+    tick(app)
+    assert keys(sent) == ["sensor:0:0"]
+    post(client, "/controller", "c=0 retired=1")
+    assert run_sql(db, "SELECT cleared_ts IS NOT NULL FROM alerts WHERE key = 'sensor:0:0'") == [(1,)]
+    assert client.get("/health").json()["alerts"] == []
+    tick(app)
+    assert keys(sent) == ["sensor:0:0"]  # neither cleared aloud nor raised again
+
+
+def test_a_retired_board_is_handed_no_water(client, db):
+    make_pot(client, mode="learning", cooldown_h=0)
+    dry_reports(client)  # cmd 1: the rules' proposal, waiting on a human
+    assert post(client, "/command", "c=0 water=3 ml=50").text == "cmd=2\n"
+    post(client, "/controller", "c=0 retired=1")
+    # Both were waiting to pour from a board nobody wants water from.
+    assert commands(db) == [(1, "expired", None), (2, "expired", None)]
+    assert post(client, "/approve", "cmd=1").status_code == 400
+    answer = post(client, "/command", "c=0 water=3 ml=50")
+    assert answer.status_code == 409
+    assert answer.text == "refused: board 0 is retired: un-retire it first\n"
+    assert dry_reports(client) == "next=60\n"  # handed nothing, proposed nothing
+    assert post(client, "/command", "c=0 stop=1").text == "cmd=3\n"  # the safe direction
+    assert "cmd=3 stop=1" in report(client, "c=0 ch0=1").text
+    report(client, "c=0 ch0=1 ack=3")
+    post(client, "/controller", "c=0 retired=0")
+    assert post(client, "/command", "c=0 water=3 ml=50").text == "cmd=4\n"
