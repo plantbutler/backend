@@ -704,6 +704,29 @@ def parse_interval(text: str) -> tuple[str, int]:
     return controller, next_s
 
 
+def parse_controller(text: str) -> tuple[int, int]:
+    """`c=<controller> retired=0|1`: the POST /controller body. Both fields,
+    each once; unknown keys ignored like everywhere else on this wire."""
+    controller = retired = None
+    for token in text.split():
+        key, sep, value = token.partition("=")
+        if not sep or not key:
+            raise ValueError(f"not a k=v token: {token!r}")
+        if key == "c":
+            if controller is not None:
+                raise ValueError("c= given twice")
+            controller = _int_in(value, "c", 0, MAX_CONTROLLER + 1)
+        elif key == "retired":
+            if retired is not None:
+                raise ValueError("retired= given twice")
+            retired = _int_in(value, "retired", 0, 2)
+    if controller is None:  # board 0 is a real board
+        raise ValueError("no c= in the body")
+    if retired is None:
+        raise ValueError("no retired= in the body")
+    return controller, retired
+
+
 # The whole window at the default bucket (2016); a week at a minute would
 # be 10080 rows of JSON.
 # A month back, which is what the app's widest chart window asks for. The
@@ -2275,6 +2298,11 @@ def create_app(
             "WHERE controller = ? AND state = 'proposed' AND created_ts < ?",
             (r.controller, now - PROPOSAL_TTL_S),
         )
+        retired = con.execute(
+            "SELECT retired FROM controllers WHERE controller = ?", (r.controller,)
+        ).fetchone()
+        if retired and retired[0]:
+            return  # a retired board keeps its readings and never waters
         if r.float_ok != 1 or r.pos != "ok":
             return  # no reservoir, no known position, no report field: dry
         # This board's own beat, so "recent" below means the same number of
@@ -2633,6 +2661,27 @@ def create_app(
                 (controller, value or None),
             )
         return value or interval
+
+    def set_retired(controller: int, flag: int) -> None:
+        """A retired board is a quiet one, not a rejected one: its reports
+        still land, but nothing pages for it and nothing waters from it.
+        Retiring also clears a standing silence page — that rule skips the
+        board from now on, so nobody else would ever clear it."""
+        now = int(time.time())
+        with connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            con.execute(
+                "INSERT INTO controllers (controller, last_seen, retired) "
+                "VALUES (?, 0, ?) "
+                "ON CONFLICT(controller) DO UPDATE SET retired = excluded.retired",
+                (controller, flag),
+            )
+            if flag:
+                con.execute(
+                    "UPDATE alerts SET cleared_ts = ? "
+                    "WHERE key = ? AND cleared_ts IS NULL",
+                    (now, f"silent:{controller}"),
+                )
 
     def free_alerts(
         con: sqlite3.Connection,
@@ -3111,10 +3160,13 @@ def create_app(
         # A controller that stopped reporting. Silence is measured against
         # the butler's own observation window too: after a redeploy or a NAS
         # reboot, last_seen is stale because the BUTLER was away — that is
-        # the dead-man's news, not this rule's.
+        # the dead-man's news, not this rule's. A retired board is left out
+        # here, so it gets no `heartbeat` entry either, and the sensor rule
+        # below skips its pots on its own.
         heartbeat: dict[str, tuple[int, int | None]] = {}
         for controller, last_seen, override in con.execute(
-            "SELECT controller, last_seen, next_s FROM controllers WHERE last_seen > 0"
+            "SELECT controller, last_seen, next_s FROM controllers "
+            "WHERE last_seen > 0 AND retired = 0"
         ):
             heartbeat[controller] = (last_seen, override)
             threshold = max(silent_after, 3 * (override or interval))
@@ -3716,6 +3768,23 @@ def create_app(
         except sqlite3.OperationalError as why:
             return PlainTextResponse(f"try again: {why}\n", status_code=503)
         return PlainTextResponse(f"next={effective}\n")
+
+    @app.post("/controller")
+    async def controller_knob(request: Request):
+        if bad_token(request):
+            return PlainTextResponse("bad token\n", status_code=401)
+        body = await slurp(request)
+        if isinstance(body, PlainTextResponse):
+            return body
+        try:
+            controller, retired = parse_controller(body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=400)
+        try:
+            await run_in_threadpool(set_retired, controller, retired)
+        except sqlite3.OperationalError as why:
+            return PlainTextResponse(f"try again: {why}\n", status_code=503)
+        return PlainTextResponse(f"controller={controller} retired={retired}\n")
 
     @app.post("/pot")
     async def pot(request: Request):

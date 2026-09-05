@@ -237,3 +237,50 @@ def test_no_pos_page_before_a_board_has_ever_said_pos_ok(app, client, sent):
     report(client, "c=0 ch0=1 float=1 pos=unknown")
     tick(app)
     assert "pos:0" in keys(sent)
+
+
+# --------------------------------------------------------------------------- #
+# Retirement (spec D7)
+# --------------------------------------------------------------------------- #
+
+
+def age_controller(db, seconds):
+    with sqlite3.connect(db) as con:
+        con.execute("UPDATE controllers SET last_seen = last_seen - ?", (seconds,))
+
+
+def test_parse_controller_wants_both_fields_once():
+    assert butler.parse_controller("c=0 retired=1") == (0, 1)
+    assert butler.parse_controller("retired=0 c=9 later=1") == (9, 0)
+    for body in ("retired=1", "c=0", "c=0 retired=2", "c=0 c=0 retired=1"):
+        with pytest.raises(ValueError):
+            butler.parse_controller(body)
+
+
+def test_a_retired_board_is_quiet_and_never_waters(app, client, db, sent):
+    make_pot(client, cooldown_h=0)
+    report(client, "c=0 ch0=1")
+    answer = post(client, "/controller", "c=0 retired=1")
+    assert answer.status_code == 200 and answer.text == "controller=0 retired=1\n"
+    assert health(client)["retired"] == 1
+    age_controller(db, 7200)
+    app.state.observed["since"] = 0
+    tick(app)
+    assert "silent:0" not in keys(sent)
+    dry_reports(client)
+    assert commands(db) == []  # readings landed, nothing queued
+    assert post(client, "/controller", "c=0 retired=0").text == "controller=0 retired=0\n"
+    age_controller(db, 7200)
+    tick(app)
+    assert "silent:0" in keys(sent)
+
+
+def test_retiring_a_paged_board_clears_its_silence_page(app, client, db, sent):
+    report(client, "c=0 ch0=1")
+    age_controller(db, 7200)
+    app.state.observed["since"] = 0
+    tick(app)
+    assert keys(sent) == ["silent:0"]
+    post(client, "/controller", "c=0 retired=1")
+    assert run_sql(db, "SELECT cleared_ts IS NOT NULL FROM alerts WHERE key = 'silent:0'") == [(1,)]
+    assert client.get("/health").json()["alerts"] == []
