@@ -163,6 +163,26 @@ def test_the_counter_is_acked_water_sent_after_the_tap(client, db):
     assert health(client)["pumped_ml"] == 190
 
 
+def test_a_stop_acked_with_a_count_is_not_water(client, db):
+    """A stop's ack may carry flow_ml=: what flowed before the board
+    stopped, which the dose's own ack already counted. The ack step stamps
+    it on the stop row like any other, so only the counter's kind = 'water'
+    keeps it out of pumped_ml and out of the sample (spec D3)."""
+    report(client, "c=0 ch0=1 float=1")
+    tap(client, db)
+    dose(client, 100, flow=90)
+    answer = post(client, "/command", "c=0 stop=1")
+    assert answer.status_code == 200, answer.text
+    stop_id = int(answer.text.strip().removeprefix("cmd="))
+    assert f"cmd={stop_id} stop=1" in report(client, "c=0 ch0=1 float=1 pos=ok").text
+    ack(client, stop_id, flow=60, float_ok=0)  # and the float drops on that report
+    assert run_sql(
+        db, "SELECT kind, ml, flow_ml FROM commands WHERE id = ?", stop_id
+    ) == [("stop", None, 60)]
+    assert health(client)["pumped_ml"] == 90
+    assert samples(db) == [(taps(db)[0], 90)]
+
+
 # --------------------------------------------------------------------------- #
 # Learning a sample (spec D4)
 # --------------------------------------------------------------------------- #
