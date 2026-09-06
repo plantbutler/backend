@@ -169,6 +169,16 @@ NTFY_TIMEOUT_S = 10
 FLAP_WINDOW_S = 600  # two bad float/pos sightings this close together raise
 RESUME_GRACE_S = 600  # a restart shorter than this keeps the observation window
 UP_PROBE_FLOOR_S = 86400  # the up-probe fires at most daily, across restarts
+# The tank has a size, and it is measured: what the meter counted between
+# a refill tap and the float going empty is one sample, the median of the
+# last TANK_MEDIAN_OF is the size, known after TANK_SAMPLES_TO_ARM. The
+# float is judged against that volume, never a clock: pumped past the size
+# plus TANK_TOLERANCE_PCT with the float still at 1 is a float presumed
+# stuck; a sample off the known size by more than TANK_DRIFT_PCT is warned.
+TANK_SAMPLES_TO_ARM = 2
+TANK_MEDIAN_OF = 5
+TANK_TOLERANCE_PCT = 10
+TANK_DRIFT_PCT = 25
 
 
 class Report(NamedTuple):
@@ -319,6 +329,9 @@ ADDED_COLUMNS = (
     ("status", "latched_ts", "INTEGER", None, None),
     ("status", "latch_reason", "TEXT", None, None),
     ("status", "pos_ok_seen", "INTEGER", None, None),
+    # The tank has a size (0.19.0): what the float said at the tap. The
+    # rows already on the NAS get NULL, which judges nothing.
+    ("refills", "float_ok", "INTEGER", None, None),
 )
 
 
@@ -808,6 +821,54 @@ def latch_of(con: sqlite3.Connection, controller: int) -> tuple[int, str] | None
         (controller,),
     ).fetchone()
     return (row[0], row[1]) if row and row[0] is not None else None
+
+
+def latest_refill(
+    con: sqlite3.Connection, controller: int
+) -> tuple[int, int | None] | None:
+    """The latest tap for this board, (ts, what the float said at it), or
+    None when nobody has ever tapped. The tap means "full to the top", so
+    everything the tank knows counts from it (spec D2)."""
+    row = con.execute(
+        "SELECT ts, float_ok FROM refills WHERE controller = ? "
+        "ORDER BY ts DESC, rowid DESC LIMIT 1",
+        (controller,),
+    ).fetchone()
+    return (row[0], row[1]) if row else None
+
+
+def pumped_since(con: sqlite3.Connection, controller: int, since_ts: int) -> int:
+    """Millilitres of acked water handed to this board after `since_ts`:
+    the meter's count, or the dose when the ack carried none — the daily
+    cap's own expression, so the counter and the cap agree. A dose lost
+    without an ack pumped something uncounted, and whatever reads this
+    fires late for it; the contra latch stands behind it (spec D3)."""
+    (total,) = con.execute(
+        "SELECT COALESCE(SUM(COALESCE(flow_ml, ml)), 0) FROM commands "
+        "WHERE controller = ? AND kind = 'water' AND acked_ts IS NOT NULL "
+        "AND sent_ts > ?",
+        (controller, since_ts),
+    ).fetchone()
+    return total
+
+
+def tank_ml(con: sqlite3.Connection, controller: int) -> int | None:
+    """The tank's size: the median of the last TANK_MEDIAN_OF samples,
+    None until TANK_SAMPLES_TO_ARM exist. A median, not a mean, so one
+    tap that was not a fill moves the number little; of two, their mean,
+    which is fine (spec D5)."""
+    last = sorted(
+        ml
+        for (ml,) in con.execute(
+            "SELECT ml FROM tank_samples WHERE controller = ? "
+            "ORDER BY ts DESC, rowid DESC LIMIT ?",
+            (controller, TANK_MEDIAN_OF),
+        )
+    )
+    if len(last) < TANK_SAMPLES_TO_ARM:
+        return None
+    mid = len(last) // 2
+    return last[mid] if len(last) % 2 else (last[mid - 1] + last[mid]) // 2
 
 
 def float_state(
@@ -2583,12 +2644,16 @@ def create_app(
                 "ON CONFLICT(controller) DO UPDATE SET last_seen = excluded.last_seen",
                 (r.controller, now),
             )
-            # The board's error before this report: the resetmid latch is
-            # an edge on it, and the upsert below overwrites it.
+            # The board's error and float before this report: the resetmid
+            # latch is an edge on the one, a tank sample on the other, and
+            # the upsert below overwrites both. A first report has neither:
+            # there is no row yet, and it closes nothing.
             prev = con.execute(
-                "SELECT err FROM status WHERE controller = ?", (r.controller,)
+                "SELECT err, float_ok FROM status WHERE controller = ?",
+                (r.controller,),
             ).fetchone()
             prev_err = prev[0] if prev else None
+            prev_float = prev[1] if prev else None
             # The latest safety fields, with enough history for the alert
             # rules: when each value last changed (`since`), when each was
             # last sent at all (`seen` — its vanishing is an alarm), and the
@@ -2669,6 +2734,23 @@ def create_app(
                     "WHERE id = ? AND controller = ? AND state = 'sent'",
                     (now, r.flow_ml, r.ack, r.controller),
                 )
+            if prev_float == 1 and r.float_ok == 0:
+                # The float went empty: the water the meter counted since
+                # the tap is one measurement of the tank. After the ack
+                # step, because the dose that drained it acks on this very
+                # report. One per tap — a float bouncing at the line adds
+                # nothing after its first crossing — and nothing on zero:
+                # a tank drained by something the meter never saw is not a
+                # measurement (spec D4).
+                tapped = latest_refill(con, r.controller)
+                if tapped is not None:
+                    pumped = pumped_since(con, r.controller, tapped[0])
+                    if pumped > 0:
+                        con.execute(
+                            "INSERT OR IGNORE INTO tank_samples "
+                            "(ts, controller, refill_ts, ml) VALUES (?, ?, ?, ?)",
+                            (now, r.controller, tapped[0], pumped),
+                        )
             # A command still 'sent' after the ack step was handed on an
             # earlier response and this report did not ack it: the board
             # does not have it. Gone, per the module docstring.
@@ -2874,11 +2956,19 @@ def create_app(
             )
 
     def record_refill(controller: int) -> int:
+        """The tap means "full to the top". What the float said at that
+        moment goes on the row, NULL for a board that has never sent
+        float= (and then the tap judges nothing), read under the write lock
+        so a report cannot slip between the look and the insert (spec D2)."""
         now = int(time.time())
         with connect() as con:
             con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT float_ok FROM status WHERE controller = ?", (controller,)
+            ).fetchone()
             con.execute(
-                "INSERT INTO refills (ts, controller) VALUES (?, ?)", (now, controller)
+                "INSERT INTO refills (ts, controller, float_ok) VALUES (?, ?, ?)",
+                (now, controller, row[0] if row else None),
             )
         return now
 
@@ -4632,6 +4722,9 @@ def create_app(
                         "retired": 0,
                         "latched": None,
                         "last_refill": None,
+                        "tank_ml": None,
+                        "tank_samples": 0,
+                        "pumped_ml": 0,
                     }
 
                 known: dict[str, dict] = {}
@@ -4666,7 +4759,15 @@ def create_app(
                 for controller, ts in con.execute(
                     "SELECT controller, MAX(ts) FROM refills GROUP BY controller"
                 ):
-                    known.setdefault(controller, entry(controller))["last_refill"] = ts
+                    e = known.setdefault(controller, entry(controller))
+                    e["last_refill"] = ts
+                    e["pumped_ml"] = pumped_since(con, controller, ts)
+                for controller, n in con.execute(
+                    "SELECT controller, COUNT(*) FROM tank_samples GROUP BY controller"
+                ):
+                    e = known.setdefault(controller, entry(controller))
+                    e["tank_samples"] = n
+                    e["tank_ml"] = tank_ml(con, controller)
                 raised = [
                     {"key": key, "raised_ts": ts}
                     for key, ts in con.execute(

@@ -213,10 +213,28 @@ CREATE TABLE IF NOT EXISTS status (
 -- against ch204, every tick, hence the index.
 CREATE TABLE IF NOT EXISTS refills (
   ts         INTEGER NOT NULL,  -- server time when the human said so
-  controller INTEGER NOT NULL
+  controller INTEGER NOT NULL,
+  float_ok   INTEGER            -- status.float_ok at the tap; NULL when the
+                                -- board had never sent float=, and then the
+                                -- tap judges nothing
 );
 
 CREATE INDEX IF NOT EXISTS refills_by_controller ON refills (controller, ts);
+
+-- The tank has a size, and it is measured: one row each time the float
+-- went empty with water on the counter since the latest tap, `ml` being
+-- the acked water handed out between the two. One per tap — a float
+-- bouncing at the waterline adds nothing after its first crossing — hence
+-- the UNIQUE; the size is the median of the last few by ts, hence the index.
+CREATE TABLE IF NOT EXISTS tank_samples (
+  ts         INTEGER NOT NULL,  -- when the float went empty
+  controller INTEGER NOT NULL,
+  refill_ts  INTEGER NOT NULL,  -- the tap this run started from
+  ml         INTEGER NOT NULL,
+  UNIQUE (controller, refill_ts)
+);
+
+CREATE INDEX IF NOT EXISTS tank_samples_by_controller ON tank_samples (controller, ts);
 
 CREATE TABLE IF NOT EXISTS alerts (
   key        TEXT PRIMARY KEY,  -- silent:<c> | sensor:<c>:<ch> | float:<c> |

@@ -1,0 +1,291 @@
+"""The tank has a size: what the float said at the tap, the counter, the
+samples the float closes, the median, and what /health says about them
+(spec D1-D5 and D9's three read-only fields)."""
+
+import sqlite3
+
+import pytest
+from fastapi.testclient import TestClient
+
+import butler
+from butler import TANK_MEDIAN_OF, TANK_SAMPLES_TO_ARM, create_app
+
+TOKEN = "test-token"
+
+
+@pytest.fixture
+def db(tmp_path):
+    return tmp_path / "butler.db"
+
+
+@pytest.fixture
+def sent():
+    return []
+
+
+@pytest.fixture
+def app(db, sent):
+    return create_app(
+        db_path=str(db),
+        token=TOKEN,
+        next_s=60,
+        cmd_ttl_s=900,
+        quiet="0-0",
+        send=lambda alert: sent.append(alert) or True,
+        ping=lambda: True,
+    )
+
+
+@pytest.fixture
+def client(app):
+    return TestClient(app)
+
+
+def post(client, path, body):
+    return client.post(path, content=body, headers={"X-Token": TOKEN})
+
+
+def report(client, body):
+    answer = post(client, "/report", body)
+    assert answer.status_code == 200, answer.text
+    return answer
+
+
+def health(client, controller=0):
+    entries = client.get("/health").json()["controllers"]
+    return next(c for c in entries if c["controller"] == controller)
+
+
+def run_sql(db, sql, *params):
+    with sqlite3.connect(db) as con:
+        return con.execute(sql, params).fetchall()
+
+
+def age(db, seconds):
+    """Everything so far happened `seconds` earlier, so what comes next is
+    later than all of it: the tests run inside one second, and the counter
+    is strict about which side of the tap a dose was sent on."""
+    with sqlite3.connect(db) as con:
+        con.execute("UPDATE refills SET ts = ts - ?", (seconds,))
+        con.execute(
+            "UPDATE commands SET created_ts = created_ts - ?, "
+            "sent_ts = sent_ts - ?, acked_ts = acked_ts - ?",
+            (seconds, seconds, seconds),
+        )
+        con.execute(
+            "UPDATE tank_samples SET ts = ts - ?, refill_ts = refill_ts - ?",
+            (seconds, seconds),
+        )
+
+
+def tap(client, db):
+    """The human says the tank is full, a minute ago. Returns the tap's
+    ts as it stands now; a later `age` moves it again, so a test that taps
+    twice reads the taps back with `taps`."""
+    answer = post(client, "/refill", "c=0")
+    assert answer.status_code == 200, answer.text
+    ts = int(answer.text.removeprefix("refill=").strip())
+    age(db, 60)
+    return ts - 60
+
+
+def hand(client, ml):
+    """A manual dose, handed to the board on its next report."""
+    answer = post(client, "/command", f"c=0 water=3 ml={ml}")
+    assert answer.status_code == 200, answer.text
+    cmd_id = int(answer.text.strip().removeprefix("cmd="))
+    handed = report(client, "c=0 ch0=1 float=1 pos=ok").text
+    assert f"cmd={cmd_id} water=3 ml={ml}" in handed
+    return cmd_id
+
+
+def ack(client, cmd_id, flow=None, float_ok=1):
+    count = "" if flow is None else f" flow_ml={flow}"
+    report(client, f"c=0 ch0=1 float={float_ok} pos=ok ack={cmd_id}{count}")
+
+
+def dose(client, ml, flow=None):
+    ack(client, hand(client, ml), flow)
+
+
+def samples(db):
+    return run_sql(db, "SELECT refill_ts, ml FROM tank_samples ORDER BY ts, rowid")
+
+
+def refills(db):
+    return run_sql(db, "SELECT float_ok FROM refills ORDER BY ts, rowid")
+
+
+def taps(db):
+    return [ts for (ts,) in run_sql(db, "SELECT ts FROM refills ORDER BY ts, rowid")]
+
+
+# --------------------------------------------------------------------------- #
+# The tap snapshots the float (spec D2)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_tap_remembers_what_the_float_said(client, db):
+    assert post(client, "/refill", "c=0").status_code == 200  # never reported
+    report(client, "c=0 ch0=1 float=1")
+    assert post(client, "/refill", "c=0").status_code == 200
+    report(client, "c=0 ch0=1 float=0")
+    assert post(client, "/refill", "c=0").status_code == 200
+    assert refills(db) == [(None,), (1,), (0,)]
+
+
+# --------------------------------------------------------------------------- #
+# The counter (spec D3)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_counter_is_acked_water_sent_after_the_tap(client, db):
+    report(client, "c=0 ch0=1 float=1")
+    assert health(client)["pumped_ml"] == 0  # no tap: nothing to count from
+    dose(client, 100, flow=100)  # before the tap
+    age(db, 60)
+    since = tap(client, db)
+    dose(client, 150, flow=140)  # the meter's count wins over the dose
+    dose(client, 50)  # an ack without a count is charged the dose
+    hand(client, 70)  # never acked: expired on the next report, uncounted
+    report(client, "c=0 ch0=1 float=1 pos=ok")
+    with sqlite3.connect(db) as con:
+        # Another board's water is that board's.
+        con.execute(
+            "INSERT INTO commands (created_ts, controller, kind, outlet, ml, "
+            "cap_s, state, source, sent_ts, acked_ts, flow_ml) "
+            "VALUES (?, 1, 'water', 3, 500, 30, 'acked', 'manual', ?, ?, 500)",
+            (since + 1, since + 1, since + 2),
+        )
+        assert butler.pumped_since(con, 0, since) == 190
+        assert butler.pumped_since(con, 0, since - 1000) == 290
+        assert butler.pumped_since(con, 1, since) == 500
+    assert health(client)["pumped_ml"] == 190
+
+
+# --------------------------------------------------------------------------- #
+# Learning a sample (spec D4)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_float_going_empty_closes_one_sample_per_tap(client, db):
+    report(client, "c=0 ch0=1 float=1")
+    tap(client, db)
+    dose(client, 100, flow=90)
+    # The dose that drains the tank acks on the very report that says
+    # empty, and that count is part of the run.
+    ack(client, hand(client, 100), flow=80, float_ok=0)
+    assert samples(db) == [(taps(db)[0], 170)]
+    report(client, "c=0 ch0=1 float=0")  # still empty: nothing new
+    report(client, "c=0 ch0=1 float=1")  # bouncing at the line, no tap
+    report(client, "c=0 ch0=1 float=0")
+    assert samples(db) == [(taps(db)[0], 170)]
+    # A tap, nothing pumped, and the float goes empty: not a measurement.
+    report(client, "c=0 ch0=1 float=1")
+    tap(client, db)
+    report(client, "c=0 ch0=1 float=0")
+    assert samples(db) == [(taps(db)[0], 170)]
+    # Then water flows and the float goes empty again on the same tap.
+    report(client, "c=0 ch0=1 float=1")
+    dose(client, 200, flow=210)
+    report(client, "c=0 ch0=1 float=0")
+    first, second = taps(db)
+    assert samples(db) == [(first, 170), (second, 210)]
+
+
+def test_a_first_report_has_no_previous_float_and_closes_nothing(client, db):
+    since = tap(client, db)
+    run_sql(
+        db,
+        "INSERT INTO commands (created_ts, controller, kind, outlet, ml, cap_s, "
+        "state, source, sent_ts, acked_ts, flow_ml) "
+        "VALUES (?, 0, 'water', 3, 100, 30, 'acked', 'manual', ?, ?, 100)",
+        since + 1, since + 1, since + 2,
+    )
+    report(client, "c=0 ch0=1 float=0")
+    assert samples(db) == []
+    # And a board that never tapped stores nothing however the float moves.
+    run_sql(db, "DELETE FROM refills")
+    report(client, "c=0 ch0=1 float=1")
+    report(client, "c=0 ch0=1 float=0")
+    assert samples(db) == []
+
+
+# --------------------------------------------------------------------------- #
+# The size (spec D5)
+# --------------------------------------------------------------------------- #
+
+
+def test_tank_ml_is_the_median_of_the_last_five_and_none_under_two(db, app):
+    assert TANK_SAMPLES_TO_ARM == 2 and TANK_MEDIAN_OF == 5
+    with sqlite3.connect(db) as con:
+        size = lambda controller=0: butler.tank_ml(con, controller)  # noqa: E731
+
+        def sample(ts, ml, controller=0):
+            con.execute(
+                "INSERT INTO tank_samples (ts, controller, refill_ts, ml) "
+                "VALUES (?, ?, ?, ?)",
+                (ts, controller, ts, ml),
+            )
+
+        assert size() is None
+        sample(1, 4000)
+        assert size() is None  # one is not a size
+        sample(2, 4201)
+        assert size() == 4100  # of two, their mean
+        sample(3, 9000)  # a tap that was not a fill
+        assert size() == 4201
+        sample(4, 4100)
+        sample(5, 4300)
+        assert size() == 4201
+        sample(6, 4400)  # the sixth pushes the first out of the window
+        sample(7, 4500)
+        assert size() == 4400  # median of 9000, 4100, 4300, 4400, 4500
+        sample(8, 1, controller=1)
+        sample(9, 2, controller=1)
+        assert size() == 4400 and size(1) == 1
+
+
+# --------------------------------------------------------------------------- #
+# What the app sees (spec D9, the read-only fields)
+# --------------------------------------------------------------------------- #
+
+
+def test_health_carries_the_size_the_count_and_the_counter(client, db):
+    report(client, "c=0 ch0=1 float=1")
+    entry = health(client)
+    assert entry["tank_ml"] is None
+    assert entry["tank_samples"] == 0
+    assert entry["pumped_ml"] == 0
+    tap(client, db)
+    dose(client, 200, flow=180)
+    report(client, "c=0 ch0=1 float=0")
+    report(client, "c=0 ch0=1 float=1")
+    entry = health(client)
+    assert (entry["tank_ml"], entry["tank_samples"]) == (None, 1)
+    tap(client, db)
+    dose(client, 200, flow=200)
+    dose(client, 50, flow=40)
+    report(client, "c=0 ch0=1 float=0")
+    entry = health(client)
+    assert (entry["tank_ml"], entry["tank_samples"]) == (210, 2)
+    assert entry["pumped_ml"] == 240
+    tap(client, db)
+    assert health(client)["pumped_ml"] == 0
+
+
+def test_an_existing_database_gains_the_snapshot_column_at_startup(db):
+    with sqlite3.connect(db) as con:
+        con.executescript(
+            """
+            CREATE TABLE refills (ts INTEGER NOT NULL, controller INTEGER NOT NULL);
+            INSERT INTO refills VALUES (5, 0);
+            """
+        )
+    client = TestClient(
+        create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900)
+    )
+    assert client.get("/health").status_code == 200
+    report(client, "c=0 ch0=1 float=1")
+    assert post(client, "/refill", "c=0").status_code == 200
+    assert refills(db) == [(None,), (1,)]  # the old row judges nothing
