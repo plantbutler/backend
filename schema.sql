@@ -190,10 +190,8 @@ CREATE TABLE IF NOT EXISTS status (
   controller     INTEGER PRIMARY KEY,
   ts             INTEGER NOT NULL,  -- when the latest report landed
   float_ok       INTEGER,           -- float= in that report, NULL if not sent
-  float_since    INTEGER,           -- when float_ok last changed value; while
-                                    -- it is 1, the float's latest rise, which
-                                    -- the tank's counter restarts at when it
-                                    -- is later than the tap
+  float_since    INTEGER,           -- when float_ok last changed value, NULL
+                                    -- included: the fields: rule's clock
   pos            TEXT,              -- pos= in that report, NULL if not sent
   pos_since      INTEGER,           -- when pos last changed value
   float_seen     INTEGER,           -- last time float= arrived at all: its
@@ -211,11 +209,17 @@ CREATE TABLE IF NOT EXISTS status (
   latched_ts     INTEGER,           -- the durable half of the board's contradiction
   latch_reason   TEXT,              -- latch: 'contra' | 'resetmid', NULL when not
   pos_ok_seen    INTEGER,           -- last pos=ok ever seen; pos: pages only after one
-  float_word     INTEGER            -- the board's last word on the float, kept
+  float_word     INTEGER,           -- the board's last word on the float, kept
                                     -- across a report that omits float= (which
                                     -- blanks float_ok): the tank sample closes on
                                     -- it going 1 -> 0, and a report that said
                                     -- nothing must not hide that edge
+  float_word_since INTEGER          -- when the word last changed, 1 -> 0 or
+                                    -- 0 -> 1 and on nothing else: while it is 1,
+                                    -- the float's latest rise, which the tank's
+                                    -- counter restarts at when it is later than
+                                    -- the tap; a report that said nothing moves
+                                    -- float_since, never this
 );
 
 -- A refill is a human event (pitch "Trust the tank"): the app says so, the

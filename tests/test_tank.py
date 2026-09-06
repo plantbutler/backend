@@ -570,9 +570,10 @@ def age(db, seconds):
         )
         con.execute(
             "UPDATE status SET float_since = float_since - ?, "
+            "float_word_since = float_word_since - ?, "
             "float_seen = float_seen - ?, "
             "float_bad = float_bad - ?, float_bad_prev = float_bad_prev - ?",
-            (seconds, seconds, seconds, seconds),
+            (seconds, seconds, seconds, seconds, seconds),
         )
         # The pages too, the ticker's own bookkeeping rows excepted (they
         # are its clock): a tap clears `over:` only when it is later than
@@ -627,6 +628,10 @@ def learn_the_tank(app, client, db, sent, size):
     assert health(client)["tank_ml"] == size
     tick(app)
     assert [k.split(":")[0] for k in keys(sent)] == ["tank"] * TANK_SAMPLES_TO_ARM
+    # Both waited for this one tick, and each is judged as it closed: the
+    # first knew nothing yet, the second knew the first.
+    assert sent[0].message.endswith(f"(tank size learning, 1 of {TANK_SAMPLES_TO_ARM})")
+    assert sent[1].message.endswith(f"(tank {size} ml over {TANK_SAMPLES_TO_ARM} samples)")
     sent.clear()
     return size * (100 + TANK_TOLERANCE_PCT) // 100
 
@@ -639,8 +644,9 @@ def taps(db):
     return [ts for (ts,) in run_sql(db, "SELECT ts FROM refills ORDER BY ts, rowid")]
 
 
-def float_since(db):
-    return run_sql(db, "SELECT float_since FROM status WHERE controller = 0")[0][0]
+def word_since(db):
+    """When the float's word last changed: its latest rise while it is 1."""
+    return run_sql(db, "SELECT float_word_since FROM status WHERE controller = 0")[0][0]
 
 
 def alerts(client):
@@ -696,7 +702,7 @@ def test_over_counts_from_the_rise_when_the_float_moved_since_the_tap(
     age(db, FLAP_WINDOW_S + 1)
     report(client, "c=0 ch0=1 float=1 pos=ok")  # refilled, untapped
     age(db, 60)
-    rise = float_since(db)
+    rise = word_since(db)
     assert rise > taps(db)[-1]
     dose(client, 100)  # 310 since the tap, 100 since the rise
     entry = health(client)
@@ -741,6 +747,8 @@ def test_over_clears_on_a_tap_and_on_nothing_else(app, client, db, sent):
     assert keys(sent) == ["over:0"]
     assert health(client)["over"] == 1
     report(client, "c=0 ch0=1 float=0 pos=ok")  # empty: the run is a sample...
+    tick(app)  # ...heard with the float at 0, which clears nothing...
+    assert alerts(client) == ["over:0"] and health(client)["over"] == 1
     report(client, "c=0 ch0=1 float=1 pos=ok")  # ...and full again, untapped
     tick(app)
     assert [k for k in keys(sent) if k.startswith("over:")] == ["over:0"]
@@ -800,6 +808,56 @@ def test_over_holds_the_rules_not_the_phone_and_the_tap_is_the_clear(
     # The window is already five dry readings deep: the next report waters.
     assert "cmd=" in dry_reports(client, n=1)
     assert len(rules_water(db)) == 1
+
+
+def test_over_holds_the_rules_through_a_float_bounce_until_the_tap(
+    app, client, db, sent
+):
+    """The float going 0 -> 1 with nobody tapping is a rise: a fresh
+    origin, a counter at 0, and the live predicate lets go. The page still
+    stands, and the page is the fact — it was raised on a pump presumed
+    stuck at full — so the rules stay dry on it, as /health's over stays
+    1, until a tap answers it (spec D6)."""
+    make_pot(client, cooldown_h=0, daily_cap_ml=100_000)
+    learn_the_tank(app, client, db, sent, 200)
+    tap(client, db)
+    dose(client, 250)
+    tick(app)
+    assert keys(sent) == ["over:0"]
+    age(db, 60)
+    report(client, f"c=0 ch0={DRY} float=0 pos=ok")
+    report(client, f"c=0 ch0={DRY} float=1 pos=ok")  # a bounce, untapped
+    entry = health(client)
+    assert entry["pumped_ml"] == 0  # the counter let go...
+    assert entry["over"] == 1  # ...the page did not
+    dry_reports(client)
+    assert rules_water(db) == []  # and the rules read the page
+    age(db, 60)
+    tap(client, db)
+    tick(app)
+    assert alerts(client) == [] and health(client)["over"] == 0
+    assert "cmd=" in dry_reports(client, n=1)
+    assert len(rules_water(db)) == 1
+
+
+def test_a_report_that_omits_float_neither_hides_nor_makes_a_rise(
+    app, client, db, sent
+):
+    """One report saying nothing about the float, then the same word again,
+    is not the float moving: no rise is invented, the counter keeps what
+    it had, and a float stuck at full is still caught (spec D3, D6)."""
+    learn_the_tank(app, client, db, sent, 200)
+    since = tap(client, db)
+    dose(client, 150)
+    report(client, "c=0 ch0=1 pos=ok")  # says nothing about the float...
+    report(client, "c=0 ch0=1 float=1 pos=ok")  # ...then full, as before
+    with sqlite3.connect(db) as con:
+        assert butler.counter_origin(con, 0) == (since, "tap")
+    assert health(client)["pumped_ml"] == 150
+    dose(client, 71)  # 221 since the tap, the float at full throughout
+    assert health(client)["over"] == 1
+    tick(app)
+    assert keys(sent) == ["over:0"]
 
 
 def test_over_pages_once_per_floor(app, client, db, sent):
@@ -933,6 +991,45 @@ def test_a_float_that_rose_after_the_tap_and_fell_later_is_not_dead(
     assert keys(sent) == []
 
 
+def test_a_float_still_empty_pages_through_a_report_that_omits_it(
+    app, client, db, sent
+):
+    """A report that says nothing about the float, then the same word
+    again, is not the float moving: its word last changed before the tap
+    still, and the page comes (spec D7)."""
+    report(client, "c=0 ch0=1 float=1 pos=ok")
+    report(client, "c=0 ch0=1 float=0 pos=ok")
+    age(db, FLAP_WINDOW_S + 1)
+    tap(client, db)  # with the float saying empty, a minute ago
+    report(client, "c=0 ch0=1 pos=ok")  # says nothing about the float...
+    report(client, "c=0 ch0=1 float=0 pos=ok")  # ...then empty, as before
+    assert word_since(db) < taps(db)[-1]  # it has not moved
+    age(db, FLAP_WINDOW_S + 1)  # its minutes are up, and one sighting is no flap
+    report(client, "c=0 ch0=1 float=0 pos=ok")  # a word, its minutes on
+    tick(app)
+    assert keys(sent) == ["stale:0"]
+
+
+def test_a_dead_float_is_judged_on_a_word_of_empty_not_on_silence(
+    app, client, db, sent
+):
+    """The report that says nothing about the float is not one that says
+    empty: stale: waits for the word (spec D7)."""
+    report(client, "c=0 ch0=1 float=1 pos=ok")
+    report(client, "c=0 ch0=1 float=0 pos=ok")
+    age(db, FLAP_WINDOW_S + 1)
+    tap(client, db)
+    age(db, PERSIST_S - 60)
+    report(client, "c=0 ch0=1 float=0 pos=ok")  # a word, its minutes on...
+    report(client, "c=0 ch0=1 pos=ok")  # ...then one that says nothing
+    tick(app)
+    assert keys(sent) == []  # judged on the word, and there was none
+    age(db, FLAP_WINDOW_S + 1)
+    report(client, "c=0 ch0=1 float=0 pos=ok")
+    tick(app)
+    assert keys(sent) == ["stale:0"]
+
+
 def test_a_tap_that_never_saw_the_float_judges_nothing(app, client, db, sent):
     report(client, "c=0 ch0=1 float=1 pos=ok")
     report(client, "c=0 ch0=1 float=0 pos=ok")
@@ -1020,26 +1117,29 @@ def test_the_helpers_read_the_origin_the_size_the_tap_and_the_float(app, db):
             [(1, 1, 190), (2, 2, 210)],
         )
         con.execute(
-            "INSERT INTO status (controller, ts, float_ok, float_since, float_seen) "
-            "VALUES (0, 1000, 1, 900, 1000)"
+            "INSERT INTO status (controller, ts, float_ok, float_word, "
+            "float_word_since, float_seen) VALUES (0, 1000, 1, 1, 900, 1000)"
         )
         assert origin() == (1000, "tap") and state() == "ok"  # nothing pumped
         pumped(220, 1001)
         assert state() == "ok"  # 200 + 10 %: at the line
         pumped(1, 1002)
         assert state() == ("over", 221, 200, 1000)
-        con.execute("UPDATE status SET float_since = 1000")  # a rise in the tap's second
+        con.execute("UPDATE status SET float_word_since = 1000")  # a rise in the tap's second
         assert origin() == (1000, "tap")  # is the tap's: the human's word wins
-        con.execute("UPDATE status SET float_since = 1001")  # rose after the tap
+        con.execute("UPDATE status SET float_word_since = 1001")  # rose after the tap
         assert origin() == (1001, "rise") and state() == "ok"  # 1 ml since
         pumped(220, 1003)
         assert state() == ("over", 221, 200, 1001)
-        con.execute("UPDATE status SET float_ok = 0")
+        con.execute("UPDATE status SET float_ok = NULL")  # a report that said nothing
+        assert origin() == (1001, "rise")  # the rise stands: the word did not move
+        assert state() == "ok"  # and a float that says nothing refuses already
+        con.execute("UPDATE status SET float_ok = 0, float_word = 0")
         assert origin() == (1000, "tap")  # empty: its last rise is behind it
         assert state() == "ok"  # a float that reads empty works
-        con.execute("UPDATE status SET float_ok = NULL")
-        assert state() == "ok"  # and one that says nothing refuses already
-        con.execute("UPDATE status SET float_ok = 1, float_since = 900")
+        con.execute(
+            "UPDATE status SET float_ok = 1, float_word = 1, float_word_since = 900"
+        )
         con.execute("INSERT INTO refills (ts, controller, float_ok) VALUES (2000, 0, 1)")
         assert origin() == (2000, "tap") and state() == "ok"  # restarts at the tap
         # Judged from the origin it is handed, never one it reads for itself.
@@ -1050,16 +1150,21 @@ def test_the_helpers_read_the_origin_the_size_the_tap_and_the_float(app, db):
         assert dead() is None  # the float said full at the tap
         con.execute("UPDATE refills SET float_ok = 0 WHERE ts = 2000")
         con.execute(
-            "UPDATE status SET float_ok = 0, float_since = 2000, float_seen = ?",
+            "UPDATE status SET float_ok = 0, float_word = 0, float_word_since = 2000, "
+            "float_seen = ?",
             (2000 + PERSIST_S - 1,),
         )
         assert dead() is None  # nothing said since its minutes
         con.execute("UPDATE status SET float_seen = ?", (2000 + PERSIST_S,))
         assert dead() == 2000
-        con.execute("UPDATE status SET float_since = 2001")
+        con.execute("UPDATE status SET float_word_since = 2001")
         assert dead() is None  # it moved after the tap
-        con.execute("UPDATE status SET float_since = 1999, float_ok = 1")
+        con.execute(
+            "UPDATE status SET float_word_since = 1999, float_ok = 1, float_word = 1"
+        )
         assert dead() is None  # it says full
+        con.execute("UPDATE status SET float_ok = NULL, float_word = 0")
+        assert dead() is None  # it said nothing, which is not empty
         con.execute("UPDATE status SET float_ok = 0")
         assert dead() == 2000
         assert butler.float_dead(con, 0, (1999, 0)) == 1999  # the tap handed

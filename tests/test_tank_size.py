@@ -87,9 +87,10 @@ def age(db, seconds):
         con.execute("UPDATE refills SET ts = ts - ?", (seconds,))
         con.execute(
             "UPDATE status SET float_since = float_since - ?, "
+            "float_word_since = float_word_since - ?, "
             "float_seen = float_seen - ?, "
             "float_bad = float_bad - ?, float_bad_prev = float_bad_prev - ?",
-            (seconds, seconds, seconds, seconds),
+            (seconds, seconds, seconds, seconds, seconds),
         )
         con.execute(
             "UPDATE commands SET created_ts = created_ts - ?, "
@@ -167,8 +168,28 @@ def origin(db):
         return butler.counter_origin(con, 0)
 
 
-def float_since(db):
-    return run_sql(db, "SELECT float_since FROM status WHERE controller = 0")[0][0]
+def word_since(db):
+    """When the float's word last changed: its latest rise while it is 1."""
+    return run_sql(db, "SELECT float_word_since FROM status WHERE controller = 0")[0][0]
+
+
+def vm_steps(con, fetch):
+    """SQLite's own count of the virtual-machine steps `fetch` costs on
+    `con`, without a clock."""
+    fetch()  # warm: a statement's first run pays for its plan
+    n = 0
+
+    def count():
+        nonlocal n
+        n += 1
+        return 0
+
+    con.set_progress_handler(count, 1)
+    try:
+        fetch()
+    finally:
+        con.set_progress_handler(None, 0)
+    return n
 
 
 # --------------------------------------------------------------------------- #
@@ -228,7 +249,7 @@ def test_the_counter_starts_at_the_latest_tap_that_saw_the_float_or_the_rise(
     age(db, 60)
     assert origin(db) is None  # a tap that saw nothing is no origin
     report(client, "c=0 ch0=1 float=1")  # the float's first word is a rise
-    assert origin(db) == (float_since(db), "rise")
+    assert origin(db) == (word_since(db), "rise")
     age(db, 60)
     dose(client, 100, flow=100)
     assert health(client)["pumped_ml"] == 100  # counted from the rise, tap or no tap
@@ -236,7 +257,7 @@ def test_the_counter_starts_at_the_latest_tap_that_saw_the_float_or_the_rise(
     assert origin(db) == (since, "tap")
     assert health(client)["pumped_ml"] == 0
     run_sql(db, "UPDATE refills SET float_ok = NULL WHERE ts = ?", since)
-    assert origin(db) == (float_since(db), "rise")  # blind after all: no origin
+    assert origin(db) == (word_since(db), "rise")  # blind after all: no origin
     assert health(client)["pumped_ml"] == 100
     run_sql(db, "UPDATE refills SET float_ok = 1 WHERE ts = ?", since)
     # The float goes empty and full again with nobody tapping.
@@ -245,7 +266,7 @@ def test_the_counter_starts_at_the_latest_tap_that_saw_the_float_or_the_rise(
     assert origin(db) == (since, "tap")  # empty: its last rise is behind the tap
     assert health(client)["pumped_ml"] == 100
     report(client, "c=0 ch0=1 float=1")
-    rise = float_since(db)
+    rise = word_since(db)
     assert rise > since and origin(db) == (rise, "rise")
     assert health(client)["pumped_ml"] == 0  # that water went before the rise
     age(db, 60)
@@ -255,7 +276,52 @@ def test_the_counter_starts_at_the_latest_tap_that_saw_the_float_or_the_rise(
     report(client, "c=0 ch0=1 float=0")
     report(client, "c=0 ch0=1 float=1")
     since = tap(client, db)
-    assert float_since(db) == since and origin(db) == (since, "tap")
+    assert word_since(db) == since and origin(db) == (since, "tap")
+
+
+def test_a_report_without_float_moves_no_rise(client, db):
+    """A report that says nothing about the float neither rises nor
+    falls: the rise the float had stands through it, and none is invented
+    when it says the same word again — the word's own clock, not
+    float_since, which such a report restarts (spec D3, amended)."""
+    report(client, "c=0 ch0=1 float=1")
+    since = tap(client, db)
+    dose(client, 150, flow=150)
+    report(client, "c=0 ch0=1 float=0")  # ran down...
+    age(db, 60)
+    report(client, "c=0 ch0=1 float=1")  # ...and refilled, untapped
+    rise = word_since(db)
+    assert rise > since and origin(db) == (rise, "rise")
+    assert health(client)["pumped_ml"] == 0  # that water went before the rise
+    report(client, "c=0 ch0=1")  # says nothing about the float
+    assert origin(db) == (rise, "rise") and health(client)["pumped_ml"] == 0
+    report(client, "c=0 ch0=1 float=1")  # the same word again is no rise
+    assert word_since(db) == rise and origin(db) == (rise, "rise")
+    # Nor is full, nothing, full since a tap: the counter keeps its water.
+    age(db, 120)
+    since = tap(client, db)
+    dose(client, 100, flow=100)
+    report(client, "c=0 ch0=1")
+    report(client, "c=0 ch0=1 float=1")
+    assert origin(db) == (since, "tap") and health(client)["pumped_ml"] == 100
+
+
+def test_a_dose_typed_before_the_tap_and_handed_after_it_counts(client, db):
+    """The counter's side of the tap is the board's, sent_ts — when it was
+    handed the dose — not the phone's created_ts: water typed before the
+    tap and pumped after it left the full tank (spec D3)."""
+    report(client, "c=0 ch0=1 float=1")
+    answer = post(client, "/command", "c=0 water=3 ml=70")
+    assert answer.status_code == 200, answer.text
+    cmd_id = int(answer.text.strip().removeprefix("cmd="))
+    age(db, 60)  # typed a minute before...
+    since = tap(client, db)  # ...the tap, itself a minute ago
+    ((created,),) = run_sql(db, "SELECT created_ts FROM commands WHERE id = ?", cmd_id)
+    assert created < since
+    handed = report(client, "c=0 ch0=1 float=1 pos=ok").text  # after the tap
+    assert f"cmd={cmd_id} water=3 ml=70" in handed
+    ack(client, cmd_id, flow=70)
+    assert health(client)["pumped_ml"] == 70
 
 
 def test_a_stop_acked_with_a_count_is_not_water(client, db):
@@ -478,22 +544,6 @@ def test_tank_history_costs_the_same_however_many_runs_a_board_has_closed(db, ap
     own step counter says so, without a clock."""
     with sqlite3.connect(db) as con:
 
-        def steps(fetch):
-            fetch()  # warm: a statement's first run pays for its plan
-            n = 0
-
-            def count():
-                nonlocal n
-                n += 1
-                return 0
-
-            con.set_progress_handler(count, 1)
-            try:
-                fetch()
-            finally:
-                con.set_progress_handler(None, 0)
-            return n
-
         def fill(total):
             con.execute("DELETE FROM tank_samples")
             con.executemany(
@@ -505,17 +555,49 @@ def test_tank_history_costs_the_same_however_many_runs_a_board_has_closed(db, ap
                 "SELECT rowid FROM tank_samples ORDER BY ts DESC, rowid DESC"
             ).fetchone()
             return (
-                steps(lambda: butler.tank_ml(con, 0)),
-                steps(
+                vm_steps(con, lambda: butler.tank_ml(con, 0)),
+                vm_steps(
+                    con,
                     lambda: butler.tank_history(
                         con, 0, (total, newest), TANK_MEDIAN_OF + 1
-                    )
+                    ),
                 ),
             )
 
         few, many = fill(6), fill(600)
         assert many[0] <= few[0], (few, many)  # the size
         assert many[1] <= few[1], (few, many)  # a sample's judgement
+
+
+def test_finding_the_unannounced_samples_costs_the_pending_few(db, app):
+    """Every tick looks for the samples with no page yet, so that walk is
+    bounded in SQLite to the pending ones plus one: the same steps over
+    six hundred announced runs as over six, and more only with more
+    pending (spec D8)."""
+    with sqlite3.connect(db) as con:
+
+        def fill(total, pending):
+            con.execute("DELETE FROM tank_samples")
+            con.execute("DELETE FROM alerts")
+            con.executemany(
+                "INSERT INTO tank_samples (ts, controller, refill_ts, ml) "
+                "VALUES (?, 0, ?, 100)",
+                [(t, t) for t in range(1, total + 1)],
+            )
+            con.executemany(
+                "INSERT INTO alerts (key, raised_ts, cleared_ts) VALUES (?, ?, NULL)",
+                [(f"tank:0:{t}", t) for t in range(1, total + 1 - pending)],
+            )
+            found = butler.unannounced_samples(con, 0)
+            assert [(ts, refill_ts) for ts, _rowid, refill_ts, _ml in found] == [
+                (t, t) for t in range(total + 1 - pending, total + 1)
+            ]
+            return vm_steps(con, lambda: butler.unannounced_samples(con, 0))
+
+        few, many = fill(6, 1), fill(600, 1)
+        assert many <= few, (few, many)
+        assert fill(600, 3) > many  # the pending ones are the cost
+        assert butler.unannounced_samples(con, 1) == []  # another board's are its own
 
 
 # --------------------------------------------------------------------------- #
@@ -585,7 +667,9 @@ def test_an_existing_database_carries_the_floats_last_word_at_startup(db):
     client = TestClient(
         create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900)
     )
-    assert run_sql(db, "SELECT float_word FROM status") == [(1,)]
+    # The word and its clock, carried from float_ok and float_since: the
+    # rise the float had before the upgrade is where it was.
+    assert run_sql(db, "SELECT float_word, float_word_since FROM status") == [(1, 5)]
     assert post(client, "/refill", "c=0").status_code == 200  # snapshots the carried 1
     run_sql(db, "UPDATE refills SET ts = ts - 60 WHERE float_ok IS NOT NULL")
     assert refills(db) == [(None,), (1,)]
@@ -658,6 +742,30 @@ def test_every_sample_is_announced_once(app, client, db, sent):
     report(client, "c=0 ch0=1 float=0")
     tick(app)
     assert len(sent) == 2
+
+
+def test_two_runs_waiting_on_one_tick_are_each_judged_as_they_closed(
+    app, client, db, sent
+):
+    """A tick that finds two samples waiting (the ticker was down, or a
+    send failed) judges the first against what the tank knew when it
+    closed — nothing — not against the second, which had not happened
+    yet (spec D8)."""
+    report(client, "c=0 ch0=1 float=1")
+    tap(client, db)
+    dose(client, 200, flow=200)
+    report(client, "c=0 ch0=1 float=0")
+    age(db, FLAP_WINDOW_S + 1)
+    report(client, "c=0 ch0=1 float=1")
+    tap(client, db)
+    dose(client, 250, flow=250)
+    dose(client, 150, flow=150)
+    report(client, "c=0 ch0=1 float=0")
+    tick(app)
+    first, second = taps(db)
+    assert keys(sent) == [f"tank:0:{first}", f"tank:0:{second}"]
+    assert sent[0].message.endswith("(tank size learning, 1 of 2)")
+    assert sent[1].message.endswith("(tank 300 ml over 2 samples)")
 
 
 def test_a_sample_off_the_size_it_knew_is_a_warning(app, client, db, sent):

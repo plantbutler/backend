@@ -141,8 +141,10 @@ watering.
   already refuse on it. `POST /refill` records a human refill, and the tap means "full to the
   top": the row snapshots `status.float_ok`. The tank's counter starts at `counter_origin()` —
   the later of the latest tap that saw the float (a NULL snapshot, the rows 0.18.0 left, is no
-  origin for anything) and the float's latest rise (`status.float_since` while it says 1: a
-  float that went 1 → 0 → 1 since the tap is a tank refilled by someone who forgot to tap) — and
+  origin for anything) and the float's latest rise (`status.float_word_since` while the word is
+  1 — the word's own clock, which a report that omits `float=` leaves alone, where `float_since`
+  is `float_ok`'s and the `fields:` rule's: a float that went 1 → 0 → 1 since the tap is a tank
+  refilled by someone who forgot to tap, and one that said nothing once has not moved) — and
   the stuck-at-empty rule reads `latest_refill()`, snapshot and all; the ticker reads both once
   per board.
   `POST /controller c= retired=1` retires a board: reports land (the latch row included —
@@ -165,16 +167,20 @@ watering.
   still says 1 — `water_rules` goes dry, `over:<c>` pages high ("since HH:MM", the origin; not
   while latched or retired), and a tap that saw the float, later than the page, is the only
   clear — not the float word dropping to 0, which is a contra, a flap or an omitted `float=` as
-  often as an empty tank; `/health`'s `over` is 1 while the predicate holds or the page stands,
-  0 for a retired board; `POST /command water=` is not gated. `float_dead()` — a tap made with
-  the float at 0, a `float=` reading `PERSIST_S` or more after it (`status.float_seen`, not the
-  wall clock: a board behind a WiFi drop has said nothing and is judged on nothing), and still 0
-  since before the tap — pages `stale:<c>` (not while latched or retired) and nothing else,
-  cleared when the float reads 1 (the key is the 0.18.0 clock rule's, so a page standing from it
-  clears through the same path). Every sample is announced once as
+  often as an empty tank; the rules stay dry while the page stands (`over_stands()`), not on the
+  live predicate alone, which a float bouncing 0 → 1 untapped lets go of; `/health`'s `over` is
+  1 while the predicate holds or the page stands, 0 for a retired board; `POST /command water=`
+  is not gated. `float_dead()` — a tap made with the float at 0, a `float=` reading `PERSIST_S`
+  or more after it (`status.float_seen`, not the wall clock: a board behind a WiFi drop has said
+  nothing and is judged on nothing), and still 0 (`float_ok`: a report that said nothing said
+  nothing) since before the tap (`float_word_since`) — pages `stale:<c>` (not while latched or
+  retired) and nothing else, cleared when the float reads 1 (the key is the 0.18.0 clock rule's,
+  so a page standing from it clears through the same path). Every sample is announced once as
   `tank:<c>:<refill_ts>`, marked like `dose:<id>` and left out of `/health` and the up-probe count
   like it, as a warning when it is more than `TANK_DRIFT_PCT` (25) off the median of the samples
-  before it. `ch204` still lands and nothing reads it.
+  before it; the pending ones are found board by board from the latest announced one back
+  (`unannounced_samples()`), never by scanning a board's life of samples every tick. `ch204`
+  still lands and nothing reads it.
 - The controller is an INTEGER on the wire and in every column, 0..255 (`MAX_CONTROLLER`), since
   0.17.0. It was free text, which made `c=` the one field a typo could turn into a second garden:
   a report from `bench1 ` opened its own controller row, heartbeat and alerts and nothing said the
