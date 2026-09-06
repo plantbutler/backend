@@ -53,9 +53,10 @@ safety field that vanished after the board had been sending it, a dose
 that was never acked or came up short on the meter or did not raise
 moisture, a learning proposal waiting, a board that stopped itself and
 waits for a human to resume it, a float presumed stuck (still saying full
-after more than the tank holds went out since the last refill, or still
-saying empty minutes after one), and each time the float closes a
-measurement of the tank — posts the transitions to a public ntfy.sh topic
+after more than the tank holds went out since the last refill or the
+float's own last rise, or still saying empty in a report minutes after a
+refill), and each time the float closes a measurement of the tank — posts
+the transitions to a public ntfy.sh topic
 (BUTLER_NTFY_TOPIC; the topic name is the secret), and only
 after a fully clean pass GETs BUTLER_DEADMAN_URL. A pass with nothing to
 send must first prove ntfy reachable, so the butler dying and the butler
@@ -826,8 +827,10 @@ def latest_refill(
     con: sqlite3.Connection, controller: int
 ) -> tuple[int, int | None] | None:
     """The latest tap for this board, (ts, what the float said at it), or
-    None when nobody has ever tapped. The tap means "full to the top", so
-    everything the tank knows counts from it (spec D2)."""
+    None when nobody has ever tapped. The tap means "full to the top". The
+    stuck-at-empty rule reads this one, snapshot and all; the counter
+    starts at counter_origin's answer, which is not always a tap (spec
+    D2, D7)."""
     row = con.execute(
         "SELECT ts, float_ok FROM refills WHERE controller = ? "
         "ORDER BY ts DESC, rowid DESC LIMIT 1",
@@ -836,12 +839,58 @@ def latest_refill(
     return (row[0], row[1]) if row else None
 
 
+def counter_origin(
+    con: sqlite3.Connection, controller: int
+) -> tuple[int, str] | None:
+    """Where this board's counter starts, (ts, "tap" | "rise"), or None:
+    the later of the latest tap that saw the float and the float's latest
+    rise — status.float_since while status.float_ok is 1 — the tap on a
+    tie, being the human's word. A tap whose snapshot is NULL (the rows
+    0.18.0 left behind, a board that had never said float=) never meant
+    "full to the top": a month of untapped top-ups behind it would become
+    a 12 L sample and a threshold no stuck float ever reaches, so it is
+    no origin for anything. A float that went 1 -> 0 -> 1 since the tap
+    is a tank that ran down and was refilled by someone who forgot to
+    tap: it demonstrably moved, so the counter restarts at the rise
+    instead of calling it stuck twenty millilitres later. With no origin
+    the counter is 0 and nothing arms (spec D3)."""
+    row = con.execute(
+        "SELECT ts FROM refills WHERE controller = ? AND float_ok IS NOT NULL "
+        "ORDER BY ts DESC, rowid DESC LIMIT 1",
+        (controller,),
+    ).fetchone()
+    tap = row[0] if row else None
+    row = con.execute(
+        "SELECT float_since FROM status WHERE controller = ? AND float_ok = 1",
+        (controller,),
+    ).fetchone()
+    rise = row[0] if row else None
+    if rise is not None and (tap is None or rise > tap):
+        return (rise, "rise")
+    return (tap, "tap") if tap is not None else None
+
+
+def tapped_after(con: sqlite3.Connection, controller: int, ts: int) -> bool:
+    """Whether a tap that saw the float is later than `ts`: the one thing
+    that clears over:<c>, since a person who tapped looked at the tank
+    (spec D6)."""
+    return (
+        con.execute(
+            "SELECT 1 FROM refills WHERE controller = ? AND float_ok IS NOT NULL "
+            "AND ts > ? LIMIT 1",
+            (controller, ts),
+        ).fetchone()
+        is not None
+    )
+
+
 def pumped_since(con: sqlite3.Connection, controller: int, since_ts: int) -> int:
-    """Millilitres of acked water handed to this board after `since_ts`:
-    the meter's count, or the dose when the ack carried none — the daily
-    cap's own expression, so the counter and the cap agree. A dose lost
-    without an ack pumped something uncounted, and whatever reads this
-    fires late for it; the contra latch stands behind it (spec D3)."""
+    """Millilitres of acked water handed to this board after `since_ts`
+    (the origin, counter_origin's ts): the meter's count, or the dose
+    when the ack carried none — the daily cap's own expression, so the
+    counter and the cap agree. A dose lost without an ack pumped
+    something uncounted, and whatever reads this fires late for it; the
+    contra latch stands behind it (spec D3)."""
     (total,) = con.execute(
         "SELECT COALESCE(SUM(COALESCE(flow_ml, ml)), 0) FROM commands "
         "WHERE controller = ? AND kind = 'water' AND acked_ts IS NOT NULL "
@@ -892,7 +941,7 @@ def tank_ml(con: sqlite3.Connection, controller: int) -> int | None:
 
 def is_over(tank: int | None, pumped: int, float_ok: int | None) -> bool:
     """D6's judgement on its three numbers: more than the tank holds, plus
-    TANK_TOLERANCE_PCT, pumped since the latest tap while the float still
+    TANK_TOLERANCE_PCT, pumped since the origin while the float still
     says full; never while the size is unknown. The one expression of it,
     so the ticker, the rules and /health cannot disagree."""
     return (
@@ -905,27 +954,26 @@ def is_over(tank: int | None, pumped: int, float_ok: int | None) -> bool:
 def tank_state(
     con: sqlite3.Connection,
     controller: int,
-    tapped: tuple[int, int | None] | None,
+    origin: tuple[int, str] | None,
 ) -> str | tuple[str, int, int, int]:
     """The float judged against the tank's size: "unknown" while the size
-    is, or nobody has tapped; ("over", pumped, tank, refill_ts) when more
+    is, or there is no origin; ("over", pumped, tank, origin_ts) when more
     than the tank holds, plus TANK_TOLERANCE_PCT, has been pumped since the
-    latest tap and the float still says full — presumed stuck at full, the
+    origin and the float still says full — presumed stuck at full, the
     dangerous way; "ok" otherwise, since a float that reads empty is a
-    float that works, and the rules refuse on it already. `tapped` is
-    latest_refill's answer, read once by the caller: the ticker hands the
-    same tap to this and to float_dead (spec D6)."""
-    if tapped is None:
+    float that works, and the rules refuse on it already. `origin` is
+    counter_origin's answer, read once by the caller (spec D6)."""
+    if origin is None:
         return "unknown"
     tank = tank_ml(con, controller)
     if tank is None:
         return "unknown"
-    pumped = pumped_since(con, controller, tapped[0])
+    pumped = pumped_since(con, controller, origin[0])
     row = con.execute(
         "SELECT float_ok FROM status WHERE controller = ?", (controller,)
     ).fetchone()
     if is_over(tank, pumped, row[0] if row else None):
-        return ("over", pumped, tank, tapped[0])
+        return ("over", pumped, tank, origin[0])
     return "ok"
 
 
@@ -933,23 +981,32 @@ def float_dead(
     con: sqlite3.Connection,
     controller: int,
     tapped: tuple[int, int | None] | None,
-    now: int,
 ) -> int | None:
     """The tap a float is presumed stuck at empty since, or None: the latest
     refill (`tapped`, latest_refill's answer, read by the caller) was tapped
-    with the float saying empty, it has had PERSIST_S to settle, and it has
-    said empty since before the tap. That last clause is what keeps a float
-    that rose after the tap and, days later, fell again for real out of
-    this: its `float_since` is after the tap. A tap that never saw the
-    float (NULL) judges nothing. Harmless, unlike its twin above: the rules
-    are dry on empty already, so this is a page and nothing else (spec D7)."""
-    if tapped is None or tapped[1] != 0 or now - tapped[0] < PERSIST_S:
+    with the float saying empty, the board has said float= at least
+    PERSIST_S after it, and it still says empty since before the tap. A
+    reading, not the wall clock: a board on a five-minute beat or behind a
+    WiFi drop has said nothing yet and is judged on nothing. The last
+    clause is what keeps a float that rose after the tap and, days later,
+    fell again for real out of this: its `float_since` is after the tap.
+    A tap that never saw the float (NULL) judges nothing. Harmless, unlike
+    its twin above: the rules are dry on empty already, so this is a page
+    and nothing else (spec D7)."""
+    if tapped is None or tapped[1] != 0:
         return None
     row = con.execute(
-        "SELECT float_ok, float_since FROM status WHERE controller = ?",
+        "SELECT float_ok, float_since, float_seen FROM status WHERE controller = ?",
         (controller,),
     ).fetchone()
-    if row and row[0] == 0 and row[1] is not None and row[1] <= tapped[0]:
+    if (
+        row
+        and row[2] is not None
+        and row[2] >= tapped[0] + PERSIST_S
+        and row[0] == 0
+        and row[1] is not None
+        and row[1] <= tapped[0]
+    ):
         return tapped[0]
     return None
 
@@ -2540,8 +2597,8 @@ def create_app(
             return  # a retired board keeps its readings and never waters
         if latch_of(con, r.controller) is not None:
             return  # the durable half of the board's latch: dry until a human resumes
-        tapped = latest_refill(con, r.controller)
-        if isinstance(tank_state(con, r.controller, tapped), tuple):
+        origin = counter_origin(con, r.controller)
+        if isinstance(tank_state(con, r.controller, origin), tuple):
             return  # over: more than the tank holds and the float still says full
         if r.float_ok != 1 or r.pos != "ok":
             return  # no reservoir, no known position, no report field: dry
@@ -2718,6 +2775,12 @@ def create_app(
             ).fetchone()
             prev_err = prev[0] if prev else None
             prev_float = prev[1] if prev else None
+            # The counter's origin as it stood before this report, on the
+            # float's edge: a rise since the tap is a refill nobody said
+            # was full, which this report's float=0 would put behind the
+            # tap again the moment the upsert lands (spec D3, D4).
+            edge = prev_float == 1 and r.float_ok == 0
+            origin = counter_origin(con, r.controller) if edge else None
             # The latest safety fields, with enough history for the alert
             # rules: when each value last changed (`since`), when each was
             # last sent at all (`seen` — its vanishing is an alarm), and the
@@ -2802,8 +2865,10 @@ def create_app(
                     (now, r.flow_ml, r.ack, r.controller),
                 )
             if (
-                prev_float == 1
-                and r.float_ok == 0
+                edge
+                and origin is not None
+                and origin[1] == "tap"
+                and latch_of(con, r.controller) is None
                 and not is_retired(con, r.controller)
             ):
                 # The float went empty: the water the meter counted since
@@ -2812,17 +2877,20 @@ def create_app(
                 # report. One per tap — a float bouncing at the line adds
                 # nothing after its first crossing — and nothing on zero:
                 # a tank drained by something the meter never saw is not a
-                # measurement (spec D4). A retired board's reports still
-                # land, but it learns nothing (spec D1).
-                tapped = latest_refill(con, r.controller)
-                if tapped is not None:
-                    pumped = pumped_since(con, r.controller, tapped[0])
-                    if pumped > 0:
-                        con.execute(
-                            "INSERT OR IGNORE INTO tank_samples "
-                            "(ts, controller, refill_ts, ml) VALUES (?, ?, ?, ?)",
-                            (now, r.controller, tapped[0], pumped),
-                        )
+                # measurement. Nothing either when the origin is a rise
+                # (refilled untapped: how full is anybody's guess), while
+                # the board's latch stands — ch207=1 on this very report
+                # set it just above, and "float OK, zero pulses" is a dead
+                # meter, a kinked tube or 12 V absent as often as anything
+                # about the tank — or for a retired board, whose reports
+                # still land but which learns nothing (spec D1, D4).
+                pumped = pumped_since(con, r.controller, origin[0])
+                if pumped > 0:
+                    con.execute(
+                        "INSERT OR IGNORE INTO tank_samples "
+                        "(ts, controller, refill_ts, ml) VALUES (?, ?, ?, ?)",
+                        (now, r.controller, origin[0], pumped),
+                    )
             # A command still 'sent' after the ack step was handed on an
             # earlier response and this report did not ack it: the board
             # does not have it. Gone, per the module docstring.
@@ -3764,52 +3832,58 @@ def create_app(
 
         # The float judged against the tank's size, never a clock. Stuck at
         # full is the dangerous one: more than the tank holds pumped since
-        # the tap with the float still saying full is a float presumed
-        # stuck, the rules stay dry on it, and the tap is the clear — the
-        # counter restarts at it, and a person who tapped looked at the
+        # the origin (the tap, or the float's own rise if later) with the
+        # float still saying full is a float presumed stuck, the rules stay
+        # dry on it, and a tap later than the page is the only clear — a
+        # person who tapped looked at the tank, where the word dropping to
+        # 0 is a contra, a flap or an omitted float= as often as an empty
         # tank. Stuck at empty is harmless: the rules are dry on empty
         # already, so it is a page and nothing else, cleared when the float
         # says full. Its `stale:` key is the clock rule's, kept so a page
-        # standing from 0.18.0 clears through the same path.
-        for controller, float_ok in con.execute(
-            "SELECT controller, float_ok FROM status"
+        # standing from 0.18.0 clears through the same path. Neither is
+        # raised while the board's latch stands: a contra forces the word
+        # to 0, and the latch page already says what to do.
+        for controller, float_ok, latched_ts in con.execute(
+            "SELECT controller, float_ok, latched_ts FROM status"
         ):
             if controller in retired:
                 continue
-            tapped = latest_refill(con, controller)  # once, for both rules
+            origin = counter_origin(con, controller)
+            tapped = latest_refill(con, controller)
             key = f"over:{controller}"
-            state = tank_state(con, controller, tapped)
-            if isinstance(state, tuple):
-                _, pumped, tank, refill_ts = state
-                if not raised(key) and floor_ok(key):
+            page = standing.get(key)
+            if page is not None and page[1] is None:
+                if tapped_after(con, controller, page[0]):
+                    found.append(
+                        Alert(
+                            key,
+                            "default",
+                            "white_check_mark",
+                            f"the tank on board {controller} was refilled",
+                            clear(key),
+                        )
+                    )
+            elif latched_ts is None and floor_ok(key):
+                state = tank_state(con, controller, origin)
+                if isinstance(state, tuple):
+                    _, pumped, tank, origin_ts = state
                     found.append(
                         Alert(
                             key,
                             "high",
                             "warning",
-                            f"board {controller} pumped {pumped} ml since the "
-                            f"refill at {hhmm(refill_ts)}, more than its tank "
-                            f"holds ({tank} ml), and the float still says full: "
+                            f"board {controller} pumped {pumped} ml since "
+                            f"{hhmm(origin_ts)}, more than its tank holds "
+                            f"({tank} ml), and the float still says full: "
                             "presumed stuck, the rules will not water until the "
                             "next refill",
                             mark(key),
                         )
                     )
-            elif raised(key):
-                found.append(
-                    Alert(
-                        key,
-                        "default",
-                        "white_check_mark",
-                        f"the tank on board {controller} was refilled, "
-                        "watering resumes",
-                        clear(key),
-                    )
-                )
             key = f"stale:{controller}"
-            dead = float_dead(con, controller, tapped, now)
+            dead = float_dead(con, controller, tapped)
             if dead is not None:
-                if not raised(key) and floor_ok(key):
+                if latched_ts is None and not raised(key) and floor_ok(key):
                     found.append(
                         Alert(
                             key,
@@ -3817,8 +3891,10 @@ def create_app(
                             "warning",
                             f"the float on board {controller} still says empty "
                             f"{(now - dead) // 60} min after the refill at "
-                            f"{hhmm(dead)}: presumed stuck at empty, look at "
-                            "the magnet",
+                            f"{hhmm(dead)}: a stuck float, or the board's own "
+                            "float check tripped — look at the magnet, or water "
+                            "once from the phone (a granted dose resets the "
+                            "board's check)",
                             mark(key),
                         )
                     )
@@ -4924,22 +5000,13 @@ def create_app(
                 for controller, ts in con.execute(
                     "SELECT controller, MAX(ts) FROM refills GROUP BY controller"
                 ):
-                    e = known.setdefault(controller, entry(controller))
-                    e["last_refill"] = ts
-                    e["pumped_ml"] = pumped_since(con, controller, ts)
+                    known.setdefault(controller, entry(controller))["last_refill"] = ts
                 for controller, n in con.execute(
                     "SELECT controller, COUNT(*) FROM tank_samples GROUP BY controller"
                 ):
                     e = known.setdefault(controller, entry(controller))
                     e["tank_samples"] = n
                     e["tank_ml"] = tank_ml(con, controller)
-                for e in known.values():
-                    # Judged on the size, the counter and the float the
-                    # entry already carries — the three numbers tank_state
-                    # reads, through the same predicate, read once.
-                    e["over"] = int(
-                        is_over(e["tank_ml"], e["pumped_ml"], e["float"])
-                    )
                 raised = [
                     {"key": key, "raised_ts": ts}
                     for key, ts in con.execute(
@@ -4947,6 +5014,24 @@ def create_app(
                         f"WHERE {RAISED_SQL} ORDER BY key"
                     )
                 ]
+                paged = {a["key"] for a in raised}
+                for controller, e in known.items():
+                    origin = counter_origin(con, controller)
+                    e["pumped_ml"] = (
+                        pumped_since(con, controller, origin[0]) if origin else 0
+                    )
+                    # Judged on the size, the counter and the float the
+                    # entry already carries — the three numbers tank_state
+                    # reads, through the same predicate, read once — or on
+                    # the page standing, which only a tap clears. Retired
+                    # is the last word, and a quiet one (spec D6, D9).
+                    e["over"] = int(
+                        not e["retired"]
+                        and (
+                            is_over(e["tank_ml"], e["pumped_ml"], e["float"])
+                            or f"over:{controller}" in paged
+                        )
+                    )
                 for cmd_id, controller, kind, state in con.execute(
                     "SELECT id, controller, kind, state FROM commands "
                     "WHERE state IN ('queued', 'sent')"
