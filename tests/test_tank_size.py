@@ -1,14 +1,22 @@
 """The tank has a size: what the float said at the tap, the counter, the
-samples the float closes, the median, and what /health says about them
-(spec D1-D5 and D9's three read-only fields)."""
+samples the float closes, the median, the page each sample earns, and what
+/health says about them (spec D1-D5, D8 and D9's three read-only fields)."""
 
 import sqlite3
+import time
 
 import pytest
 from fastapi.testclient import TestClient
 
 import butler
-from butler import TANK_MEDIAN_OF, TANK_SAMPLES_TO_ARM, create_app
+from butler import (
+    FLAP_WINDOW_S,
+    MAX_DOSE_ML,
+    TANK_MEDIAN_OF,
+    TANK_SAMPLES_TO_ARM,
+    UP_AFTER_S,
+    create_app,
+)
 
 TOKEN = "test-token"
 
@@ -56,6 +64,14 @@ def health(client, controller=0):
     return next(c for c in entries if c["controller"] == controller)
 
 
+def tick(app, now=None):
+    return app.state.tick(now)
+
+
+def keys(sent):
+    return [a.key for a in sent if a.message is not None]
+
+
 def run_sql(db, sql, *params):
     with sqlite3.connect(db) as con:
         return con.execute(sql, params).fetchall()
@@ -63,10 +79,17 @@ def run_sql(db, sql, *params):
 
 def age(db, seconds):
     """Everything so far happened `seconds` earlier, so what comes next is
-    later than all of it: the tests run inside one second, and the counter
-    is strict about which side of the tap a dose was sent on."""
+    later than all of it: the tests run inside one second, the counter is
+    strict about which side of the tap a dose was sent on, and two float=0
+    sightings inside the flap window are one float flapping, not two runs
+    of the tank."""
     with sqlite3.connect(db) as con:
         con.execute("UPDATE refills SET ts = ts - ?", (seconds,))
+        con.execute(
+            "UPDATE status SET float_since = float_since - ?, "
+            "float_bad = float_bad - ?, float_bad_prev = float_bad_prev - ?",
+            (seconds, seconds, seconds),
+        )
         con.execute(
             "UPDATE commands SET created_ts = created_ts - ?, "
             "sent_ts = sent_ts - ?, acked_ts = acked_ts - ?",
@@ -76,6 +99,16 @@ def age(db, seconds):
             "UPDATE tank_samples SET ts = ts - ?, refill_ts = refill_ts - ?",
             (seconds, seconds),
         )
+        # The page a sample earned is keyed on its tap, so it moves with it:
+        # left behind, the sample would look unannounced and page again.
+        for (key,) in con.execute(
+            "SELECT key FROM alerts WHERE key LIKE 'tank:%'"
+        ).fetchall():
+            head, refill_ts = key.rsplit(":", 1)
+            con.execute(
+                "UPDATE alerts SET key = ? WHERE key = ?",
+                (f"{head}:{int(refill_ts) - seconds}", key),
+            )
 
 
 def tap(client, db):
@@ -382,3 +415,117 @@ def test_an_existing_database_carries_the_floats_last_word_at_startup(db):
     )
     report(client, "c=0 ch0=1 float=0")
     assert samples(db) == [(10, 100)]
+
+
+# --------------------------------------------------------------------------- #
+# Every sample is announced (spec D8)
+# --------------------------------------------------------------------------- #
+
+
+def run_the_tank_down(app, client, db, ml):
+    """One run, a flap window after the last: a tap, `ml` through the meter
+    in doses the board accepts (each handed on a report that says full),
+    the float going empty, and a tick. Returns the tap's ts as it stands."""
+    age(db, FLAP_WINDOW_S + 1)
+    since = tap(client, db)
+    while ml:
+        part = min(ml, MAX_DOSE_ML)
+        dose(client, part, flow=part)
+        ml -= part
+    report(client, "c=0 ch0=1 float=0")
+    tick(app)
+    return since
+
+
+def test_every_sample_is_announced_once(app, client, db, sent):
+    report(client, "c=0 ch0=1 float=1")
+    first = tap(client, db)
+    dose(client, 200, flow=190)
+    report(client, "c=0 ch0=1 float=0")
+    tick(app)
+    tick(app)
+    assert keys(sent) == [f"tank:0:{first}"]  # once
+    (alert,) = sent
+    assert (alert.priority, alert.tags) == ("default", "droplet")
+    assert alert.message == (
+        f"board 0 ran its tank down: 190 ml since the refill at "
+        f"{butler.hhmm(first)} (tank size learning, 1 of 2)"
+    )
+    # With one sample behind it there is no size to drift from, however
+    # far off the second lands: it is announced, and the two make a size.
+    second = run_the_tank_down(app, client, db, 400)
+    assert keys(sent) == [f"tank:0:{first}", f"tank:0:{second}"]
+    assert sent[-1].tags == "droplet"
+    assert sent[-1].message == (
+        f"board 0 ran its tank down: 400 ml since the refill at "
+        f"{butler.hhmm(second)} (tank 295 ml over 2 samples)"
+    )
+    # Marked like a dose judgement: a row that is never cleared.
+    assert run_sql(
+        db, "SELECT cleared_ts FROM alerts WHERE key LIKE 'tank:%' ORDER BY key"
+    ) == [(None,), (None,)]
+    # A tap, nothing pumped, the float going empty: no sample, no page.
+    age(db, FLAP_WINDOW_S + 1)
+    report(client, "c=0 ch0=1 float=1")
+    tap(client, db)
+    report(client, "c=0 ch0=1 float=0")
+    tick(app)
+    assert len(sent) == 2
+
+
+def test_a_sample_off_the_size_it_knew_is_a_warning(app, client, db, sent):
+    report(client, "c=0 ch0=1 float=1")
+    run_the_tank_down(app, client, db, 200)
+    run_the_tank_down(app, client, db, 200)
+    since = run_the_tank_down(app, client, db, 250)  # 200 + 25 %: at the line
+    assert sent[-1].tags == "droplet"
+    assert sent[-1].message == (
+        f"board 0 ran its tank down: 250 ml since the refill at "
+        f"{butler.hhmm(since)} (tank 200 ml over 3 samples)"
+    )
+    run_the_tank_down(app, client, db, 251)  # past it, against the earlier three
+    assert (sent[-1].priority, sent[-1].tags) == ("default", "warning")
+    assert sent[-1].message == (
+        "board 0's tank measured 251 ml this run, not the 200 ml it knew: a "
+        "different tank, a clogging meter, or a tap that was not a fill"
+    )
+    run_the_tank_down(app, client, db, 100)  # short of it: the same warning
+    assert sent[-1].tags == "warning"
+    assert sent[-1].message.startswith(
+        "board 0's tank measured 100 ml this run, not the 225 ml it knew"
+    )
+    assert health(client)["tank_samples"] == 5  # a warning is still a sample
+    assert len(keys(sent)) == 5
+
+
+def test_the_announcements_never_reach_the_app_or_the_up_count(
+    app, client, db, sent
+):
+    report(client, "c=0 ch0=1 float=1")
+    run_the_tank_down(app, client, db, 200)
+    assert len(keys(sent)) == 1
+    assert client.get("/health").json()["alerts"] == []
+    # The probe's tick is ten minutes on, when the board would be silent;
+    # retired, it is quiet, and its announcement is the one row standing.
+    assert post(client, "/controller", "c=0 retired=1").status_code == 200
+    assert run_sql(
+        db, "SELECT cleared_ts FROM alerts WHERE key LIKE 'tank:%'"
+    ) == [(None,)]
+    tick(app, int(time.time()) + UP_AFTER_S + 1)
+    probe = sent[-1]
+    assert probe.key is None
+    assert probe.message == "the butler is up; 0 condition(s) raised"
+
+
+def test_a_retired_boards_sample_waits_for_it(app, client, db, sent):
+    report(client, "c=0 ch0=1 float=1")
+    since = tap(client, db)
+    dose(client, 200, flow=200)
+    report(client, "c=0 ch0=1 float=0")
+    assert post(client, "/controller", "c=0 retired=1").status_code == 200
+    tick(app)
+    assert keys(sent) == []
+    # Skipped, not forgotten: back in service, the run is announced.
+    assert post(client, "/controller", "c=0 retired=0").status_code == 200
+    tick(app)
+    assert keys(sent) == [f"tank:0:{since}"]

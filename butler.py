@@ -52,8 +52,10 @@ sensor's channel gone missing, reservoir empty, manifold position lost, a
 safety field that vanished after the board had been sending it, a dose
 that was never acked or came up short on the meter or did not raise
 moisture, a learning proposal waiting, a board that stopped itself and
-waits for a human to resume it, a float that never moved across a
-refill — posts the transitions to a public ntfy.sh topic
+waits for a human to resume it, a float presumed stuck (still saying full
+after more than the tank holds went out since the last refill, or still
+saying empty minutes after one), and each time the float closes a
+measurement of the tank — posts the transitions to a public ntfy.sh topic
 (BUTLER_NTFY_TOPIC; the topic name is the secret), and only
 after a fully clean pass GETs BUTLER_DEADMAN_URL. A pass with nothing to
 send must first prove ntfy reachable, so the butler dying and the butler
@@ -94,7 +96,7 @@ from starlette.requests import ClientDisconnect
 # metadata because the container installs no package — it copies butler.py
 # beside fastapi and runs it. A test asserts this and pyproject.toml agree,
 # which is the only thing that keeps the two honest.
-VERSION = "0.18.0"
+VERSION = "0.19.0"
 
 BODY_CAP = 4096  # a full 15-channel report is ~200 bytes; 4 KB is generous
 # Photographs are the first thing here that is not small. The phone caps the
@@ -849,23 +851,38 @@ def pumped_since(con: sqlite3.Connection, controller: int, since_ts: int) -> int
     return total
 
 
-def tank_ml(con: sqlite3.Connection, controller: int) -> int | None:
-    """The tank's size: the median of the last TANK_MEDIAN_OF samples,
-    None until TANK_SAMPLES_TO_ARM exist. A median, not a mean, so one
-    tap that was not a fill moves the number little; of two, their mean,
-    which is fine (spec D5)."""
-    last = sorted(
-        ml
-        for (ml,) in con.execute(
-            "SELECT ml FROM tank_samples WHERE controller = ? "
-            "ORDER BY ts DESC, rowid DESC LIMIT ?",
-            (controller, TANK_MEDIAN_OF),
-        )
-    )
+def tank_median(samples: list[int]) -> int | None:
+    """The size a run of samples says, oldest last: the median of the last
+    TANK_MEDIAN_OF, None until TANK_SAMPLES_TO_ARM. A median, not a mean,
+    so one tap that was not a fill moves the number little; of two, their
+    mean, which is fine (spec D5)."""
+    last = sorted(samples[-TANK_MEDIAN_OF:])
     if len(last) < TANK_SAMPLES_TO_ARM:
         return None
     mid = len(last) // 2
     return last[mid] if len(last) % 2 else (last[mid - 1] + last[mid]) // 2
+
+
+def tank_history(
+    con: sqlite3.Connection, controller: int, upto: tuple[int, int] | None = None
+) -> list[int]:
+    """This board's samples, oldest first; `upto`, a sample's (ts, rowid),
+    stops at that one, included: what the tank knew as it closed."""
+    ts, rowid = upto if upto is not None else (None, None)
+    return [
+        ml
+        for (ml,) in con.execute(
+            "SELECT ml FROM tank_samples WHERE controller = ? "
+            "AND (? IS NULL OR ts < ? OR (ts = ? AND rowid <= ?)) "
+            "ORDER BY ts, rowid",
+            (controller, ts, ts, ts, rowid),
+        )
+    ]
+
+
+def tank_ml(con: sqlite3.Connection, controller: int) -> int | None:
+    """The tank's size as it stands (spec D5)."""
+    return tank_median(tank_history(con, controller))
 
 
 def is_over(tank: int | None, pumped: int, float_ok: int | None) -> bool:
@@ -3028,7 +3045,7 @@ def create_app(
         pots_now (see the sensor rule), so once the pot is gone or buried
         neither branch can ever run again: the row would sit in /health for
         ever and keep inflating the daily up-probe count, which excludes
-        dose:, dosefail:, proposal: and meta: but not sensor:.
+        dose:, dosefail:, tank:, proposal: and meta: but not sensor:.
         `proposal:<c>:<outlet>` is the same shape and cheap to take with it,
         and without it the next pot on that hose inherits up to a day of
         nudge silence.
@@ -3800,6 +3817,56 @@ def create_app(
                     )
                 )
 
+        # Every sample the float closes is announced once, keyed on its tap
+        # and marked like a dose judgement: a one-shot, never cleared, so
+        # /health and the up-probe leave `tank:` out as they leave `dose:`.
+        # Against the size the tank knew before it — the median of the
+        # earlier last few, once there are enough of them — a sample off
+        # by more than TANK_DRIFT_PCT is a warning rather than news: the
+        # tank was swapped, the meter is clogging, or the tap was not a
+        # fill. A retired board's waits, like its doses.
+        for controller, ts, rowid, refill_ts, ml in con.execute(
+            "SELECT controller, ts, rowid, refill_ts, ml FROM tank_samples "
+            "WHERE NOT EXISTS (SELECT 1 FROM alerts WHERE key = "
+            "'tank:' || tank_samples.controller || ':' || tank_samples.refill_ts) "
+            "ORDER BY controller, ts, rowid"
+        ).fetchall():
+            if controller in retired:
+                continue
+            key = f"tank:{controller}:{refill_ts}"
+            history = tank_history(con, controller, (ts, rowid))
+            known = tank_median(history[:-1])
+            if known is not None and abs(ml - known) > known * TANK_DRIFT_PCT // 100:
+                found.append(
+                    Alert(
+                        key,
+                        "default",
+                        "warning",
+                        f"board {controller}'s tank measured {ml} ml this run, "
+                        f"not the {known} ml it knew: a different tank, a "
+                        "clogging meter, or a tap that was not a fill",
+                        mark(key),
+                    )
+                )
+                continue
+            size = tank_median(history)
+            found.append(
+                Alert(
+                    key,
+                    "default",
+                    "droplet",
+                    f"board {controller} ran its tank down: {ml} ml since the "
+                    f"refill at {hhmm(refill_ts)} "
+                    + (
+                        f"(tank {size} ml over {len(history)} samples)"
+                        if size is not None
+                        else f"(tank size learning, {len(history)} of "
+                        f"{TANK_SAMPLES_TO_ARM})"
+                    ),
+                    mark(key),
+                )
+            )
+
         # Every dose the board was handed gets judged exactly once: never
         # acked (judged immediately — the loss is proven the moment the next
         # report failed to ack), short on the meter, or no moisture rise
@@ -4057,6 +4124,7 @@ def create_app(
                 (raised_count,) = con.execute(
                     "SELECT COUNT(*) FROM alerts WHERE cleared_ts IS NULL "
                     "AND key NOT LIKE 'dose:%' AND key NOT LIKE 'dosefail:%' "
+                    "AND key NOT LIKE 'tank:%' "
                     "AND key NOT LIKE 'proposal:%' AND key NOT LIKE 'meta:%'"
                 ).fetchone()
                 last_probe = con.execute(
@@ -4857,6 +4925,7 @@ def create_app(
                         "SELECT key, raised_ts FROM alerts "
                         "WHERE cleared_ts IS NULL AND key NOT LIKE 'dose:%' "
                         "AND key NOT LIKE 'dosefail:%' "
+                        "AND key NOT LIKE 'tank:%' "
                         "AND key NOT LIKE 'proposal:%' "
                         "AND key NOT LIKE 'meta:%' ORDER BY key"
                     )

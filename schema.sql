@@ -214,8 +214,10 @@ CREATE TABLE IF NOT EXISTS status (
 );
 
 -- A refill is a human event (pitch "Trust the tank"): the app says so, the
--- board cannot. The stuck-float rule reads the latest one per controller
--- against ch204, every tick, hence the index.
+-- board cannot, and the tap means "full to the top". Everything the tank
+-- knows counts from the latest one per controller — the water pumped
+-- since, the sample the float closes, both stuck-float rules — read on
+-- every report and every tick, hence the index.
 CREATE TABLE IF NOT EXISTS refills (
   ts         INTEGER NOT NULL,  -- server time when the human said so
   controller INTEGER NOT NULL,
@@ -246,7 +248,9 @@ CREATE TABLE IF NOT EXISTS alerts (
                                 -- pos:<c> | fields:<kind>:<c> | dose:<id> |
                                 -- dosefail:<c> | proposal:<c>:<outlet> |
                                 -- latch:<c> (the board stopped itself) |
-                                -- stale:<c> (float never moved across a refill), plus
+                                -- over:<c> (pumped past the tank, float still full) |
+                                -- stale:<c> (float still empty after a refill) |
+                                -- tank:<c>:<refill_ts> (a sample announced, once), plus
                                 -- meta:tick / meta:up bookkeeping rows
   raised_ts  INTEGER NOT NULL,
   cleared_ts INTEGER,           -- NULL while the condition stands

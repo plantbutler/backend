@@ -565,6 +565,16 @@ def age(db, seconds):
             "float_bad = float_bad - ?, float_bad_prev = float_bad_prev - ?",
             (seconds, seconds, seconds),
         )
+        # The page a sample earned is keyed on its tap, so it moves with it:
+        # left behind, the sample would look unannounced and page again.
+        for (key,) in con.execute(
+            "SELECT key FROM alerts WHERE key LIKE 'tank:%'"
+        ).fetchall():
+            head, refill_ts = key.rsplit(":", 1)
+            con.execute(
+                "UPDATE alerts SET key = ? WHERE key = ?",
+                (f"{head}:{int(refill_ts) - seconds}", key),
+            )
 
 
 def tap(client, db):
@@ -586,9 +596,11 @@ def dose(client, ml, float_ok=1):
     report(client, f"c=0 ch0=1 float={float_ok} pos=ok ack={cmd_id} flow_ml={ml}")
 
 
-def learn_the_tank(client, db, size):
+def learn_the_tank(app, client, db, sent, size):
     """Two runs of `size` ml, each ended by the float and a flap window
-    apart: the tank is known. Returns the line `over` starts past."""
+    apart: the tank is known, and its two announcements are ticked away
+    (they are test_tank_size's subject). Returns the line `over` starts
+    past."""
     report(client, "c=0 ch0=1 float=1 pos=ok")
     for _ in range(TANK_SAMPLES_TO_ARM):
         tap(client, db)
@@ -596,6 +608,9 @@ def learn_the_tank(client, db, size):
         age(db, FLAP_WINDOW_S + 1)
         report(client, "c=0 ch0=1 float=1 pos=ok")
     assert health(client)["tank_ml"] == size
+    tick(app)
+    assert [k.split(":")[0] for k in keys(sent)] == ["tank"] * TANK_SAMPLES_TO_ARM
+    sent.clear()
     return size * (100 + TANK_TOLERANCE_PCT) // 100
 
 
@@ -621,7 +636,7 @@ def test_a_refill_is_recorded_and_shown(client, db):
 def test_over_fires_past_the_tolerance_and_only_while_the_float_says_full(
     app, client, db, sent
 ):
-    assert learn_the_tank(client, db, 200) == 220
+    assert learn_the_tank(app, client, db, sent, 200) == 220
     since = tap(client, db)
     dose(client, 100)
     dose(client, 120)  # 220: at the line, not past it
@@ -645,21 +660,21 @@ def test_over_fires_past_the_tolerance_and_only_while_the_float_says_full(
 def test_a_float_that_goes_empty_past_the_size_is_a_float_that_works(
     app, client, db, sent
 ):
-    learn_the_tank(client, db, 200)
-    tap(client, db)
+    learn_the_tank(app, client, db, sent, 200)
+    since = tap(client, db)
     dose(client, 150)
     dose(client, 71, float_ok=0)  # 221, and the float said so
     assert health(client)["over"] == 0
     tick(app)
-    assert keys(sent) == []
-    assert health(client)["tank_samples"] == 3  # a longer run, learned
+    assert keys(sent) == [f"tank:0:{since}"]  # a longer run, learned and told
+    assert health(client)["tank_samples"] == 3
 
 
 def test_over_holds_the_rules_not_the_phone_and_the_tap_is_the_clear(
     app, client, db, sent
 ):
     make_pot(client, cooldown_h=0, daily_cap_ml=100_000)
-    learn_the_tank(client, db, 200)
+    learn_the_tank(app, client, db, sent, 200)
     tap(client, db)
     dose(client, 250)
     tick(app)
@@ -682,7 +697,7 @@ def test_over_holds_the_rules_not_the_phone_and_the_tap_is_the_clear(
 
 
 def test_over_pages_once_per_floor(app, client, db, sent):
-    learn_the_tank(client, db, 200)
+    learn_the_tank(app, client, db, sent, 200)
     tap(client, db)
     dose(client, 250)
     tick(app)
@@ -703,7 +718,7 @@ def test_over_pages_once_per_floor(app, client, db, sent):
 
 
 def test_a_top_up_tapped_daily_never_fires(app, client, db, sent):
-    learn_the_tank(client, db, 200)
+    learn_the_tank(app, client, db, sent, 200)
     for _ in range(4):
         tap(client, db)
         dose(client, 150)  # the day's water, under the size...
@@ -713,7 +728,7 @@ def test_a_top_up_tapped_daily_never_fires(app, client, db, sent):
 
 
 def test_retiring_a_board_clears_its_over_page(app, client, db, sent):
-    learn_the_tank(client, db, 200)
+    learn_the_tank(app, client, db, sent, 200)
     tap(client, db)
     dose(client, 250)
     tick(app)
@@ -751,7 +766,7 @@ def test_a_tank_still_learning_is_never_over(app, client, db, sent):
     assert entry["tank_samples"] == 1 and entry["tank_ml"] is None
     assert entry["pumped_ml"] == 500 and entry["over"] == 0
     tick(app)
-    assert keys(sent) == []
+    assert [k.split(":")[0] for k in keys(sent)] == ["tank"]  # the sample, no over
 
 
 def test_a_float_still_empty_its_minutes_after_the_tap_pages(app, client, db, sent):
