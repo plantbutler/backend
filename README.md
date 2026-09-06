@@ -78,7 +78,8 @@ curl -s -X POST http://localhost:8000/controller \
 # -> controller=0 retired=1   (reports still land; nothing pages or waters it; retired=0 undoes)
 curl -s -X POST http://localhost:8000/refill \
   -H 'X-Token: dev' --data-binary 'c=0'
-# -> refill=1757000000        (when you refilled the tank; the float now has three minutes to move)
+# -> refill=1757000000        (you filled the tank to the top: the count restarts here, and a
+#                              float still saying empty in a report three minutes on is paged)
 curl -s -X POST http://localhost:8000/resume \
   -H 'X-Token: dev' --data-binary 'c=0'
 # -> resumed=0                (lifts the backend's latch; type `clear contra` on the board too)
@@ -256,13 +257,19 @@ stopped itself — `ch207=1`, the float said full and the meter saw nothing, or 
 change counts) — which latches the butler too: no rule waters it and `POST /command` refuses a
 dose until `POST /resume`, and that one pages high every time, floor or no floor; a float
 presumed stuck — still saying full after more than the tank holds (plus a tenth) has been pumped
-since the refill you recorded, so the rules will not water that board until you tap "refilled"
-again (a dose typed at the phone still goes: the board's own float check runs), or still saying
-empty three minutes after a tap made with it empty, a page and nothing more, since the rules are
-dry on empty already; and each time the float closes a measurement of the tank — what the meter
-counted between your tap and the float going empty, the tank's size being the median of the last
-five such runs (known after two), and a run more than a quarter off what it knew is a warning: a
-different tank, a clogging meter, or a tap that was not a fill. A
+since the refill you recorded, or since the float last rose if that came later (a tank refilled
+by someone who forgot to tap restarts the count: the float demonstrably moved), so the rules will
+not water that board, and only your next tap "refilled" clears the page — not the float dropping,
+which is a flap or a contra as often as an empty tank (a dose typed at the phone still goes: the
+board's own float check runs); or still saying empty in a report three minutes or more after a
+tap made with it empty — a stuck float, or the board's own float check tripped, which a dose from
+the phone resets — a page and nothing more, since the rules are dry on empty already; neither
+while the board's latch stands; and each time the float closes a measurement of the tank — what
+the meter counted between your tap and the float going empty, on a board neither latched nor
+retired and whose float has not risen since the tap (a refill nobody said was full measures
+nothing), the tank's size being the median of the last five such runs (known after two), and a
+run more than a quarter off what it knew is a warning: a different tank, a clogging meter, or a
+tap that was not a fill. A
 cleared condition re-raises at most hourly and correlated dose failures page once per controller
 per hour — a muted phone is worse than a late alert — and a dose that worked is recorded
 silently: this tells you when it's *wrong*.
