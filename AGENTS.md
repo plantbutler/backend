@@ -220,9 +220,9 @@ watering.
   does not exist refused without writing anything; 0.15.0 on 2026-09-04 turns `plant_type` into a
   closed set of six kinds, replaces the two free-text sizes with `pot_diameter_cm` and
   `plant_height_cm` and reads them as a water buffer and the demand on it, and answers `kind` from
-  GBIF's family so the dropdown opens pre-selected; 0.18.0 on 2026-09-05 with the tank): container
+  GBIF's family so the dropdown opens pre-selected; 0.18.0 with the tank on 2026-09-06, verified live: a fake board latched it through `ch207=1`, water was refused with the words to act on, `stop` passed, `/resume` cleared it, and retiring the fake board silenced it): container
   `plantbutler`
-  on the NAS, port 9380, image `plantbutler-backend:0.15.0` shipped via `docker save | ssh docker load` over the tailnet, database on `/volume1/docker/plantbutler/data`, secrets in `deploy.env` beside it
+  on the NAS, port 9380, image `plantbutler-backend:0.18.0`, built on the NAS from the three files (`Dockerfile`, `butler.py`, `schema.sql`) copied over ssh into `/volume1/docker/plantbutler/build` (the NAS has no sftp, so `cat >` over ssh, not scp), database on `/volume1/docker/plantbutler/data`, secrets in `deploy.env` beside it
   (600, not in git: the token, the ntfy topic, the healthchecks.io ping URL, the Trefle token),
   `-e TZ=Europe/Zurich` so BUTLER_QUIET means local night. Photographs share that volume —
   `/data/photos`, one directory per pot — so they are backed up or lost with the database rather
