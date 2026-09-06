@@ -864,20 +864,25 @@ def tank_median(samples: list[int]) -> int | None:
 
 
 def tank_history(
-    con: sqlite3.Connection, controller: int, upto: tuple[int, int] | None = None
+    con: sqlite3.Connection,
+    controller: int,
+    upto: tuple[int, int] | None = None,
+    n: int = TANK_MEDIAN_OF,
 ) -> list[int]:
-    """This board's samples, oldest first; `upto`, a sample's (ts, rowid),
-    stops at that one, included: what the tank knew as it closed."""
+    """The last `n` of this board's samples, oldest first; `upto`, a
+    sample's (ts, rowid), ends the run at that one, included: what the
+    tank knew as it closed. Bounded in SQLite, walking the index back
+    from the newest, not in Python after the fetch: every report, tick
+    and /health reads this, and what a board has closed in its life must
+    not be their cost."""
     ts, rowid = upto if upto is not None else (None, None)
-    return [
-        ml
-        for (ml,) in con.execute(
-            "SELECT ml FROM tank_samples WHERE controller = ? "
-            "AND (? IS NULL OR ts < ? OR (ts = ? AND rowid <= ?)) "
-            "ORDER BY ts, rowid",
-            (controller, ts, ts, ts, rowid),
-        )
-    ]
+    rows = con.execute(
+        "SELECT ml FROM tank_samples WHERE controller = ? "
+        "AND (? IS NULL OR ts < ? OR (ts = ? AND rowid <= ?)) "
+        "ORDER BY ts DESC, rowid DESC LIMIT ?",
+        (controller, ts, ts, ts, rowid, n),
+    ).fetchall()
+    return [ml for (ml,) in reversed(rows)]
 
 
 def tank_ml(con: sqlite3.Connection, controller: int) -> int | None:
@@ -3845,7 +3850,10 @@ def create_app(
             if controller in retired:
                 continue
             key = f"tank:{controller}:{refill_ts}"
-            history = tank_history(con, controller, (ts, rowid))
+            # The sample and the five before it: the size it is judged
+            # against is the median of those five, the size it joins the
+            # median of the five ending at it.
+            history = tank_history(con, controller, (ts, rowid), TANK_MEDIAN_OF + 1)
             known = tank_median(history[:-1])
             if known is not None and abs(ml - known) > known * TANK_DRIFT_PCT // 100:
                 found.append(

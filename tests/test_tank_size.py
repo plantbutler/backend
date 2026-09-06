@@ -341,6 +341,81 @@ def test_tank_ml_is_the_median_of_the_last_five_and_none_under_two(db, app):
         assert size() == 4400 and size(1) == 1
 
 
+def test_tank_history_is_the_last_few_up_to_a_sample(db, app):
+    """Five by default, oldest first, and up to a sample when one is
+    named: two closed at the same second are told apart by rowid, so the
+    later one is not in the run of the earlier."""
+    with sqlite3.connect(db) as con:
+        history = butler.tank_history
+
+        def sample(ts, ml, controller=0):
+            cur = con.execute(
+                "INSERT INTO tank_samples (ts, controller, refill_ts, ml) "
+                "VALUES (?, ?, ?, ?)",
+                (ts, controller, ml, ml),
+            )
+            return (ts, cur.lastrowid)
+
+        assert history(con, 0) == []
+        at = {ml: sample(ml // 100, ml) for ml in range(100, 800, 100)}
+        sample(7, 750)  # the same second as 700, a later row
+        sample(4, 9, controller=1)
+        assert history(con, 0) == [400, 500, 600, 700, 750]
+        assert history(con, 0, at[600]) == [200, 300, 400, 500, 600]
+        assert history(con, 0, at[600], TANK_MEDIAN_OF + 1) == [
+            100, 200, 300, 400, 500, 600
+        ]
+        assert history(con, 0, at[700]) == [300, 400, 500, 600, 700]
+        assert history(con, 1) == [9]
+
+
+def test_tank_history_costs_the_same_however_many_runs_a_board_has_closed(db, app):
+    """Read on every report, tick and /health, so the fetch is bounded in
+    SQLite, not in Python after it: walking the index back from the newest
+    takes the same steps over six hundred samples as over six. SQLite's
+    own step counter says so, without a clock."""
+    with sqlite3.connect(db) as con:
+
+        def steps(fetch):
+            fetch()  # warm: a statement's first run pays for its plan
+            n = 0
+
+            def count():
+                nonlocal n
+                n += 1
+                return 0
+
+            con.set_progress_handler(count, 1)
+            try:
+                fetch()
+            finally:
+                con.set_progress_handler(None, 0)
+            return n
+
+        def fill(total):
+            con.execute("DELETE FROM tank_samples")
+            con.executemany(
+                "INSERT INTO tank_samples (ts, controller, refill_ts, ml) "
+                "VALUES (?, 0, ?, 100)",
+                [(t, t) for t in range(1, total + 1)],
+            )
+            (newest,) = con.execute(
+                "SELECT rowid FROM tank_samples ORDER BY ts DESC, rowid DESC"
+            ).fetchone()
+            return (
+                steps(lambda: butler.tank_ml(con, 0)),
+                steps(
+                    lambda: butler.tank_history(
+                        con, 0, (total, newest), TANK_MEDIAN_OF + 1
+                    )
+                ),
+            )
+
+        few, many = fill(6), fill(600)
+        assert many[0] <= few[0], (few, many)  # the size
+        assert many[1] <= few[1], (few, many)  # a sample's judgement
+
+
 # --------------------------------------------------------------------------- #
 # What the app sees (spec D9, the read-only fields)
 # --------------------------------------------------------------------------- #
@@ -511,6 +586,23 @@ def test_the_count_is_the_samples_the_size_rests_on(app, client, db, sent):
     assert sent[-1].message == (
         f"board 0 ran its tank down: 200 ml since the refill at "
         f"{butler.hhmm(since)} (tank 200 ml over 5 samples)"
+    )
+
+
+def test_a_sample_is_judged_against_the_five_before_it(app, client, db, sent):
+    """The size a sample is held to is the median of the five that came
+    before it, not of the four: a run that fetched only the window ending
+    at the sample would judge it against a different number."""
+    report(client, "c=0 ch0=1 float=1")
+    for ml in (1000, 1000, 1000, 200, 200):
+        run_the_tank_down(app, client, db, ml)
+    # Of the five before: 1000. Of the four before: 600, and 1000 would
+    # be a warning against that.
+    since = run_the_tank_down(app, client, db, 1000)
+    assert sent[-1].tags == "droplet"
+    assert sent[-1].message == (
+        f"board 0 ran its tank down: 1000 ml since the refill at "
+        f"{butler.hhmm(since)} (tank 1000 ml over 5 samples)"
     )
 
 
