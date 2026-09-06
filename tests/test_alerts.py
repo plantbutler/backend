@@ -836,6 +836,32 @@ def test_health_shows_safety_fields_and_raised_conditions(app, client, db, sent)
     assert client.get("/health").json()["alerts"] == []
 
 
+def test_a_raised_condition_is_none_of_the_one_shots(app, client, db, sent):
+    """A dose judgement, a hose's failure floor, a tank announcement, a
+    proposal nudge and the ticker's own rows are recorded and never
+    cleared. /health's raised list and the up-probe's count read one
+    clause for what stands raised, and none of those is in it."""
+    now = int(time.time())
+    with sqlite3.connect(db) as con:
+        for key in (
+            "dose:7",
+            "dosefail:0",
+            "tank:0:5",
+            "proposal:0:3",
+            "meta:tick",
+            "sensor:0:0",
+        ):
+            con.execute(
+                "INSERT INTO alerts (key, raised_ts) VALUES (?, ?)", (key, now)
+            )
+    assert [a["key"] for a in client.get("/health").json()["alerts"]] == [
+        "sensor:0:0"
+    ]
+    tick(app, now + UP_AFTER_S + 1)
+    assert [a.key for a in sent] == [None]
+    assert sent[0].message == "the butler is up; 1 condition(s) raised"
+
+
 # --------------------------------------------------------------------------- #
 # The wire itself, against a real local server
 # --------------------------------------------------------------------------- #

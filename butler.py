@@ -1058,6 +1058,17 @@ def live_sql(col: str = "status") -> str:
     """The same allow-list as a SQL predicate. One source, so a fourth
     status cannot be admitted by one reader and refused by another."""
     return f"{col} IN (" + ", ".join(f"'{s}'" for s in LIVE_STATUSES) + ")"
+
+
+# The key families that are recorded and never cleared: a dose judgement,
+# a hose's failure floor, a tank announcement, a proposal nudge and the
+# ticker's own rows. What stands raised, to /health's list and to the
+# up-probe's count, is a condition with none of these among it — one
+# predicate, so the list cannot show what the count leaves out.
+ONE_SHOT_KEYS = ("dose:", "dosefail:", "tank:", "proposal:", "meta:")
+RAISED_SQL = "cleared_ts IS NULL" + "".join(
+    f" AND key NOT LIKE '{family}%'" for family in ONE_SHOT_KEYS
+)
 LAST_DOSE_KEYS = (
     "id",
     "ml",
@@ -3044,8 +3055,8 @@ def create_app(
         without this. Both its raise AND its clear live inside a loop over
         pots_now (see the sensor rule), so once the pot is gone or buried
         neither branch can ever run again: the row would sit in /health for
-        ever and keep inflating the daily up-probe count, which excludes
-        dose:, dosefail:, tank:, proposal: and meta: but not sensor:.
+        ever and keep inflating the daily up-probe count, which leaves out
+        ONE_SHOT_KEYS but not sensor:.
         `proposal:<c>:<outlet>` is the same shape and cheap to take with it,
         and without it the next pot on that hose inherits up to a day of
         nudge silence.
@@ -4127,10 +4138,7 @@ def create_app(
             # silent.
             with connect() as con:
                 (raised_count,) = con.execute(
-                    "SELECT COUNT(*) FROM alerts WHERE cleared_ts IS NULL "
-                    "AND key NOT LIKE 'dose:%' AND key NOT LIKE 'dosefail:%' "
-                    "AND key NOT LIKE 'tank:%' "
-                    "AND key NOT LIKE 'proposal:%' AND key NOT LIKE 'meta:%'"
+                    f"SELECT COUNT(*) FROM alerts WHERE {RAISED_SQL}"
                 ).fetchone()
                 last_probe = con.execute(
                     "SELECT raised_ts FROM alerts WHERE key = 'meta:up'"
@@ -4928,11 +4936,7 @@ def create_app(
                     {"key": key, "raised_ts": ts}
                     for key, ts in con.execute(
                         "SELECT key, raised_ts FROM alerts "
-                        "WHERE cleared_ts IS NULL AND key NOT LIKE 'dose:%' "
-                        "AND key NOT LIKE 'dosefail:%' "
-                        "AND key NOT LIKE 'tank:%' "
-                        "AND key NOT LIKE 'proposal:%' "
-                        "AND key NOT LIKE 'meta:%' ORDER BY key"
+                        f"WHERE {RAISED_SQL} ORDER BY key"
                     )
                 ]
                 for cmd_id, controller, kind, state in con.execute(
