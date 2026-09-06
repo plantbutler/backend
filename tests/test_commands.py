@@ -213,6 +213,12 @@ def test_health_lists_a_configured_but_never_seen_controller(client, db):
         "command": None,
         "float": None,
         "pos": None,
+        "err": None,
+        "err_ts": None,
+        "pos_ok_seen": None,
+        "retired": 0,
+        "latched": None,
+        "last_refill": None,
     }
 
 
@@ -227,9 +233,9 @@ def test_a_dose_without_a_cap_gets_the_rules_own_cap(client, db):
     handed = report(client, "c=0 ch0=1").text
     assert "cmd=1 water=3 ml=50 cap_s=7" in handed  # 50 // 20 + 5
     report(client, "c=0 ch0=1 ack=1 flow_ml=50")
-    command(client, "c=0 water=3 ml=1000")
+    command(client, "c=0 water=3 ml=250")
     handed = report(client, "c=0 ch0=1").text
-    assert "cmd=2 water=3 ml=1000 cap_s=55" in handed  # 1000 // 20 + 5, under MAX_CAP_S
+    assert "cmd=2 water=3 ml=250 cap_s=17" in handed  # 250 // 20 + 5, under MAX_CAP_S
 
 
 @pytest.mark.parametrize(
@@ -320,6 +326,6 @@ def test_parse_command_shapes():
 
 def test_cap_for_stays_under_the_firmware_cap_after_a_retune(monkeypatch):
     assert cap_for(1) == 5  # the slack alone
-    assert cap_for(butler.MAX_DOSE_ML) == 55  # under MAX_CAP_S at today's flow floor
-    monkeypatch.setattr(butler, "FLOW_FLOOR_ML_S", 10)  # a bench retune
+    assert cap_for(butler.MAX_DOSE_ML) == 17  # under MAX_CAP_S at today's flow floor
+    monkeypatch.setattr(butler, "FLOW_FLOOR_ML_S", 1)  # a bench retune
     assert cap_for(butler.MAX_DOSE_ML) == butler.MAX_CAP_S

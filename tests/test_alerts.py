@@ -379,6 +379,7 @@ def test_a_full_reservoir_clears_after_a_quiet_window_and_reflaps_floor(
 
 
 def test_a_lost_manifold_position_raises_and_clears(app, client, db, sent):
+    report(client)  # homed once: pos: pages only for a board that ever said pos=ok
     report(client, safe=False, extra="float=1 pos=unknown")
     report(client, safe=False, extra="float=1 pos=unknown")
     tick(app, int(time.time()))
@@ -819,6 +820,7 @@ def test_a_malformed_silent_threshold_refuses_with_its_name(db, monkeypatch):
 
 
 def test_health_shows_safety_fields_and_raised_conditions(app, client, db, sent):
+    report(client)  # homed once: pos: pages only for a board that ever said pos=ok
     report(client, safe=False, extra="float=0 pos=unknown")
     report(client, safe=False, extra="float=0 pos=unknown")
     tick(app, int(time.time()))

@@ -63,7 +63,8 @@ image. Keeping a photograph writes the file first and the row second; deleting o
 first and the file second. Whichever way a crash or a half-restored backup lands, what is left over
 is the harmless direction.
 
-Queue a command for the board's next report, or change its report interval:
+Queue a command for the board's next report, change its report interval, retire it, say you
+refilled its tank, or resume it after it stopped itself:
 
 ```bash
 curl -s -X POST http://localhost:8000/command \
@@ -72,6 +73,15 @@ curl -s -X POST http://localhost:8000/command \
 #                  leave cap_s out and the rules' own formula sizes it)
 curl -s -X POST http://localhost:8000/interval \
   -H 'X-Token: dev' --data-binary 'c=0 next=120'
+curl -s -X POST http://localhost:8000/controller \
+  -H 'X-Token: dev' --data-binary 'c=0 retired=1'
+# -> controller=0 retired=1   (reports still land; nothing pages or waters it; retired=0 undoes)
+curl -s -X POST http://localhost:8000/refill \
+  -H 'X-Token: dev' --data-binary 'c=0'
+# -> refill=1757000000        (when you refilled the tank; the float now has three minutes to move)
+curl -s -X POST http://localhost:8000/resume \
+  -H 'X-Token: dev' --data-binary 'c=0'
+# -> resumed=0                (lifts the backend's latch; type `clear contra` on the board too)
 ```
 
 Tell it what hangs where. A bare `name=` creates a pot and mints its id; the answer carries
@@ -240,10 +250,18 @@ mapped sensor's channel gone missing while its controller stays healthy; `float=
 empty) or `pos=unknown` (manifold lost) seen twice inside ten minutes — one blip is slosh, a flap
 is an empty tank; a safety field that vanished after the board had been sending it; a dose that
 was never acked (immediately), came up short on the meter, or did not raise moisture a soak
-later; a learning proposal waiting for approval (one nudge per hose per day). A cleared
-condition re-raises at most hourly and correlated dose failures page once per controller per
-hour — a muted phone is worse than a late alert — and a dose that worked is recorded silently:
-this tells you when it's *wrong*.
+later; a learning proposal waiting for approval (one nudge per hose per day); a board that
+stopped itself — `ch207=1`, the float said full and the meter saw nothing, or `err=` turning to
+`resetmid`, it reset with the pump running (`err=` is the board's sticky last error, so only the
+change counts) — which latches the butler too: no rule waters it and `POST /command` refuses a
+dose until `POST /resume`, and that one pages high every time, floor or no floor; a float that
+never moved across a refill — the board's `ch204` says it last moved more than ten minutes before
+the refill you recorded (you pour first and tap second), and the three minutes are up — presumed
+stuck, so the rules will not water that board until it moves, and tapping "refilled" again does
+not count as moving (a dose typed at the phone still goes: the board's own float check runs). A
+cleared condition re-raises at most hourly and correlated dose failures page once per controller
+per hour — a muted phone is worse than a late alert — and a dose that worked is recorded
+silently: this tells you when it's *wrong*.
 
 Set `BUTLER_DEADMAN_URL` (a healthchecks.io ping URL, say) and every clean pass GETs it — a
 pass with nothing to send first proves ntfy reachable — so the butler dying and the butler

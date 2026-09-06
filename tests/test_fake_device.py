@@ -25,3 +25,11 @@ def test_it_understands_stop_and_silence():
         {"id": 17, "kind": "stop"},
     )
     assert parse_response("next=60\n") == (60, None)
+
+
+def test_it_reports_the_tank_s_own_fields():
+    # What --err, --contra and --float-age put on every report: the last
+    # safety error, the board's contradiction latch on ch207, and the seconds
+    # since the float last moved on ch204.
+    body = build_report("fake1", 5, [7], err="contra", contra=True, float_age=42)
+    assert body == "c=fake1 t=5 ch0=7 ch204=42 ch207=1 err=contra\n"

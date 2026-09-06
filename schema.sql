@@ -87,7 +87,9 @@ CREATE INDEX IF NOT EXISTS commands_by_pot
 CREATE TABLE IF NOT EXISTS controllers (
   controller INTEGER PRIMARY KEY,
   last_seen  INTEGER NOT NULL,  -- 0 = configured but never heard from
-  next_s     INTEGER
+  next_s     INTEGER,
+  retired    INTEGER NOT NULL DEFAULT 0  -- 1: a board that is gone; reports
+                                         -- still land, nothing pages or waters
 );
 
 -- Pots, plants and calibration (cycle 2). One row per pot: the two
@@ -198,13 +200,30 @@ CREATE TABLE IF NOT EXISTS status (
   float_bad_prev INTEGER,           -- inside FLAP_WINDOW_S raise, so a float
                                     -- flapping at the waterline still pages
   pos_bad        INTEGER,           -- same, for pos=unknown
-  pos_bad_prev   INTEGER
+  pos_bad_prev   INTEGER,
+  err            TEXT,              -- err= in the latest report that carried one:
+  err_ts         INTEGER,           -- the board's last safety error, and when
+  latched_ts     INTEGER,           -- the durable half of the board's contradiction
+  latch_reason   TEXT,              -- latch: 'contra' | 'resetmid', NULL when not
+  pos_ok_seen    INTEGER            -- last pos=ok ever seen; pos: pages only after one
 );
+
+-- A refill is a human event (pitch "Trust the tank"): the app says so, the
+-- board cannot. The stuck-float rule reads the latest one per controller
+-- against ch204, every tick, hence the index.
+CREATE TABLE IF NOT EXISTS refills (
+  ts         INTEGER NOT NULL,  -- server time when the human said so
+  controller INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS refills_by_controller ON refills (controller, ts);
 
 CREATE TABLE IF NOT EXISTS alerts (
   key        TEXT PRIMARY KEY,  -- silent:<c> | sensor:<c>:<ch> | float:<c> |
                                 -- pos:<c> | fields:<kind>:<c> | dose:<id> |
-                                -- dosefail:<c> | proposal:<c>:<outlet>, plus
+                                -- dosefail:<c> | proposal:<c>:<outlet> |
+                                -- latch:<c> (the board stopped itself) |
+                                -- stale:<c> (float never moved across a refill), plus
                                 -- meta:tick / meta:up bookkeeping rows
   raised_ts  INTEGER NOT NULL,
   cleared_ts INTEGER,           -- NULL while the condition stands

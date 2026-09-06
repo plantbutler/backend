@@ -51,8 +51,10 @@ alert rules from database state alone — controller silent, a mapped
 sensor's channel gone missing, reservoir empty, manifold position lost, a
 safety field that vanished after the board had been sending it, a dose
 that was never acked or came up short on the meter or did not raise
-moisture, a learning proposal waiting — posts the transitions to a public
-ntfy.sh topic (BUTLER_NTFY_TOPIC; the topic name is the secret), and only
+moisture, a learning proposal waiting, a board that stopped itself and
+waits for a human to resume it, a float that never moved across a
+refill — posts the transitions to a public ntfy.sh topic
+(BUTLER_NTFY_TOPIC; the topic name is the secret), and only
 after a fully clean pass GETs BUTLER_DEADMAN_URL. A pass with nothing to
 send must first prove ntfy reachable, so the butler dying and the butler
 losing ntfy both stop the pings. Raising is debounced (two bad sightings
@@ -92,7 +94,7 @@ from starlette.requests import ClientDisconnect
 # metadata because the container installs no package — it copies butler.py
 # beside fastapi and runs it. A test asserts this and pyproject.toml agree,
 # which is the only thing that keeps the two honest.
-VERSION = "0.17.0"
+VERSION = "0.18.0"
 
 BODY_CAP = 4096  # a full 15-channel report is ~200 bytes; 4 KB is generous
 # Photographs are the first thing here that is not small. The phone caps the
@@ -111,6 +113,10 @@ PHOTO_ID_TRIES = 4
 # is a `pot=../../etc` writing outside the photo store, which no amount of
 # "but the pot has to exist" reasoning further down would catch on its own.
 SAFE_ID = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
+# err= is the board's last safety error: one of its own short lowercase
+# tokens (contra, resetmid, range, heap, ...). Bounded like every other
+# field, so a stray value cannot become an unbounded TEXT on status.
+ERR_TOKEN = re.compile(r"\A[a-z_]{1,16}\Z")
 RETRY_WINDOW_S = 300  # how long an identical (controller, t) counts as a retry
 MAX_CHANNEL = 255
 # The board's own number, and an integer like every other identifier on the
@@ -119,8 +125,28 @@ MAX_CHANNEL = 255
 # opened its own controller row, its own heartbeat and its own alerts, and
 # nothing anywhere said the two were the same board.
 MAX_CONTROLLER = 255
+# The board's diagnostic channels this file reads. ch207 is its contradiction
+# latch (float said full, meter saw nothing), 0 or 1 in every report while it
+# stands; it lives in .noinit on the board and a power cycle erases it, which
+# is why the durable half is here.
+CONTRA_CHANNEL = 207
+# ch204 = seconds since the float last changed state, a bare count that
+# restarts at boot: after a reboot `ts - ch204` is the boot time, later than
+# any refill, and the rule below reads "moved" until the float really does.
+# A false negative after a reboot, never a page.
+FLOAT_AGE_CHANNEL = 204
+LATCH_TEXT = {
+    "contra": "the float said full and the meter saw nothing",
+    "resetmid": "it reset with the pump running",
+}
 MAX_RAW = 2**31  # 14-bit ADC today; headroom without letting 2**63 near sqlite
-MAX_DOSE_ML = 1000  # a liter in one command is already implausible for a pot
+# The board's own PB_DOSE_RIG_MAX_ML, and the two move together: a pot
+# above it is refused by the firmware with err=range, acked with flow_ml=0,
+# charged nothing, cooled down and paged high once per cooldown, forever,
+# and never watered. Refusing here, at /command and at pot save, is what
+# keeps that loop unreachable. (DECISIONS #7: a full dump is a mop-up; a
+# quarter of the bench reservoir per dose is the number that makes it one.)
+MAX_DOSE_ML = 250
 MAX_CAP_S = 60  # the firmware enforces its own cap; this bounds what we ask
 MIN_NEXT_S, MAX_NEXT_S = 5, 3600  # the interval knob's sane range
 RULES_WINDOW = 5  # median of this many readings is the whole smoothing story
@@ -132,6 +158,7 @@ VERDICT_VALUES = ("ok", "too_much", "too_little")
 ALERT_TICK_S = 60  # the alert ticker's beat; a create_app parameter in tests
 SILENT_AFTER_S = 600  # BUTLER_SILENT_S default; the floor is 3x the interval
 PERSIST_S = 180  # a status must hold this long before it raises or clears
+REFILL_SLACK_S = 600  # a float that moved this long before the refill tap moved for it
 REALERT_FLOOR_S = 3600  # a cleared condition sounds again at most hourly
 SOAK_S = 1800  # water needs this long to reach the sensor before judging
 MIN_RISE_PCT = 5  # a dose that raised moisture less than this did not work
@@ -152,6 +179,7 @@ class Report(NamedTuple):
     flow_ml: int | None  # what the flow meter counted while executing it
     float_ok: int | None  # reservoir float switch: 1 floats, 0 empty
     pos: str | None  # manifold position: 'ok' or 'unknown'
+    err: str | None  # the board's last safety error token, when it sent one
 
 
 class Command(NamedTuple):
@@ -283,6 +311,14 @@ ADDED_COLUMNS = (
     ),
     ("readings", "pot_id", "TEXT", None, None),
     ("commands", "pot_id", "TEXT", None, None),
+    # Trust the tank (0.18.0): a board's own last error, its durable latch,
+    # whether it ever knew its position, and whether it is retired.
+    ("controllers", "retired", "INTEGER NOT NULL DEFAULT 0", None, None),
+    ("status", "err", "TEXT", None, None),
+    ("status", "err_ts", "INTEGER", None, None),
+    ("status", "latched_ts", "INTEGER", None, None),
+    ("status", "latch_reason", "TEXT", None, None),
+    ("status", "pos_ok_seen", "INTEGER", None, None),
 )
 
 
@@ -542,7 +578,7 @@ def parse_report(text: str) -> Report:
     """
     controller = None
     channels: dict[int, int] = {}
-    t = ack = flow_ml = float_ok = pos = None
+    t = ack = flow_ml = float_ok = pos = err = None
     for token in text.split():
         key, sep, value = token.partition("=")
         if not sep or not key:
@@ -573,6 +609,12 @@ def parse_report(text: str) -> Report:
             if value not in ("ok", "unknown"):
                 raise ValueError(f"pos= must be ok or unknown, got {value!r}")
             pos = value
+        elif key == "err":
+            if err is not None:
+                raise ValueError("err= given twice")
+            if not ERR_TOKEN.match(value):
+                raise ValueError(f"err= must be a short lowercase token, got {value!r}")
+            err = value
         elif key.startswith("ch") and key[2:].isascii() and key[2:].isdigit():
             channel = int(key[2:])
             if channel > MAX_CHANNEL:
@@ -588,7 +630,7 @@ def parse_report(text: str) -> Report:
         raise ValueError("no chN= in the report")
     if flow_ml is not None and ack is None:
         raise ValueError("flow_ml= without ack=")
-    return Report(controller, channels, t, ack, flow_ml, float_ok, pos)
+    return Report(controller, channels, t, ack, flow_ml, float_ok, pos, err)
 
 
 def cap_for(ml: int) -> int:
@@ -677,6 +719,129 @@ def parse_interval(text: str) -> tuple[str, int]:
     if next_s is None:
         raise ValueError("no next= in the request")
     return controller, next_s
+
+
+def parse_controller(text: str) -> tuple[int, int]:
+    """`c=<controller> retired=0|1`: the POST /controller body. Both fields,
+    each once; unknown keys ignored like everywhere else on this wire."""
+    controller = retired = None
+    for token in text.split():
+        key, sep, value = token.partition("=")
+        if not sep or not key:
+            raise ValueError(f"not a k=v token: {token!r}")
+        if key == "c":
+            if controller is not None:
+                raise ValueError("c= given twice")
+            controller = _int_in(value, "c", 0, MAX_CONTROLLER + 1)
+        elif key == "retired":
+            if retired is not None:
+                raise ValueError("retired= given twice")
+            retired = _int_in(value, "retired", 0, 2)
+    if controller is None:  # board 0 is a real board
+        raise ValueError("no c= in the body")
+    if retired is None:
+        raise ValueError("no retired= in the body")
+    return controller, retired
+
+
+def parse_board(text: str) -> int:
+    """A body that names a board and nothing else: `c=<controller>`."""
+    controller = None
+    for token in text.split():
+        key, sep, value = token.partition("=")
+        if not sep or not key:
+            raise ValueError(f"not a k=v token: {token!r}")
+        if key == "c":
+            if controller is not None:
+                raise ValueError("c= given twice")
+            controller = _int_in(value, "c", 0, MAX_CONTROLLER + 1)
+    if controller is None:  # board 0 is a real board
+        raise ValueError("no c= in the body")
+    return controller
+
+
+class Retired(Exception):
+    """POST /command's refusal of water for a retired board."""
+
+    def __init__(self, controller: int):
+        super().__init__(f"board {controller} is retired: un-retire it first")
+
+
+def is_retired(con: sqlite3.Connection, controller: int) -> bool:
+    row = con.execute(
+        "SELECT retired FROM controllers WHERE controller = ?", (controller,)
+    ).fetchone()
+    return bool(row and row[0])
+
+
+class Latched(Exception):
+    """POST /command's refusal while a board's durable latch stands."""
+
+    def __init__(self, controller: int, since: int, reason: str):
+        super().__init__(
+            f"board {controller} stopped watering ({reason} since {hhmm(since)}): "
+            "check the tank, type clear contra on the board, then resume"
+        )
+
+
+def latch_reason(r: Report, prev_err: str | None) -> str | None:
+    """What in this report latches the backend, if anything; `prev_err` is
+    the stored status.err before this report. ch207 is a level: the board
+    sends it on every report while its latch stands, and `clear contra` on
+    the console drops it. err= is the board's sticky last error, repeated
+    on every report until a later dose ends with something else and never
+    touched by the console, so `err=contra` is not a trigger — it would
+    re-latch a resumed board forever — and resetmid is an edge: the value
+    turning into it in this report. The float going empty is deliberately
+    not here either: the rules already refuse on float=0, and a refill is
+    the human event for that (spec D2)."""
+    if r.channels.get(CONTRA_CHANNEL) == 1:
+        return "contra"
+    if r.err == "resetmid" and prev_err != "resetmid":
+        return "resetmid"
+    return None
+
+
+def latch_of(con: sqlite3.Connection, controller: int) -> tuple[int, str] | None:
+    row = con.execute(
+        "SELECT latched_ts, latch_reason FROM status WHERE controller = ?",
+        (controller,),
+    ).fetchone()
+    return (row[0], row[1]) if row and row[0] is not None else None
+
+
+def float_state(
+    con: sqlite3.Connection, controller: int, now: int
+) -> str | tuple[str, int]:
+    """Where the float stands against the latest refill: "none" (no ch204
+    reading, or never refilled), "moved", "waiting" or ("frozen", refill).
+    One reader for the ticker and the rules, so the page and the refusal
+    cannot disagree. The latest ch204 reading says when the float last
+    moved. At or after the refill, or within REFILL_SLACK_S before the tap,
+    is "moved": a person pours first and taps second, and the tap is not
+    the moment the water arrived. Otherwise the float is "waiting" until
+    the reading is PERSIST_S past the refill — it had its minutes to settle
+    — and "frozen" from then on, with the refill as the evidence. Waiting is
+    not moved: a second tap while the float is stuck must not read as the
+    float moving (spec D6)."""
+    row = con.execute(
+        "SELECT ts, raw FROM readings WHERE controller = ? AND channel = ? "
+        "ORDER BY ts DESC, rowid DESC LIMIT 1",
+        (controller, FLOAT_AGE_CHANNEL),
+    ).fetchone()
+    if row is None:
+        return "none"
+    read_ts, age = row
+    (refill,) = con.execute(
+        "SELECT MAX(ts) FROM refills WHERE controller = ?", (controller,)
+    ).fetchone()
+    if refill is None:
+        return "none"
+    if read_ts - age >= refill - REFILL_SLACK_S:
+        return "moved"
+    if read_ts - refill < PERSIST_S:
+        return "waiting"
+    return ("frozen", refill)
 
 
 # The whole window at the default bucket (2016); a week at a minute would
@@ -2250,6 +2415,12 @@ def create_app(
             "WHERE controller = ? AND state = 'proposed' AND created_ts < ?",
             (r.controller, now - PROPOSAL_TTL_S),
         )
+        if is_retired(con, r.controller):
+            return  # a retired board keeps its readings and never waters
+        if latch_of(con, r.controller) is not None:
+            return  # the durable half of the board's latch: dry until a human resumes
+        if isinstance(float_state(con, r.controller, now), tuple):
+            return  # frozen: presumed stuck, the wiring README's rule, enforced here
         if r.float_ok != 1 or r.pos != "ok":
             return  # no reservoir, no known position, no report field: dry
         # This board's own beat, so "recent" below means the same number of
@@ -2350,12 +2521,20 @@ def create_app(
             if watered:
                 continue
             cap = cap_ml if cap_ml is not None else DEFAULT_DAILY_CAP_DOSES * dose
+            # Acked water only. A handed command the board never acked is far
+            # likelier a response that never arrived than an ack that was
+            # lost — the firmware never retries once any response bytes came
+            # back — and charging its full dose starved the pot for the day
+            # on nothing. The cooldown above still counts it: spacing errs
+            # dry, the cap counts water. (Jacopo, 2026-09-05.)
+            #
             # One row, one owner, one SUM. This used to need a DISTINCT over
             # a join, because a dose handed in the very second of a remap sat
             # in both the window that closed and the one that opened; a
             # stamped row cannot be in two windows at once.
             (spent,) = con.execute(
-                "SELECT COALESCE(SUM(COALESCE(flow_ml, ml)), 0) FROM commands "
+                "SELECT COALESCE(SUM(CASE WHEN acked_ts IS NOT NULL "
+                "THEN COALESCE(flow_ml, ml) ELSE 0 END), 0) FROM commands "
                 "WHERE pot_id = ? AND sent_ts > ?",
                 (pot_id, now - 86400),
             ).fetchone()
@@ -2364,7 +2543,8 @@ def create_app(
             # to. MAX rather than a sum, because an attributed dose is
             # counted by both queries and must be spent once.
             (hose_spent,) = con.execute(
-                "SELECT COALESCE(SUM(COALESCE(flow_ml, ml)), 0) FROM commands "
+                "SELECT COALESCE(SUM(CASE WHEN acked_ts IS NOT NULL "
+                "THEN COALESCE(flow_ml, ml) ELSE 0 END), 0) FROM commands "
                 "WHERE controller = ? AND outlet = ? AND sent_ts > ?",
                 (r.controller, outlet, now - 86400),
             ).fetchone()
@@ -2403,17 +2583,30 @@ def create_app(
                 "ON CONFLICT(controller) DO UPDATE SET last_seen = excluded.last_seen",
                 (r.controller, now),
             )
+            # The board's error before this report: the resetmid latch is
+            # an edge on it, and the upsert below overwrites it.
+            prev = con.execute(
+                "SELECT err FROM status WHERE controller = ?", (r.controller,)
+            ).fetchone()
+            prev_err = prev[0] if prev else None
             # The latest safety fields, with enough history for the alert
             # rules: when each value last changed (`since`), when each was
             # last sent at all (`seen` — its vanishing is an alarm), and the
             # last two bad sightings (`bad`, `bad_prev` — a float flapping
-            # at the waterline must still page). All SET expressions read
-            # the pre-update row, so the ordering below is safe.
+            # at the waterline must still page). Plus the board's last error
+            # (`err`, left alone by a report without one, and `err_ts`, when
+            # it last changed value — the board repeats its last error on
+            # every report, so "last seen" would just be the report clock)
+            # and the last pos=ok ever seen (`pos_ok_seen`).
+            # All SET expressions read the pre-update row, so the ordering
+            # below is safe. latched_ts/latch_reason are deliberately not
+            # here: the latch is set and cleared on its own, never through
+            # this upsert, so no report can overwrite it.
             con.execute(
                 "INSERT INTO status (controller, ts, float_ok, float_since, "
                 "pos, pos_since, float_seen, pos_seen, float_bad, "
-                "float_bad_prev, pos_bad, pos_bad_prev) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL) "
+                "float_bad_prev, pos_bad, pos_bad_prev, err, err_ts, pos_ok_seen) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?) "
                 "ON CONFLICT(controller) DO UPDATE SET ts = excluded.ts, "
                 "float_ok = excluded.float_ok, pos = excluded.pos, "
                 "float_since = CASE WHEN status.float_ok IS excluded.float_ok "
@@ -2431,7 +2624,13 @@ def create_app(
                 "pos_bad_prev = CASE WHEN excluded.pos = 'unknown' "
                 "THEN status.pos_bad ELSE status.pos_bad_prev END, "
                 "pos_bad = CASE WHEN excluded.pos = 'unknown' "
-                "THEN excluded.ts ELSE status.pos_bad END",
+                "THEN excluded.ts ELSE status.pos_bad END, "
+                "err = COALESCE(excluded.err, status.err), "
+                "err_ts = CASE WHEN excluded.err IS NOT NULL "
+                "AND status.err IS NOT excluded.err "
+                "THEN excluded.ts ELSE status.err_ts END, "
+                "pos_ok_seen = CASE WHEN excluded.pos = 'ok' "
+                "THEN excluded.ts ELSE status.pos_ok_seen END",
                 (
                     r.controller,
                     now,
@@ -2443,8 +2642,27 @@ def create_app(
                     now if r.pos is not None else None,
                     now if r.float_ok == 0 else None,
                     now if r.pos == "unknown" else None,
+                    r.err,
+                    now if r.err is not None else None,
+                    now if r.pos == "ok" else None,
                 ),
             )
+            reason = latch_reason(r, prev_err)
+            if reason is not None:
+                # Set once, never refreshed while it stands: `since` is when
+                # the trouble began. A dose still waiting would pour into a
+                # tank nobody has looked at, so it goes the way burial sends
+                # one; a 'sent' one is with the board, whose own latch holds.
+                con.execute(
+                    "UPDATE status SET latched_ts = COALESCE(latched_ts, ?), "
+                    "latch_reason = COALESCE(latch_reason, ?) WHERE controller = ?",
+                    (now, reason, r.controller),
+                )
+                con.execute(
+                    "UPDATE commands SET state = 'expired' WHERE controller = ? "
+                    "AND kind = 'water' AND state IN ('proposed', 'queued')",
+                    (r.controller,),
+                )
             if r.ack is not None:
                 con.execute(
                     "UPDATE commands SET state = 'acked', acked_ts = ?, flow_ml = ? "
@@ -2545,6 +2763,15 @@ def create_app(
                 "AND COALESCE(sent_ts, created_ts) < ?",
                 (c.controller, now - cmd_ttl),
             )
+            # Water for a retired board is refused here, the only door the
+            # rules do not guard. A stop still goes: it is the safe
+            # direction, and the board may be mid-dose from before.
+            if c.kind == "water" and is_retired(con, c.controller):
+                raise Retired(c.controller)
+            if c.kind == "water":
+                standing = latch_of(con, c.controller)
+                if standing is not None:
+                    raise Latched(c.controller, *standing)
             busy = con.execute(
                 "SELECT id, state FROM commands "
                 "WHERE controller = ? AND state IN ('queued', 'sent') LIMIT 1",
@@ -2586,6 +2813,74 @@ def create_app(
                 (controller, value or None),
             )
         return value or interval
+
+    def set_retired(controller: int, flag: int) -> None:
+        """A retired board is a quiet one, not a rejected one: its reports
+        still land, but nothing pages for it and nothing waters from it.
+        Retiring drops the water still waiting for the board — a proposal
+        or a queued dose would otherwise be handed out on its next report,
+        so it goes the way burial sends one; a 'sent' one is with the board
+        and expires on that report. It also clears whatever page stands for
+        the board — silence, a sensor, the float, the position, a field that
+        vanished, the latch, a stuck float: every rule skips the board from
+        now on, so nobody else would ever clear them. The latch row itself
+        stays: nobody checked that tank, and the board comes back with it."""
+        now = int(time.time())
+        with connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            con.execute(
+                "INSERT INTO controllers (controller, last_seen, retired) "
+                "VALUES (?, 0, ?) "
+                "ON CONFLICT(controller) DO UPDATE SET retired = excluded.retired",
+                (controller, flag),
+            )
+            if flag:
+                con.execute(
+                    "UPDATE commands SET state = 'expired' WHERE controller = ? "
+                    "AND kind = 'water' AND state IN ('proposed', 'queued')",
+                    (controller,),
+                )
+                con.execute(
+                    "UPDATE alerts SET cleared_ts = ? WHERE cleared_ts IS NULL "
+                    "AND (key IN (?, ?, ?, ?, ?, ?, ?) OR key LIKE ?)",
+                    (
+                        now,
+                        f"silent:{controller}",
+                        f"float:{controller}",
+                        f"pos:{controller}",
+                        f"fields:float:{controller}",
+                        f"fields:pos:{controller}",
+                        f"latch:{controller}",
+                        f"stale:{controller}",
+                        f"sensor:{controller}:%",
+                    ),
+                )
+
+    def resume(controller: int) -> None:
+        """The human's half: the tank was checked. Clears the row and the
+        page together, so /health and the phone agree the moment it answers;
+        idempotent on a board that was not latched."""
+        now = int(time.time())
+        with connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            con.execute(
+                "UPDATE status SET latched_ts = NULL, latch_reason = NULL "
+                "WHERE controller = ?",
+                (controller,),
+            )
+            con.execute(
+                "UPDATE alerts SET cleared_ts = ? WHERE key = ? AND cleared_ts IS NULL",
+                (now, f"latch:{controller}"),
+            )
+
+    def record_refill(controller: int) -> int:
+        now = int(time.time())
+        with connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            con.execute(
+                "INSERT INTO refills (ts, controller) VALUES (?, ?)", (now, controller)
+            )
+        return now
 
     def free_alerts(
         con: sqlite3.Connection,
@@ -3032,6 +3327,18 @@ def create_app(
             )
         }
 
+        # A retired board is a quiet one, not a rejected one: its reports
+        # land, and every rule below that speaks for a board's own condition
+        # leaves it out. Nothing waters from it, so "watering is on hold" has
+        # nothing to tell; and the pages that stood when it was retired were
+        # cleared by set_retired, since nobody here would ever clear them.
+        retired = {
+            controller
+            for (controller,) in con.execute(
+                "SELECT controller FROM controllers WHERE retired = 1"
+            )
+        }
+
         def raised(key: str) -> bool:
             row = standing.get(key)
             return row is not None and row[1] is None
@@ -3064,10 +3371,13 @@ def create_app(
         # A controller that stopped reporting. Silence is measured against
         # the butler's own observation window too: after a redeploy or a NAS
         # reboot, last_seen is stale because the BUTLER was away — that is
-        # the dead-man's news, not this rule's.
+        # the dead-man's news, not this rule's. A retired board is left out
+        # here, so it gets no `heartbeat` entry either, and the sensor rule
+        # below skips its pots on its own.
         heartbeat: dict[str, tuple[int, int | None]] = {}
         for controller, last_seen, override in con.execute(
-            "SELECT controller, last_seen, next_s FROM controllers WHERE last_seen > 0"
+            "SELECT controller, last_seen, next_s FROM controllers "
+            "WHERE last_seen > 0 AND retired = 0"
         ):
             heartbeat[controller] = (last_seen, override)
             threshold = max(silent_after, 3 * (override or interval))
@@ -3162,13 +3472,30 @@ def create_app(
             float_bad_prev,
             pos_bad,
             pos_bad_prev,
+            pos_ok_seen,
         ) in con.execute(
             "SELECT controller, ts, float_ok, float_since, pos, pos_since, "
             "float_seen, pos_seen, float_bad, float_bad_prev, pos_bad, "
-            "pos_bad_prev FROM status"
+            "pos_bad_prev, pos_ok_seen FROM status"
         ):
+            if controller in retired:
+                continue
             pos_value = {"ok": 1, "unknown": 0}.get(pos)
-            for kind, value, value_since, seen, bad, bad_prev, trouble, relief in (
+            # A board that has never said pos=ok is one shipped with the flag
+            # that forces pos=unknown; paging on it would raise once, two
+            # minutes after first boot, and then stand deaf for the whole
+            # bench programme.
+            for (
+                kind,
+                value,
+                value_since,
+                seen,
+                bad,
+                bad_prev,
+                trouble,
+                relief,
+                armed,
+            ) in (
                 (
                     "float",
                     float_ok,
@@ -3181,6 +3508,7 @@ def create_app(
                         "waterline: watering is on hold"
                     ),
                     f"the reservoir on {controller} is full again",
+                    True,
                 ),
                 (
                     "pos",
@@ -3194,6 +3522,7 @@ def create_app(
                         "watering is on hold"
                     ),
                     f"{controller} knows its manifold position again",
+                    pos_ok_seen is not None,
                 ),
             ):
                 key = f"{kind}:{controller}"
@@ -3203,7 +3532,7 @@ def create_app(
                     and now - bad <= FLAP_WINDOW_S
                     and now - bad_prev <= FLAP_WINDOW_S
                 )
-                if flapped:
+                if flapped and armed:
                     if not raised(key) and floor_ok(key):
                         found.append(Alert(key, "high", "warning", trouble, mark(key)))
                 elif (
@@ -3246,6 +3575,66 @@ def create_app(
                         )
                     )
 
+        # The durable latch. High, and without the re-alert floor: a board
+        # that latches again ten minutes after a human resumed it is exactly
+        # the repeat that must not wait an hour to be heard.
+        for controller, latched_ts, reason in con.execute(
+            "SELECT controller, latched_ts, latch_reason FROM status "
+            "WHERE latched_ts IS NOT NULL"
+        ):
+            if controller in retired:
+                continue  # the row stands and comes back with the board
+            key = f"latch:{controller}"
+            if not raised(key):
+                found.append(
+                    Alert(
+                        key,
+                        "high",
+                        "warning",
+                        f"board {controller} stopped watering: "
+                        f"{LATCH_TEXT.get(reason, reason)} — check the tank, type "
+                        "clear contra on the board, then resume in the app",
+                        mark(key),
+                    )
+                )
+
+        # A float that has not moved across a refill is presumed stuck — the
+        # one float fault the wiring cannot catch (the magnet off the float,
+        # or stuck to the hall). Only the backend knows both the refill and
+        # ch204, so the rule lives here and nowhere on the board. Cleared on
+        # "moved" only: a second tap of the button while the float is still
+        # stuck is "waiting", and must not send a false "moved" that hides
+        # the fault behind the re-alert floor.
+        for (controller,) in con.execute("SELECT DISTINCT controller FROM refills"):
+            if controller in retired:
+                continue
+            key = f"stale:{controller}"
+            state = float_state(con, controller, now)
+            if isinstance(state, tuple):
+                _, refill = state
+                if not raised(key) and floor_ok(key):
+                    found.append(
+                        Alert(
+                            key,
+                            "high",
+                            "warning",
+                            f"the float on board {controller} has not moved since "
+                            f"before the refill at {hhmm(refill)}: presumed stuck, "
+                            "the rules will not water until it moves",
+                            mark(key),
+                        )
+                    )
+            elif state == "moved" and raised(key):
+                found.append(
+                    Alert(
+                        key,
+                        "default",
+                        "white_check_mark",
+                        f"the float on board {controller} moved",
+                        clear(key),
+                    )
+                )
+
         # Every dose the board was handed gets judged exactly once: never
         # acked (judged immediately — the loss is proven the moment the next
         # report failed to ack), short on the meter, or no moisture rise
@@ -3274,6 +3663,8 @@ def create_app(
             "(SELECT 1 FROM alerts WHERE key = 'dose:' || commands.id)",
             (now - DOSE_LOOKBACK_S,),
         ).fetchall():
+            if controller in retired:
+                continue  # judged once the board is back, inside the lookback
             row = con.execute(
                 "SELECT next_s FROM controllers WHERE controller = ?", (controller,)
             ).fetchone()
@@ -3622,6 +4013,10 @@ def create_app(
             return PlainTextResponse(f"refused: {why}\n", status_code=400)
         try:
             cmd_id, busy = await run_in_threadpool(enqueue, parsed)
+        except Retired as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=409)
+        except Latched as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=409)
         except sqlite3.OperationalError as why:
             return PlainTextResponse(f"try again: {why}\n", status_code=503)
         if busy:
@@ -3652,6 +4047,57 @@ def create_app(
         except sqlite3.OperationalError as why:
             return PlainTextResponse(f"try again: {why}\n", status_code=503)
         return PlainTextResponse(f"next={effective}\n")
+
+    @app.post("/controller")
+    async def controller_knob(request: Request):
+        if bad_token(request):
+            return PlainTextResponse("bad token\n", status_code=401)
+        body = await slurp(request)
+        if isinstance(body, PlainTextResponse):
+            return body
+        try:
+            controller, retired = parse_controller(body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=400)
+        try:
+            await run_in_threadpool(set_retired, controller, retired)
+        except sqlite3.OperationalError as why:
+            return PlainTextResponse(f"try again: {why}\n", status_code=503)
+        return PlainTextResponse(f"controller={controller} retired={retired}\n")
+
+    @app.post("/resume")
+    async def resume_board(request: Request):
+        if bad_token(request):
+            return PlainTextResponse("bad token\n", status_code=401)
+        body = await slurp(request)
+        if isinstance(body, PlainTextResponse):
+            return body
+        try:
+            controller = parse_board(body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=400)
+        try:
+            await run_in_threadpool(resume, controller)
+        except sqlite3.OperationalError as why:
+            return PlainTextResponse(f"try again: {why}\n", status_code=503)
+        return PlainTextResponse(f"resumed={controller}\n")
+
+    @app.post("/refill")
+    async def refill(request: Request):
+        if bad_token(request):
+            return PlainTextResponse("bad token\n", status_code=401)
+        body = await slurp(request)
+        if isinstance(body, PlainTextResponse):
+            return body
+        try:
+            controller = parse_board(body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as why:
+            return PlainTextResponse(f"refused: {why}\n", status_code=400)
+        try:
+            ts = await run_in_threadpool(record_refill, controller)
+        except sqlite3.OperationalError as why:
+            return PlainTextResponse(f"try again: {why}\n", status_code=503)
+        return PlainTextResponse(f"refill={ts}\n")
 
     @app.post("/pot")
     async def pot(request: Request):
@@ -4180,6 +4626,12 @@ def create_app(
                         "command": None,
                         "float": None,
                         "pos": None,
+                        "err": None,
+                        "err_ts": None,
+                        "pos_ok_seen": None,
+                        "retired": 0,
+                        "latched": None,
+                        "last_refill": None,
                     }
 
                 known: dict[str, dict] = {}
@@ -4187,18 +4639,34 @@ def create_app(
                     "SELECT controller, MAX(ts) FROM readings GROUP BY controller"
                 ):
                     known.setdefault(controller, entry(controller))["last_seen"] = seen
-                for controller, seen, override in con.execute(
-                    "SELECT controller, last_seen, next_s FROM controllers"
+                for controller, seen, override, retired in con.execute(
+                    "SELECT controller, last_seen, next_s, retired FROM controllers"
                 ):
                     e = known.setdefault(controller, entry(controller))
                     e["last_seen"] = max(e["last_seen"], seen)
                     e["next_s"] = override
-                for controller, float_ok, pos in con.execute(
-                    "SELECT controller, float_ok, pos FROM status"
+                    e["retired"] = retired
+                for (
+                    controller, float_ok, pos, err, err_ts, pos_ok_seen, latched_ts, reason,
+                ) in con.execute(
+                    "SELECT controller, float_ok, pos, err, err_ts, pos_ok_seen, "
+                    "latched_ts, latch_reason FROM status"
                 ):
                     e = known.setdefault(controller, entry(controller))
                     e["float"] = float_ok
                     e["pos"] = pos
+                    e["err"] = err
+                    e["err_ts"] = err_ts
+                    e["pos_ok_seen"] = pos_ok_seen
+                    e["latched"] = (
+                        {"since": latched_ts, "reason": reason}
+                        if latched_ts is not None
+                        else None
+                    )
+                for controller, ts in con.execute(
+                    "SELECT controller, MAX(ts) FROM refills GROUP BY controller"
+                ):
+                    known.setdefault(controller, entry(controller))["last_refill"] = ts
                 raised = [
                     {"key": key, "raised_ts": ts}
                     for key, ts in con.execute(

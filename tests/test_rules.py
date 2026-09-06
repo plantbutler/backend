@@ -487,14 +487,16 @@ def test_the_cap_credits_a_dose_that_underflowed(client, db):
     assert "cmd=2" in ack.text
 
 
-def test_a_handed_but_unacked_dose_counts_its_full_ml(client, db):
-    # The board may have watered without acking: assume the whole dose ran.
+def test_a_handed_but_unacked_dose_is_not_charged_to_the_cap(client, db):
+    # A response that never arrived is likelier than an ack that was lost,
+    # so the cap charges acked water only (spec D9). The cooldown, keyed on
+    # sent_ts, is what still spaces a dose the board may have poured.
     make_pot(client, cooldown_h=0, daily_cap_ml=150)
     soak(client, 5)  # cmd=1 handed
 
-    last = report(client)  # no ack: flow unknown, so 100 + 100 > 150
-    assert "cmd=" not in last.text
-    assert len(commands(db)) == 1
+    last = report(client)  # no ack: expired, nothing charged, 0 + 100 <= 150
+    assert "cmd=2" in last.text
+    assert len(commands(db)) == 2
 
 
 def test_approve_refusals(client, db):
@@ -683,7 +685,11 @@ def test_a_remap_in_the_second_of_a_dose_spends_the_cap_once(client, db):
             (edge, edge),
         )
 
-    soak_both(client, 6)  # 100 ml of 250 spent, so the next 100 ml fits
+    soak_both(client, 1)  # 100 ml of 250 spent, so the next 100 ml fits
+    assert len(commands(db)) == 2
+    # Acked, so it is charged: 200 of 250, and nothing more fits today.
+    report(client, extra=f"ch1={DRY} ack=2 flow_ml=100")
+    soak_both(client, 5)
     assert len(commands(db)) == 2
 
 
