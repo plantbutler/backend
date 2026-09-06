@@ -1,5 +1,6 @@
-"""Trust the tank: err=, the durable latch, refills, the stuck-float rule,
-retirement, and the rules corrections that came with them."""
+"""Trust the tank: err=, the durable latch, refills, the float judged
+against the tank's size, retirement, and the rules corrections that came
+with them."""
 
 import sqlite3
 import time
@@ -8,7 +9,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 import butler
-from butler import PERSIST_S, create_app, parse_report
+from butler import (
+    FLAP_WINDOW_S,
+    PERSIST_S,
+    REALERT_FLOOR_S,
+    TANK_SAMPLES_TO_ARM,
+    TANK_TOLERANCE_PCT,
+    create_app,
+    parse_report,
+)
 
 TOKEN = "test-token"
 DRY = 11000  # pct 12 with make_pot's calibration
@@ -124,7 +133,7 @@ def test_health_carries_the_new_fields_with_their_defaults(client):
     entry = health(client)
     for key in ("err", "err_ts", "pos_ok_seen", "latched", "last_refill"):
         assert entry[key] is None, key
-    assert entry["retired"] == 0
+    assert entry["retired"] == 0 and entry["over"] == 0
 
 
 def test_an_old_database_grows_the_columns_at_startup(db):
@@ -301,14 +310,18 @@ def test_retiring_a_board_clears_its_sensor_page_too(app, client, db, sent):
 
 
 def raise_every_page_a_board_can_earn(app, client, db, sent):
-    """The six pages the ticker raises for a board's own condition, all at
-    once: an empty tank and a lost manifold twice inside the flap window, the
-    contradiction latch, a float that never moved across a refill, then both
-    safety fields vanishing for PERSIST_S."""
+    """The six pages the ticker raises for a board's own condition: an
+    empty tank and a lost manifold twice inside the flap window, the
+    contradiction latch, a float still saying empty its minutes after a
+    refill, then both safety fields vanishing for PERSIST_S. Two ticks,
+    because the last two want float= gone and the stuck float wants it
+    still saying empty. (`over:` is the one page not here: it wants the
+    float saying full.)"""
     report(client, "c=0 ch0=1 float=1 pos=ok")
     report(client, "c=0 ch0=1 float=0 pos=unknown ch207=1")
     report(client, "c=0 ch0=1 float=0 pos=unknown")
-    plant_float_history(db, refill_ago=600, read_ago=60, age=4200)
+    tapped = refill(client)  # with the float saying empty
+    tick(app, tapped + PERSIST_S)
     report(client, "c=0 ch0=1")
     run_sql(
         db,
@@ -331,18 +344,18 @@ def test_a_retired_board_pages_nothing_whatever_its_reports_say(app, client, db,
     report(client, "c=0 ch0=1 float=1 pos=ok")
     post(client, "/controller", "c=0 retired=1")
     # Everything a live board would page for: the tank empty twice, the
-    # manifold lost twice, the contradiction latch, and a float that never
-    # moved across a refill.
+    # manifold lost twice, the contradiction latch, and a float still
+    # saying empty its minutes after a refill.
     report(client, "c=0 ch0=1 float=0 pos=unknown ch207=1")
     report(client, "c=0 ch0=1 float=0 pos=unknown")
-    plant_float_history(db, refill_ago=600, read_ago=60, age=4200)
-    tick(app)
+    tapped = refill(client)
+    tick(app, tapped + PERSIST_S)
     assert keys(sent) == []
     assert health(client)["latched"]["reason"] == "contra"  # the report landed
     assert health(client)["float"] == 0
     # Back in service, the board's standing trouble is heard at once.
     post(client, "/controller", "c=0 retired=0")
-    tick(app)
+    tick(app, tapped + PERSIST_S)
     assert sorted(keys(sent)) == ["float:0", "latch:0", "pos:0", "stale:0"]
 
 
@@ -520,23 +533,78 @@ def test_the_latch_pages_once_and_resume_clears_row_and_page(app, client, db, se
 
 
 # --------------------------------------------------------------------------- #
-# Refills and the stuck float (spec D5, D6)
+# Refills, and the float judged against the tank's size (spec D6, D7)
 # --------------------------------------------------------------------------- #
 
 
-def plant_float_history(db, *, refill_ago, read_ago, age, controller=0):
-    """A refill and one ch204 reading, timestamps controlled: the float last
-    moved `age` seconds before the reading."""
-    now = int(time.time())
+def refill(client):
+    """The human taps "refilled" on board 0; the tap's ts."""
+    answer = post(client, "/refill", "c=0")
+    assert answer.status_code == 200, answer.text
+    return int(answer.text.removeprefix("refill=").strip())
+
+
+def age(db, seconds):
+    """Everything so far happened `seconds` earlier, relations kept: the
+    tests run inside one second, the counter is strict about which side of
+    the tap a dose was sent on, and two float=0 sightings inside the flap
+    window are one float flapping, not two runs of the tank."""
     with sqlite3.connect(db) as con:
+        con.execute("UPDATE refills SET ts = ts - ?", (seconds,))
         con.execute(
-            "INSERT INTO refills (ts, controller) VALUES (?, ?)",
-            (now - refill_ago, controller),
+            "UPDATE commands SET created_ts = created_ts - ?, "
+            "sent_ts = sent_ts - ?, acked_ts = acked_ts - ?",
+            (seconds, seconds, seconds),
         )
         con.execute(
-            "INSERT INTO readings (ts, controller, channel, raw) VALUES (?, ?, ?, ?)",
-            (now - read_ago, controller, butler.FLOAT_AGE_CHANNEL, age),
+            "UPDATE tank_samples SET ts = ts - ?, refill_ts = refill_ts - ?",
+            (seconds, seconds),
         )
+        con.execute(
+            "UPDATE status SET float_since = float_since - ?, "
+            "float_bad = float_bad - ?, float_bad_prev = float_bad_prev - ?",
+            (seconds, seconds, seconds),
+        )
+
+
+def tap(client, db):
+    """The human says the tank is full, a minute ago; the tap's ts as it
+    stands after that."""
+    ts = refill(client)
+    age(db, 60)
+    return ts - 60
+
+
+def dose(client, ml, float_ok=1):
+    """A manual dose, handed on one report and acked with the meter's count
+    on the next, whose float= says `float_ok`."""
+    answer = post(client, "/command", f"c=0 water=3 ml={ml}")
+    assert answer.status_code == 200, answer.text
+    cmd_id = int(answer.text.strip().removeprefix("cmd="))
+    handed = report(client, "c=0 ch0=1 float=1 pos=ok").text
+    assert f"cmd={cmd_id} water=3 ml={ml}" in handed
+    report(client, f"c=0 ch0=1 float={float_ok} pos=ok ack={cmd_id} flow_ml={ml}")
+
+
+def learn_the_tank(client, db, size):
+    """Two runs of `size` ml, each ended by the float and a flap window
+    apart: the tank is known. Returns the line `over` starts past."""
+    report(client, "c=0 ch0=1 float=1 pos=ok")
+    for _ in range(TANK_SAMPLES_TO_ARM):
+        tap(client, db)
+        dose(client, size, float_ok=0)
+        age(db, FLAP_WINDOW_S + 1)
+        report(client, "c=0 ch0=1 float=1 pos=ok")
+    assert health(client)["tank_ml"] == size
+    return size * (100 + TANK_TOLERANCE_PCT) // 100
+
+
+def rules_water(db):
+    return run_sql(db, "SELECT id FROM commands WHERE source = 'rules'")
+
+
+def alerts(client):
+    return [a["key"] for a in client.get("/health").json()["alerts"]]
 
 
 def test_a_refill_is_recorded_and_shown(client, db):
@@ -550,105 +618,241 @@ def test_a_refill_is_recorded_and_shown(client, db):
     assert post(client, "/refill", "retired=1").status_code == 400
 
 
-def test_a_float_that_never_moved_across_a_refill_pages_and_holds_the_water(
+def test_over_fires_past_the_tolerance_and_only_while_the_float_says_full(
     app, client, db, sent
 ):
-    make_pot(client, cooldown_h=0)
-    # Refilled ten minutes ago; the float last moved an hour before that.
-    plant_float_history(db, refill_ago=600, read_ago=60, age=4200)
+    assert learn_the_tank(client, db, 200) == 220
+    since = tap(client, db)
+    dose(client, 100)
+    dose(client, 120)  # 220: at the line, not past it
     tick(app)
+    assert keys(sent) == [] and health(client)["over"] == 0
+    dose(client, 1)  # 221, and the float still says full
+    assert health(client)["over"] == 1
+    tick(app)
+    tick(app)
+    assert keys(sent) == ["over:0"]  # once
+    (alert,) = sent
+    assert alert.priority == "high"
+    assert alert.message == (
+        f"board 0 pumped 221 ml since the refill at {butler.hhmm(since)}, more "
+        "than its tank holds (200 ml), and the float still says full: presumed "
+        "stuck, the rules will not water until the next refill"
+    )
+    assert alerts(client) == ["over:0"]
+
+
+def test_a_float_that_goes_empty_past_the_size_is_a_float_that_works(
+    app, client, db, sent
+):
+    learn_the_tank(client, db, 200)
+    tap(client, db)
+    dose(client, 150)
+    dose(client, 71, float_ok=0)  # 221, and the float said so
+    assert health(client)["over"] == 0
+    tick(app)
+    assert keys(sent) == []
+    assert health(client)["tank_samples"] == 3  # a longer run, learned
+
+
+def test_over_holds_the_rules_not_the_phone_and_the_tap_is_the_clear(
+    app, client, db, sent
+):
+    make_pot(client, cooldown_h=0, daily_cap_ml=100_000)
+    learn_the_tank(client, db, 200)
+    tap(client, db)
+    dose(client, 250)
+    tick(app)
+    assert keys(sent) == ["over:0"]
+    dry_reports(client)
+    assert rules_water(db) == []
+    # A dose typed at the phone still goes: a human is at the phone, and
+    # the board's own float check runs before its pump does.
+    dose(client, 50)
+    tap(client, db)
+    assert health(client)["over"] == 0
+    tick(app)
+    assert keys(sent) == ["over:0", "over:0"]
+    assert sent[-1].priority == "default"
+    assert sent[-1].message == "the tank on board 0 was refilled, watering resumes"
+    assert alerts(client) == []
+    # The window is already five dry readings deep: the next report waters.
+    assert "cmd=" in dry_reports(client, n=1)
+    assert len(rules_water(db)) == 1
+
+
+def test_over_pages_once_per_floor(app, client, db, sent):
+    learn_the_tank(client, db, 200)
+    tap(client, db)
+    dose(client, 250)
+    tick(app)
+    tap(client, db)
+    tick(app)
+    assert keys(sent) == ["over:0", "over:0"]
+    dose(client, 250)  # over again inside the hour: the page waits its floor
+    tick(app)
+    assert keys(sent) == ["over:0", "over:0"]
+    assert health(client)["over"] == 1  # the state is a fact all the same
+    run_sql(
+        db,
+        "UPDATE alerts SET cleared_ts = cleared_ts - ? WHERE key = 'over:0'",
+        REALERT_FLOOR_S,
+    )
+    tick(app)
+    assert keys(sent) == ["over:0", "over:0", "over:0"]
+
+
+def test_a_top_up_tapped_daily_never_fires(app, client, db, sent):
+    learn_the_tank(client, db, 200)
+    for _ in range(4):
+        tap(client, db)
+        dose(client, 150)  # the day's water, under the size...
+        tick(app)
+    assert health(client)["pumped_ml"] == 150  # ...counted from the last tap alone
+    assert keys(sent) == [] and health(client)["over"] == 0
+
+
+def test_retiring_a_board_clears_its_over_page(app, client, db, sent):
+    learn_the_tank(client, db, 200)
+    tap(client, db)
+    dose(client, 250)
+    tick(app)
+    assert keys(sent) == ["over:0"]
+    post(client, "/controller", "c=0 retired=1")
+    assert alerts(client) == []
+    assert health(client)["over"] == 1  # the page went, the fact stays
+    tick(app)
+    assert keys(sent) == ["over:0"]  # neither cleared aloud nor raised again
+
+
+def test_a_float_still_empty_its_minutes_after_the_tap_pages(app, client, db, sent):
+    report(client, "c=0 ch0=1 float=1 pos=ok")
+    report(client, "c=0 ch0=1 float=0 pos=ok")
+    tapped = refill(client)  # with the float saying empty
+    tick(app, tapped + PERSIST_S - 1)
+    assert keys(sent) == []  # its minutes to settle
+    tick(app, tapped + PERSIST_S)
     assert keys(sent) == ["stale:0"]
     (alert,) = sent
-    assert alert.priority == "high" and "has not moved since before the refill" in alert.message
-    # Each report carries ch204 itself: still frozen, so the rules stay dry.
-    dry_reports(client, extra="ch204=5000")
-    assert commands(db) == []
-    # Then the float moves: cleared, and the next report waters — the window
-    # is already five dry readings deep. One report, not a window of them:
-    # with cooldown 0 every further unacked report would expire the last
-    # dose and hand another, and page it as never acknowledged.
-    dry_reports(client, n=1, extra="ch204=5")
-    tick(app)
+    assert alert.priority == "high"
+    assert alert.message == (
+        f"the float on board 0 still says empty 3 min after the refill at "
+        f"{butler.hhmm(tapped)}: presumed stuck at empty, look at the magnet"
+    )
+    tick(app, tapped + PERSIST_S + 60)
+    assert keys(sent) == ["stale:0"]  # once
+    # A second tap while it still says empty is not the float moving.
+    refill(client)
+    tick(app, tapped + PERSIST_S + 60)
+    assert keys(sent) == ["stale:0"]
+    assert alerts(client) == ["stale:0"]
+    # Then the float moves: cleared.
+    report(client, "c=0 ch0=1 float=1 pos=ok")
+    tick(app, tapped + PERSIST_S + 60)
     assert keys(sent) == ["stale:0", "stale:0"]
     assert sent[-1].priority == "default"
-    assert client.get("/health").json()["alerts"] == []
-    assert len(commands(db)) == 1
+    assert sent[-1].message == "the float on board 0 moved"
+    assert alerts(client) == []
 
 
-def test_the_float_gets_its_grace_after_a_refill_and_needs_a_refill_at_all(app, client, db, sent):
-    plant_float_history(db, refill_ago=100, read_ago=10, age=4000)  # 90 s < PERSIST_S
-    tick(app)
-    assert keys(sent) == []
-    # A board that has never been refilled is never stale, whatever ch204
-    # says. The ticker never asks about such a board (it walks the refills
-    # table), so the one path that does is the rules, on every report: send
-    # the largest count the wire accepts — older than the epoch, so a guard
-    # that stood in a refill at time zero would still read "stuck" — and the
-    # fifth dry report must water.
-    run_sql(db, "DELETE FROM refills")
-    make_pot(client, cooldown_h=0)
-    handed = dry_reports(client, extra=f"ch204={butler.MAX_RAW - 1}")
-    assert "cmd=1 water=3 ml=100" in handed
-    assert commands(db) == [(1, "sent", None)]
-    tick(app)
-    assert keys(sent) == []
-
-
-def test_a_float_that_rose_while_the_water_was_poured_is_not_stuck(app, client, db, sent):
-    # The natural order: pour, watch the float rise, then tap "refilled".
-    # The float moved 30 s before the tap; the reading is ten minutes after.
-    make_pot(client, cooldown_h=0)
-    plant_float_history(db, refill_ago=600, read_ago=0, age=630)
-    tick(app)
-    assert keys(sent) == []
-    handed = dry_reports(client, extra="ch204=640")
-    assert "cmd=1 water=3 ml=100" in handed
-    tick(app)
-    assert keys(sent) == []
-
-
-def test_a_second_refill_tap_neither_clears_the_page_nor_frees_the_water(
+def test_a_float_that_rose_after_the_tap_and_fell_later_is_not_dead(
     app, client, db, sent
 ):
-    make_pot(client, cooldown_h=0)
-    plant_float_history(db, refill_ago=600, read_ago=60, age=4200)
-    tick(app)
-    assert keys(sent) == ["stale:0"]
-    # Tapped again, no new reading: the float is waiting for its minutes,
-    # which is not the same as having moved. The page stands.
-    assert post(client, "/refill", "c=0").status_code == 200
-    tick(app)
-    assert keys(sent) == ["stale:0"]
-    assert [a["key"] for a in client.get("/health").json()["alerts"]] == ["stale:0"]
-    # The grace runs out with the float still where it was: the rules refuse.
-    run_sql(db, "UPDATE refills SET ts = ts - ?", PERSIST_S + 60)
-    dry_reports(client, extra="ch204=5000")
-    assert commands(db) == []
-    tick(app)
+    report(client, "c=0 ch0=1 float=1 pos=ok")
+    report(client, "c=0 ch0=1 float=0 pos=ok")
+    tapped = tap(client, db)
+    report(client, "c=0 ch0=1 float=1 pos=ok")  # rose as the water arrived
+    tick(app, tapped + PERSIST_S)
+    assert keys(sent) == []
+    age(db, FLAP_WINDOW_S + 1)  # days later...
+    report(client, "c=0 ch0=1 float=0 pos=ok")  # ...legitimately empty again
+    tick(app, int(time.time()) + PERSIST_S)
+    assert keys(sent) == []
+
+
+def test_a_tap_that_never_saw_the_float_judges_nothing(app, client, db, sent):
+    report(client, "c=0 ch0=1 float=1 pos=ok")
+    report(client, "c=0 ch0=1 float=0 pos=ok")
+    tapped = refill(client)
+    run_sql(db, "UPDATE refills SET float_ok = NULL")  # a row from before 0.19.0
+    tick(app, tapped + PERSIST_S)
+    assert keys(sent) == []
+    # A board that has never sent float= has nothing to judge either.
+    assert post(client, "/refill", "c=1").status_code == 200
+    tick(app, tapped + PERSIST_S)
+    assert keys(sent) == []
+    # The next tap looks at the float.
+    tapped = refill(client)
+    tick(app, tapped + PERSIST_S)
     assert keys(sent) == ["stale:0"]
 
 
-def test_float_state_answers_none_moved_waiting_or_frozen(app, db):
-    refill = 1_000_000
+def test_a_stale_page_from_the_clock_rule_clears_when_the_float_says_full(
+    app, client, db, sent
+):
+    # 0.18.0 raised it off ch204 and a refill; neither says anything now,
+    # and the key is kept so it still clears through the same path.
+    report(client, "c=0 ch0=1 float=1 pos=ok")
+    report(client, "c=0 ch0=1 float=0 pos=ok")
+    run_sql(
+        db,
+        "INSERT INTO alerts (key, raised_ts, cleared_ts) VALUES ('stale:0', ?, NULL)",
+        int(time.time()) - 86400,
+    )
+    tick(app)
+    assert keys(sent) == [] and alerts(client) == ["stale:0"]
+    report(client, "c=0 ch0=1 float=1 pos=ok")
+    tick(app)
+    assert keys(sent) == ["stale:0"]
+    assert sent[0].priority == "default" and sent[0].message == "the float on board 0 moved"
+    assert alerts(client) == []
+
+
+def test_tank_state_and_float_dead_read_the_size_the_tap_and_the_float(app, db):
     with sqlite3.connect(db) as con:
-        state = lambda: butler.float_state(con, 0, refill + 3600)  # noqa: E731
-        assert state() == "none"  # no reading, no refill
-        con.execute("INSERT INTO refills (ts, controller) VALUES (?, 0)", (refill,))
-        assert state() == "none"  # no reading yet
-        con.execute(
-            "INSERT INTO readings (ts, controller, channel, raw) VALUES (?, 0, ?, ?)",
-            (refill + 600, butler.FLOAT_AGE_CHANNEL, 0),
+        state = lambda: butler.tank_state(con, 0)  # noqa: E731
+        dead = lambda now: butler.float_dead(con, 0, now)  # noqa: E731
+
+        def pumped(ml, sent_ts):
+            con.execute(
+                "INSERT INTO commands (created_ts, controller, kind, outlet, ml, "
+                "cap_s, state, source, sent_ts, acked_ts, flow_ml) "
+                "VALUES (?, 0, 'water', 3, ?, 30, 'acked', 'manual', ?, ?, ?)",
+                (sent_ts, ml, sent_ts, sent_ts + 1, ml),
+            )
+
+        assert state() == "unknown" and dead(10_000) is None  # never tapped
+        con.execute("INSERT INTO refills (ts, controller, float_ok) VALUES (1000, 0, 1)")
+        assert state() == "unknown"  # tapped, size unknown
+        con.executemany(
+            "INSERT INTO tank_samples (ts, controller, refill_ts, ml) VALUES (?, 0, ?, ?)",
+            [(1, 1, 190), (2, 2, 210)],
         )
-        assert state() == "moved"  # moved at the reading, after the refill
-
-        def read(ts, age):
-            con.execute("UPDATE readings SET ts = ?, raw = ?", (ts, age))
-            return state()
-
-        slack = butler.REFILL_SLACK_S
-        assert read(refill + 600, 600 + slack) == "moved"  # moved exactly slack before
-        assert read(refill + 600, 600 + slack + 1) == ("frozen", refill)  # a second earlier
-        assert read(refill + PERSIST_S - 1, 5000) == "waiting"  # not yet its minutes
-        assert read(refill + PERSIST_S, 5000) == ("frozen", refill)
-        con.execute("DELETE FROM refills")
-        assert read(refill + 600, 5000) == "none"  # never refilled: never stuck
+        con.execute(
+            "INSERT INTO status (controller, ts, float_ok, float_since) VALUES (0, 1000, 1, 900)"
+        )
+        assert state() == "ok"  # nothing pumped
+        pumped(220, 1001)
+        assert state() == "ok"  # 200 + 10 %: at the line
+        pumped(1, 1002)
+        assert state() == ("over", 221, 200, 1000)
+        con.execute("UPDATE status SET float_ok = 0")
+        assert state() == "ok"  # a float that reads empty works
+        con.execute("UPDATE status SET float_ok = NULL")
+        assert state() == "ok"  # and one that says nothing refuses already
+        con.execute("UPDATE status SET float_ok = 1")
+        con.execute("INSERT INTO refills (ts, controller, float_ok) VALUES (2000, 0, 1)")
+        assert state() == "ok"  # the counter restarts at the tap
+        assert dead(3000) is None  # the float said full at the tap
+        con.execute("UPDATE refills SET float_ok = 0 WHERE ts = 2000")
+        con.execute("UPDATE status SET float_ok = 0, float_since = 2000")
+        assert dead(2000 + PERSIST_S - 1) is None
+        assert dead(2000 + PERSIST_S) == 2000
+        con.execute("UPDATE status SET float_since = 2001")
+        assert dead(3000) is None  # it moved after the tap
+        con.execute("UPDATE status SET float_since = 1999, float_ok = 1")
+        assert dead(3000) is None  # it says full
+        con.execute("UPDATE status SET float_ok = 0")
+        assert dead(3000) == 2000
+        con.execute("UPDATE refills SET float_ok = NULL WHERE ts = 2000")
+        assert dead(3000) is None  # a tap that never saw the float

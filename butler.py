@@ -130,11 +130,6 @@ MAX_CONTROLLER = 255
 # stands; it lives in .noinit on the board and a power cycle erases it, which
 # is why the durable half is here.
 CONTRA_CHANNEL = 207
-# ch204 = seconds since the float last changed state, a bare count that
-# restarts at boot: after a reboot `ts - ch204` is the boot time, later than
-# any refill, and the rule below reads "moved" until the float really does.
-# A false negative after a reboot, never a page.
-FLOAT_AGE_CHANNEL = 204
 LATCH_TEXT = {
     "contra": "the float said full and the meter saw nothing",
     "resetmid": "it reset with the pump running",
@@ -158,7 +153,6 @@ VERDICT_VALUES = ("ok", "too_much", "too_little")
 ALERT_TICK_S = 60  # the alert ticker's beat; a create_app parameter in tests
 SILENT_AFTER_S = 600  # BUTLER_SILENT_S default; the floor is 3x the interval
 PERSIST_S = 180  # a status must hold this long before it raises or clears
-REFILL_SLACK_S = 600  # a float that moved this long before the refill tap moved for it
 REALERT_FLOOR_S = 3600  # a cleared condition sounds again at most hourly
 SOAK_S = 1800  # water needs this long to reach the sensor before judging
 MIN_RISE_PCT = 5  # a dose that raised moisture less than this did not work
@@ -874,38 +868,49 @@ def tank_ml(con: sqlite3.Connection, controller: int) -> int | None:
     return last[mid] if len(last) % 2 else (last[mid - 1] + last[mid]) // 2
 
 
-def float_state(
-    con: sqlite3.Connection, controller: int, now: int
-) -> str | tuple[str, int]:
-    """Where the float stands against the latest refill: "none" (no ch204
-    reading, or never refilled), "moved", "waiting" or ("frozen", refill).
-    One reader for the ticker and the rules, so the page and the refusal
-    cannot disagree. The latest ch204 reading says when the float last
-    moved. At or after the refill, or within REFILL_SLACK_S before the tap,
-    is "moved": a person pours first and taps second, and the tap is not
-    the moment the water arrived. Otherwise the float is "waiting" until
-    the reading is PERSIST_S past the refill — it had its minutes to settle
-    — and "frozen" from then on, with the refill as the evidence. Waiting is
-    not moved: a second tap while the float is stuck must not read as the
-    float moving (spec D6)."""
+def tank_state(
+    con: sqlite3.Connection, controller: int
+) -> str | tuple[str, int, int, int]:
+    """The float judged against the tank's size: "unknown" while the size
+    is, or nobody has tapped; ("over", pumped, tank, refill_ts) when more
+    than the tank holds, plus TANK_TOLERANCE_PCT, has been pumped since the
+    latest tap and the float still says full — presumed stuck at full, the
+    dangerous way; "ok" otherwise, since a float that reads empty is a
+    float that works, and the rules refuse on it already. One reader for
+    the ticker, the rules and /health, so the page, the refusal and the
+    phone cannot disagree (spec D6)."""
+    tank = tank_ml(con, controller)
+    tapped = latest_refill(con, controller)
+    if tank is None or tapped is None:
+        return "unknown"
+    pumped = pumped_since(con, controller, tapped[0])
     row = con.execute(
-        "SELECT ts, raw FROM readings WHERE controller = ? AND channel = ? "
-        "ORDER BY ts DESC, rowid DESC LIMIT 1",
-        (controller, FLOAT_AGE_CHANNEL),
+        "SELECT float_ok FROM status WHERE controller = ?", (controller,)
     ).fetchone()
-    if row is None:
-        return "none"
-    read_ts, age = row
-    (refill,) = con.execute(
-        "SELECT MAX(ts) FROM refills WHERE controller = ?", (controller,)
+    if pumped > tank * (100 + TANK_TOLERANCE_PCT) // 100 and row and row[0] == 1:
+        return ("over", pumped, tank, tapped[0])
+    return "ok"
+
+
+def float_dead(con: sqlite3.Connection, controller: int, now: int) -> int | None:
+    """The tap a float is presumed stuck at empty since, or None: the latest
+    refill was tapped with the float saying empty, it has had PERSIST_S to
+    settle, and it has said empty since before the tap. That last clause is
+    what keeps a float that rose after the tap and, days later, fell again
+    for real out of this: its `float_since` is after the tap. A tap that
+    never saw the float (NULL) judges nothing. Harmless, unlike its twin
+    above: the rules are dry on empty already, so this is a page and
+    nothing else (spec D7)."""
+    tapped = latest_refill(con, controller)
+    if tapped is None or tapped[1] != 0 or now - tapped[0] < PERSIST_S:
+        return None
+    row = con.execute(
+        "SELECT float_ok, float_since FROM status WHERE controller = ?",
+        (controller,),
     ).fetchone()
-    if refill is None:
-        return "none"
-    if read_ts - age >= refill - REFILL_SLACK_S:
-        return "moved"
-    if read_ts - refill < PERSIST_S:
-        return "waiting"
-    return ("frozen", refill)
+    if row and row[0] == 0 and row[1] is not None and row[1] <= tapped[0]:
+        return tapped[0]
+    return None
 
 
 # The whole window at the default bucket (2016); a week at a minute would
@@ -2483,8 +2488,8 @@ def create_app(
             return  # a retired board keeps its readings and never waters
         if latch_of(con, r.controller) is not None:
             return  # the durable half of the board's latch: dry until a human resumes
-        if isinstance(float_state(con, r.controller, now), tuple):
-            return  # frozen: presumed stuck, the wiring README's rule, enforced here
+        if isinstance(tank_state(con, r.controller), tuple):
+            return  # over: more than the tank holds and the float still says full
         if r.float_ok != 1 or r.pos != "ok":
             return  # no reservoir, no known position, no report field: dry
         # This board's own beat, so "recent" below means the same number of
@@ -2918,9 +2923,10 @@ def create_app(
         so it goes the way burial sends one; a 'sent' one is with the board
         and expires on that report. It also clears whatever page stands for
         the board — silence, a sensor, the float, the position, a field that
-        vanished, the latch, a stuck float: every rule skips the board from
-        now on, so nobody else would ever clear them. The latch row itself
-        stays: nobody checked that tank, and the board comes back with it."""
+        vanished, the latch, a float stuck either way: every rule skips the
+        board from now on, so nobody else would ever clear them. The latch
+        row itself stays: nobody checked that tank, and the board comes back
+        with it."""
         now = int(time.time())
         with connect() as con:
             con.execute("BEGIN IMMEDIATE")
@@ -2938,7 +2944,7 @@ def create_app(
                 )
                 con.execute(
                     "UPDATE alerts SET cleared_ts = ? WHERE cleared_ts IS NULL "
-                    "AND (key IN (?, ?, ?, ?, ?, ?, ?) OR key LIKE ?)",
+                    "AND (key IN (?, ?, ?, ?, ?, ?, ?, ?) OR key LIKE ?)",
                     (
                         now,
                         f"silent:{controller}",
@@ -2947,6 +2953,7 @@ def create_app(
                         f"fields:float:{controller}",
                         f"fields:pos:{controller}",
                         f"latch:{controller}",
+                        f"over:{controller}",
                         f"stale:{controller}",
                         f"sensor:{controller}:%",
                     ),
@@ -3702,33 +3709,66 @@ def create_app(
                     )
                 )
 
-        # A float that has not moved across a refill is presumed stuck — the
-        # one float fault the wiring cannot catch (the magnet off the float,
-        # or stuck to the hall). Only the backend knows both the refill and
-        # ch204, so the rule lives here and nowhere on the board. Cleared on
-        # "moved" only: a second tap of the button while the float is still
-        # stuck is "waiting", and must not send a false "moved" that hides
-        # the fault behind the re-alert floor.
-        for (controller,) in con.execute("SELECT DISTINCT controller FROM refills"):
+        # The float judged against the tank's size, never a clock. Stuck at
+        # full is the dangerous one: more than the tank holds pumped since
+        # the tap with the float still saying full is a float presumed
+        # stuck, the rules stay dry on it, and the tap is the clear — the
+        # counter restarts at it, and a person who tapped looked at the
+        # tank. Stuck at empty is harmless: the rules are dry on empty
+        # already, so it is a page and nothing else, cleared when the float
+        # says full. Its `stale:` key is the clock rule's, kept so a page
+        # standing from 0.18.0 clears through the same path.
+        for controller, float_ok in con.execute(
+            "SELECT controller, float_ok FROM status"
+        ):
             if controller in retired:
                 continue
-            key = f"stale:{controller}"
-            state = float_state(con, controller, now)
+            key = f"over:{controller}"
+            state = tank_state(con, controller)
             if isinstance(state, tuple):
-                _, refill = state
+                _, pumped, tank, refill_ts = state
                 if not raised(key) and floor_ok(key):
                     found.append(
                         Alert(
                             key,
                             "high",
                             "warning",
-                            f"the float on board {controller} has not moved since "
-                            f"before the refill at {hhmm(refill)}: presumed stuck, "
-                            "the rules will not water until it moves",
+                            f"board {controller} pumped {pumped} ml since the "
+                            f"refill at {hhmm(refill_ts)}, more than its tank "
+                            f"holds ({tank} ml), and the float still says full: "
+                            "presumed stuck, the rules will not water until the "
+                            "next refill",
                             mark(key),
                         )
                     )
-            elif state == "moved" and raised(key):
+            elif raised(key):
+                found.append(
+                    Alert(
+                        key,
+                        "default",
+                        "white_check_mark",
+                        f"the tank on board {controller} was refilled, "
+                        "watering resumes",
+                        clear(key),
+                    )
+                )
+            key = f"stale:{controller}"
+            tapped = float_dead(con, controller, now)
+            if tapped is not None:
+                if not raised(key) and floor_ok(key):
+                    found.append(
+                        Alert(
+                            key,
+                            "high",
+                            "warning",
+                            f"the float on board {controller} still says empty "
+                            f"{(now - tapped) // 60} min after the refill at "
+                            f"{hhmm(tapped)}: presumed stuck at empty, look at "
+                            "the magnet",
+                            mark(key),
+                        )
+                    )
+            elif float_ok == 1 and raised(key):
                 found.append(
                     Alert(
                         key,
@@ -4739,6 +4779,7 @@ def create_app(
                         "tank_ml": None,
                         "tank_samples": 0,
                         "pumped_ml": 0,
+                        "over": 0,
                     }
 
                 known: dict[str, dict] = {}
@@ -4776,6 +4817,9 @@ def create_app(
                     e = known.setdefault(controller, entry(controller))
                     e["last_refill"] = ts
                     e["pumped_ml"] = pumped_since(con, controller, ts)
+                    e["over"] = int(
+                        isinstance(tank_state(con, controller), tuple)
+                    )
                 for controller, n in con.execute(
                     "SELECT controller, COUNT(*) FROM tank_samples GROUP BY controller"
                 ):

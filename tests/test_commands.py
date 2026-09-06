@@ -222,6 +222,7 @@ def test_health_lists_a_configured_but_never_seen_controller(client, db):
         "tank_ml": None,
         "tank_samples": 0,
         "pumped_ml": 0,
+        "over": 0,
     }
 
 
