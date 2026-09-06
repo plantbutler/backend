@@ -11,9 +11,16 @@ Decisions and traps only. The code says the rest.
 ## 1. What is already on the wire (no firmware change)
 
 - `float=` 1/0 is the board's **word**, not the raw switch: the debounced float AND not the
-  contra latch AND not the flap limit (`report.cpp:118`). A sample (D4) closes on that word. A
-  contra-forced 0 means the pump ran dry, so the tank really was empty: a true, slightly high,
-  sample. A flap-forced 0 means the level is at the line: a true sample.
+  contra latch AND not the flap limit (`report.cpp:118`). A sample (D4) closes on that word,
+  except on a contra report. *Amended 2026-09-07:* a contra (`ch207=1`) is "float OK, zero
+  pulses", and zero pulses is also a dead meter, a kinked tube, a dead pump or 12 V absent
+  (`safety.cpp:119-126`, the wiring truth table): a fault, not a measurement, so it closes no
+  sample and the board's standing latch silences D6 and D7. A flap-forced 0 (three consecutive
+  float refusals, `config.h:148-153`) means the level is at the line when it happens — a true
+  sample — but the forced 0 **outlives a refill**: the firmware resets it only on a granted
+  dose (`safety.cpp:105`), and the rules never grant while the word is 0. Only a manual dose
+  from the phone gets out. D7's page says so. Trap for the firmware, filed as an issue: the wire
+  cannot tell a flap latch from an empty tank; a channel for it would let the backend say which.
 - `ack=<id> flow_ml=<n>` is the measured millilitres per dose. The firmware drops D6 the moment
   the float goes empty mid-dose, so the ack carries what flowed before the line.
 - `ch204` stays in every report and stays stored as a channel. Nothing reads it after this.
@@ -39,55 +46,73 @@ means (D9).
 
 **D3 — The counter.** `pumped_since(con, controller, since_ts) -> int`: `SUM(COALESCE(flow_ml,
 ml))` over `commands` with `kind = 'water'`, this controller, `acked_ts IS NOT NULL` and
-`sent_ts > since_ts`. The daily cap's expression: acked water, as the cap counts it. `since_ts`
-is the latest refill's `ts`; with no refill the counter is 0 and nothing below arms. Trap: a dose
+`sent_ts > since_ts`. The daily cap's expression: acked water, as the cap counts it. Trap: a dose
 lost without an ack (`resetmid`) pumped something uncounted, so the rule fires late; the contra
 latch stands behind it, as it does today. Accepted.
 
+*Amended 2026-09-07.* `since_ts` is the **origin**, `counter_origin(con, controller) -> (ts,
+kind) | None`: the later of the latest tap whose snapshot is not NULL (`kind = "tap"`, its
+`refills` row) and the float's latest rise, `status.float_since` while `status.float_ok = 1`
+(`kind = "rise"`). Two reasons. A tap from 0.18.0 (NULL snapshot) never meant "full to the top"
+— a month of untapped top-ups behind it would have become a 12 L sample and a threshold no stuck
+float ever reaches — so it is no origin for anything. And a float that went 1 → 0 → 1 since the
+tap is a tank that ran down and was refilled by someone who forgot to tap: the float
+demonstrably moved, so the counter restarts at the rise instead of calling it stuck twenty
+millilitres later. With no origin the counter is 0 and nothing below arms. `/health`'s
+`pumped_ml` is this counter.
+
 **D4 — Learning a sample.** In the report transaction, before the status upsert, read the
-previous `float_ok`. When it was 1 and this report says 0, and a latest refill `r` exists, and
-`pumped_since(r.ts) > 0`, insert `tank_samples(ts = now, controller, refill_ts = r.ts, ml)`.
-`UNIQUE(controller, refill_ts)`: one sample per tap, so a float bouncing at the line adds nothing
-after the first crossing (`INSERT OR IGNORE`). Zero pumped stores nothing: a tank drained by
-something the meter never saw (evaporation, a tap that was not a fill) is not a measurement.
-Trap: `status` rows exist only once a controller has reported; a first report has no previous
-`float_ok` and closes nothing. Trap: a report that omits `float=` blanks `status.float_ok`
-(its vanishing is its own alarm), so the edge is read off `status.float_word`, the board's
-last word, kept across such a report — in the `CREATE` and in `ADDED_COLUMNS`, carried from
-`float_ok` at the upgrade so a tank at full through it still closes its sample.
+previous float word (`status.float_word`, the board's last real `float=`, so a report that omits
+the field hides no edge). When it was 1 and this report says 0, and the origin (D3) is a tap
+`r`, and `pumped_since(r.ts) > 0`, insert `tank_samples(ts = now, controller, refill_ts = r.ts,
+ml)`. `UNIQUE(controller, refill_ts)`: one sample per tap, so a float bouncing at the line adds
+nothing after the first crossing (`INSERT OR IGNORE`). Zero pumped stores nothing: a tank
+drained by something the meter never saw (evaporation, a tap that was not a fill) is not a
+measurement. *Amended 2026-09-07:* no sample on a report carrying `ch207=1`, nor on a board
+whose latch stands, nor for a retired board (§1, D1); and none when the origin is a rise — the
+tank was refilled untapped and nobody said it was full, so its content is unknown. Trap: `status`
+rows exist only once a controller has reported; a first report has no previous word and closes
+nothing.
 
 **D5 — The size.** `tank_ml(con, controller) -> int | None`: the median of the last
 `TANK_MEDIAN_OF` samples by `ts`, `None` while fewer than `TANK_SAMPLES_TO_ARM` exist. Median,
 not mean: one tap that was not a fill must not move the number by much. The median of two is
 their mean; that is fine.
 
-**D6 — Stuck at full, the dangerous one.** `tank_state(con, controller, tapped) -> "unknown" |
-"ok" | tuple`: `"unknown"` while `tank_ml` is None or there is no refill; `("over", pumped, tank,
-refill_ts)` when `pumped_since(refill_ts) > tank * (100 + TANK_TOLERANCE_PCT) // 100` **and**
-`status.float_ok == 1`; `"ok"` otherwise (a float that reads 0 is a float that works, and
-`float=0` already refuses). `tapped` is `latest_refill`'s answer, read once by the caller and
-handed to D6 and D7 alike; the comparison itself is one predicate, `is_over(tank, pumped,
-float_ok)`, which `/health` applies to the three numbers it already carries rather than reading
-them again. `water_rules` skips the controller on `"over"` (dry, decision #5),
-after the retired and latch checks. The ticker raises `over:<c>` (high, with `floor_ok`): "board N
-pumped X ml since the refill at HH:MM, more than its tank holds (Y ml), and the float still says
-full: presumed stuck, the rules will not water until the next refill". It clears when raised and
-the state is no longer `"over"`: "the tank on board N was refilled, watering resumes". The tap is
-the clear: the counter restarts at it, and a person who tapped looked at the tank. No resume
-flow. `POST /command` is **not** gated, as D6 of the old spec chose: a human is at the phone, the
+**D6 — Stuck at full, the dangerous one.** `tank_state(con, controller, origin) -> "unknown" |
+"ok" | tuple`: `"unknown"` while `tank_ml` is None or there is no origin; `("over", pumped,
+tank, origin_ts)` when `pumped_since(origin_ts) > tank * (100 + TANK_TOLERANCE_PCT) // 100`
+**and** `status.float_ok == 1`; `"ok"` otherwise (a float that reads 0 is a float that works,
+and `float=0` already refuses). `origin` is `counter_origin`'s answer, read once by the caller
+and handed to D6 and D7 alike (D7 needs the latest tap too); the comparison itself is one
+predicate, `is_over(tank, pumped, float_ok)`, which `/health` applies to the numbers it already
+carries. `water_rules` skips the controller on `"over"` (dry, decision #5), after the retired
+and latch checks. The ticker raises `over:<c>` (high, with `floor_ok`; skipped while the board's
+latch stands or it is retired): "board N pumped X ml since HH:MM, more than its tank holds (Y
+ml), and the float still says full: presumed stuck, the rules will not water until the next
+refill". *Amended 2026-09-07:* the tap is the **only** clear — the page clears when raised and a
+tap with a non-NULL snapshot is later than the alert's `raised_ts`: "the tank on board N was
+refilled". Not on the float word dropping to 0, which is a contra, a flap or an omitted `float=`
+as often as an empty tank, and "watering resumes" was untrue then. `/health`'s `over` is 1 while
+the live predicate holds **or** `over:<c>` stands, and 0 for a retired board. No resume flow.
+`POST /command` is **not** gated, as D6 of the old spec chose: a human is at the phone, the
 board's own float check still runs, and the no-flow abort is beneath both.
 
-**D7 — Stuck at empty, the harmless one.** `float_dead(con, controller, tapped, now) -> int |
-None`: the latest refill `r` (`tapped`, as in D6) has `float_ok = 0`, `now - r.ts >= PERSIST_S`,
-and `status` still says `float_ok = 0` with `float_since <= r.ts` → `r.ts`. Trap that the
-`float_since` clause exists for: a float that went 0 → 1 after the tap and, days later,
-legitimately back to 0 must not read as dead; its `float_since` is after the tap. The ticker
+**D7 — Stuck at empty, the harmless one.** `float_dead(con, controller, tapped) -> int | None`:
+the latest refill `r` (`tapped`) has `float_ok = 0`, the board has said `float=` at least
+`PERSIST_S` after the tap (`status.float_seen >= r.ts + PERSIST_S`), and `status` still says
+`float_ok = 0` with `float_since <= r.ts` → `r.ts`. *Amended 2026-09-07:* a reading, not the wall
+clock — a board on a five-minute beat or behind a WiFi drop has said nothing yet and is judged on
+nothing, as the 0.18.0 rule's "waiting" did. Trap that the `float_since` clause exists for: a
+float that went 0 → 1 after the tap and, days later, legitimately back to 0 must not read as
+dead; its `float_since` is after the tap. Skipped while the board's latch stands (contra forces
+the word to 0; the latch page already says what to do) and for a retired board. The ticker
 raises `stale:<c>` (high, with `floor_ok`; the key is kept so a `stale:` standing from 0.18.0
 clears through the same path): "the float on board N still says empty M min after the refill at
-HH:MM: presumed stuck at empty, look at the magnet".
-It clears when raised and `status.float_ok == 1`: "the float on board N moved". Page only: the
-rules are already dry on `float=0`, and this rule is not in `water_rules`. A refill with
-`float_ok` NULL judges nothing.
+HH:MM: a stuck float, or the board's own float check tripped — look at the magnet, or water once
+from the phone (a granted dose resets the board's check)". It clears when raised and
+`status.float_ok == 1`: "the float on board N moved". Page only: the rules are already dry on
+`float=0`, and this rule is not in `water_rules`. A refill with `float_ok` NULL judges nothing.
 
 **D8 — Every sample is announced, drift is warned.** The ticker pages each `tank_samples` row
 once, keyed `tank:<c>:<refill_ts>` and marked like `dose:<id>` (a one-shot, never cleared): with
@@ -100,13 +125,18 @@ learning, K of 2)". Trap: `/health`'s raised list must exclude `tank:%` as it ex
 or the app shows every announcement for ever. Retired boards: skipped, like `dose:`.
 
 **D9 — What the app sees and says.** `/health` controller entries gain `tank_ml` (int | null),
-`tank_samples` (int), `pumped_ml` (int, since the latest refill, 0 without one), `over` (0 | 1).
-App (`ControllerHealth`: `tankMl`, `tankSamples`, `pumpedMl`, `over`):
+`tank_samples` (int), `pumped_ml` (int, since the origin, 0 without one), `over` (0 | 1; 0 for a
+retired board). App (`ControllerHealth`: `tankMl`, `tankSamples`, `pumpedMl`, `over`).
+*Amended 2026-09-07:* `tankSamples` is `Int?`, null when the key is absent — a 0.18.0 backend
+must not read as "learning 0/2" and nag; the tank part of the line, the hint and `OVER` render
+only when `tankSamples` is not null. A retired row shows none of the tank part, the hint or
+`OVER`: retired is the last word and a quiet one. `learningGaps` names an over board ("the board
+not having pumped more than its tank holds"), so a mode flip on one explains itself.
 
 - `controllerLine`, after `pos`: `tank ≈4.2 L, 1.1 L pumped` when `tankMl` is known, else
   `tank learning 1/2`; and, after `STOPPED`'s slot, `OVER` when `over == 1`. Volumes through one
   helper `mlText`: below 1000 → `850 ml`, else one decimal → `4.2 L`.
-- Under a row that is not retired: while `tankSamples < 2`, a plain `bodySmall` line "Let the
+- Under a row that is not retired and whose `tankSamples` is not null: while `tankSamples < 2`, a plain `bodySmall` line "Let the
   tank run empty twice without topping up, and tap refilled when you fill it to the top, so the
   butler learns its size."; when `over == 1`, an error-coloured line "board N pumped more than
   its tank holds and the float still says full: check the float, refill, then tap refilled."
