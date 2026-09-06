@@ -205,7 +205,12 @@ CREATE TABLE IF NOT EXISTS status (
   err_ts         INTEGER,           -- the board's last safety error, and when
   latched_ts     INTEGER,           -- the durable half of the board's contradiction
   latch_reason   TEXT,              -- latch: 'contra' | 'resetmid', NULL when not
-  pos_ok_seen    INTEGER            -- last pos=ok ever seen; pos: pages only after one
+  pos_ok_seen    INTEGER,           -- last pos=ok ever seen; pos: pages only after one
+  float_word     INTEGER            -- the board's last word on the float, kept
+                                    -- across a report that omits float= (which
+                                    -- blanks float_ok): the tank sample closes on
+                                    -- it going 1 -> 0, and a report that said
+                                    -- nothing must not hide that edge
 );
 
 -- A refill is a human event (pitch "Trust the tank"): the app says so, the

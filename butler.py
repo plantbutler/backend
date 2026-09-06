@@ -329,9 +329,12 @@ ADDED_COLUMNS = (
     ("status", "latched_ts", "INTEGER", None, None),
     ("status", "latch_reason", "TEXT", None, None),
     ("status", "pos_ok_seen", "INTEGER", None, None),
-    # The tank has a size (0.19.0): what the float said at the tap. The
-    # rows already on the NAS get NULL, which judges nothing.
+    # The tank has a size (0.19.0): what the float said at the tap (the
+    # rows already on the NAS get NULL, which judges nothing) and the
+    # board's last word on the float, carried from float_ok so a tank
+    # sitting at full through the upgrade still closes its sample.
     ("refills", "float_ok", "INTEGER", None, None),
+    ("status", "float_word", "INTEGER", "float_ok", lambda v: v),
 )
 
 
@@ -2646,10 +2649,13 @@ def create_app(
             )
             # The board's error and float before this report: the resetmid
             # latch is an edge on the one, a tank sample on the other, and
-            # the upsert below overwrites both. A first report has neither:
-            # there is no row yet, and it closes nothing.
+            # the upsert below overwrites both. The float is its last
+            # word, not float_ok: a report that omits float= blanks that
+            # column (its vanishing is its own alarm) and must not hide
+            # the edge. A first report has neither: there is no row yet,
+            # and it closes nothing.
             prev = con.execute(
-                "SELECT err, float_ok FROM status WHERE controller = ?",
+                "SELECT err, float_word FROM status WHERE controller = ?",
                 (r.controller,),
             ).fetchone()
             prev_err = prev[0] if prev else None
@@ -2670,8 +2676,9 @@ def create_app(
             con.execute(
                 "INSERT INTO status (controller, ts, float_ok, float_since, "
                 "pos, pos_since, float_seen, pos_seen, float_bad, "
-                "float_bad_prev, pos_bad, pos_bad_prev, err, err_ts, pos_ok_seen) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?) "
+                "float_bad_prev, pos_bad, pos_bad_prev, err, err_ts, pos_ok_seen, "
+                "float_word) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?, ?) "
                 "ON CONFLICT(controller) DO UPDATE SET ts = excluded.ts, "
                 "float_ok = excluded.float_ok, pos = excluded.pos, "
                 "float_since = CASE WHEN status.float_ok IS excluded.float_ok "
@@ -2695,7 +2702,8 @@ def create_app(
                 "AND status.err IS NOT excluded.err "
                 "THEN excluded.ts ELSE status.err_ts END, "
                 "pos_ok_seen = CASE WHEN excluded.pos = 'ok' "
-                "THEN excluded.ts ELSE status.pos_ok_seen END",
+                "THEN excluded.ts ELSE status.pos_ok_seen END, "
+                "float_word = COALESCE(excluded.float_word, status.float_word)",
                 (
                     r.controller,
                     now,
@@ -2710,6 +2718,7 @@ def create_app(
                     r.err,
                     now if r.err is not None else None,
                     now if r.pos == "ok" else None,
+                    r.float_ok,
                 ),
             )
             reason = latch_reason(r, prev_err)
@@ -2734,14 +2743,19 @@ def create_app(
                     "WHERE id = ? AND controller = ? AND state = 'sent'",
                     (now, r.flow_ml, r.ack, r.controller),
                 )
-            if prev_float == 1 and r.float_ok == 0:
+            if (
+                prev_float == 1
+                and r.float_ok == 0
+                and not is_retired(con, r.controller)
+            ):
                 # The float went empty: the water the meter counted since
                 # the tap is one measurement of the tank. After the ack
                 # step, because the dose that drained it acks on this very
                 # report. One per tap — a float bouncing at the line adds
                 # nothing after its first crossing — and nothing on zero:
                 # a tank drained by something the meter never saw is not a
-                # measurement (spec D4).
+                # measurement (spec D4). A retired board's reports still
+                # land, but it learns nothing (spec D1).
                 tapped = latest_refill(con, r.controller)
                 if tapped is not None:
                     pumped = pumped_since(con, r.controller, tapped[0])

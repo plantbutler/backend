@@ -28,7 +28,8 @@ Decisions and traps only. The code says the rest.
 
 **D1 — The tank is the board's.** One tank per controller. Samples, the counter and every page
 are keyed by controller. A retired board learns nothing and pages nothing; the rules skip it
-already.
+already, and D4's insert skips it too: its reports still land, and a dose that was with the
+board when it was retired still acks.
 
 **D2 — The tap means "full to the top".** `POST /refill` is unchanged on the wire
 (`refill=<ts>`). The row gains `float_ok INTEGER`: `status.float_ok` at the tap, NULL when the
@@ -50,7 +51,10 @@ previous `float_ok`. When it was 1 and this report says 0, and a latest refill `
 after the first crossing (`INSERT OR IGNORE`). Zero pumped stores nothing: a tank drained by
 something the meter never saw (evaporation, a tap that was not a fill) is not a measurement.
 Trap: `status` rows exist only once a controller has reported; a first report has no previous
-`float_ok` and closes nothing.
+`float_ok` and closes nothing. Trap: a report that omits `float=` blanks `status.float_ok`
+(its vanishing is its own alarm), so the edge is read off `status.float_word`, the board's
+last word, kept across such a report — in the `CREATE` and in `ADDED_COLUMNS`, carried from
+`float_ok` at the upgrade so a tank at full through it still closes its sample.
 
 **D5 — The size.** `tank_ml(con, controller) -> int | None`: the median of the last
 `TANK_MEDIAN_OF` samples by `ts`, `None` while fewer than `TANK_SAMPLES_TO_ARM` exist. Median,

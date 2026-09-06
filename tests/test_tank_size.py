@@ -178,7 +178,8 @@ def test_the_float_going_empty_closes_one_sample_per_tap(client, db):
     assert samples(db) == [(taps(db)[0], 170)]
     report(client, "c=0 ch0=1 float=0")  # still empty: nothing new
     report(client, "c=0 ch0=1 float=1")  # bouncing at the line, no tap
-    report(client, "c=0 ch0=1 float=0")
+    dose(client, 100, flow=100)  # and watered while it says full
+    report(client, "c=0 ch0=1 float=0")  # the first crossing stands, not 270
     assert samples(db) == [(taps(db)[0], 170)]
     # A tap, nothing pumped, and the float goes empty: not a measurement.
     report(client, "c=0 ch0=1 float=1")
@@ -209,6 +210,47 @@ def test_a_first_report_has_no_previous_float_and_closes_nothing(client, db):
     report(client, "c=0 ch0=1 float=1")
     report(client, "c=0 ch0=1 float=0")
     assert samples(db) == []
+
+
+def test_a_report_without_float_hides_no_edge(client, db):
+    report(client, "c=0 ch0=1 float=1")
+    tap(client, db)
+    dose(client, 100, flow=90)
+    report(client, "c=0 ch0=1")  # says nothing about the float
+    assert run_sql(db, "SELECT float_ok, float_word FROM status") == [(None, 1)]
+    report(client, "c=0 ch0=1 float=0")  # full, silent, empty: an edge
+    assert samples(db) == [(taps(db)[0], 90)]
+    # Empty, silent, empty is not one, whatever the counter says.
+    since = tap(client, db)
+    run_sql(
+        db,
+        "INSERT INTO commands (created_ts, controller, kind, outlet, ml, cap_s, "
+        "state, source, sent_ts, acked_ts, flow_ml) "
+        "VALUES (?, 0, 'water', 3, 100, 30, 'acked', 'manual', ?, ?, 100)",
+        since + 1, since + 1, since + 2,
+    )
+    report(client, "c=0 ch0=1")
+    report(client, "c=0 ch0=1 float=0")
+    first, _second = taps(db)
+    assert samples(db) == [(first, 90)]
+
+
+def test_a_retired_board_learns_nothing(client, db):
+    report(client, "c=0 ch0=1 float=1")
+    tap(client, db)
+    cmd_id = hand(client, 100)  # with the board when it is retired
+    assert post(client, "/controller", "c=0 retired=1").status_code == 200
+    ack(client, cmd_id, flow=90, float_ok=0)  # the ack lands, the float drops
+    assert health(client)["pumped_ml"] == 90  # acked water is a fact
+    assert samples(db) == []  # a measurement is learning
+    report(client, "c=0 ch0=1 float=1")
+    report(client, "c=0 ch0=1 float=0")
+    assert samples(db) == []
+    # Back in service, the same tap and the same water close the sample.
+    assert post(client, "/controller", "c=0 retired=0").status_code == 200
+    report(client, "c=0 ch0=1 float=1")
+    report(client, "c=0 ch0=1 float=0")
+    assert samples(db) == [(taps(db)[0], 90)]
 
 
 # --------------------------------------------------------------------------- #
@@ -289,3 +331,34 @@ def test_an_existing_database_gains_the_snapshot_column_at_startup(db):
     report(client, "c=0 ch0=1 float=1")
     assert post(client, "/refill", "c=0").status_code == 200
     assert refills(db) == [(None,), (1,)]  # the old row judges nothing
+
+
+def test_an_existing_database_carries_the_floats_last_word_at_startup(db):
+    # The 0.18.0 shape of status: float_ok, no float_word. A tank sitting
+    # at full through the upgrade closes its sample on the first empty.
+    with sqlite3.connect(db) as con:
+        con.executescript(
+            """
+            CREATE TABLE status (
+              controller INTEGER PRIMARY KEY, ts INTEGER NOT NULL, float_ok INTEGER,
+              float_since INTEGER, pos TEXT, pos_since INTEGER, float_seen INTEGER,
+              pos_seen INTEGER, float_bad INTEGER, float_bad_prev INTEGER,
+              pos_bad INTEGER, pos_bad_prev INTEGER, err TEXT, err_ts INTEGER,
+              latched_ts INTEGER, latch_reason TEXT, pos_ok_seen INTEGER);
+            INSERT INTO status (controller, ts, float_ok, float_since) VALUES (0, 5, 1, 5);
+            CREATE TABLE refills (ts INTEGER NOT NULL, controller INTEGER NOT NULL);
+            INSERT INTO refills VALUES (10, 0);
+            """
+        )
+    client = TestClient(
+        create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900)
+    )
+    assert run_sql(db, "SELECT float_word FROM status") == [(1,)]
+    run_sql(
+        db,
+        "INSERT INTO commands (created_ts, controller, kind, outlet, ml, cap_s, "
+        "state, source, sent_ts, acked_ts, flow_ml) "
+        "VALUES (11, 0, 'water', 3, 100, 30, 'acked', 'manual', 11, 12, 100)",
+    )
+    report(client, "c=0 ch0=1 float=0")
+    assert samples(db) == [(10, 100)]
