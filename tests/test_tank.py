@@ -723,6 +723,35 @@ def test_retiring_a_board_clears_its_over_page(app, client, db, sent):
     assert health(client)["over"] == 1  # the page went, the fact stays
     tick(app)
     assert keys(sent) == ["over:0"]  # neither cleared aloud nor raised again
+    # Past the floor a cleared page may sound again; a retired board's does
+    # not, however long it stays over. Back in service, it is heard at once.
+    run_sql(
+        db,
+        "UPDATE alerts SET cleared_ts = cleared_ts - ? WHERE key = 'over:0'",
+        REALERT_FLOOR_S,
+    )
+    tick(app)
+    assert keys(sent) == ["over:0"]
+    post(client, "/controller", "c=0 retired=0")
+    tick(app)
+    assert keys(sent) == ["over:0", "over:0"]
+    assert sent[-1].priority == "high"
+
+
+def test_a_tank_still_learning_is_never_over(app, client, db, sent):
+    report(client, "c=0 ch0=1 float=1 pos=ok")
+    tap(client, db)
+    dose(client, 200, float_ok=0)  # one sample: the size is not known yet
+    age(db, FLAP_WINDOW_S + 1)
+    report(client, "c=0 ch0=1 float=1 pos=ok")
+    tap(client, db)
+    dose(client, 250)
+    dose(client, 250)  # 500 since the tap, past any size, the float at full
+    entry = health(client)
+    assert entry["tank_samples"] == 1 and entry["tank_ml"] is None
+    assert entry["pumped_ml"] == 500 and entry["over"] == 0
+    tick(app)
+    assert keys(sent) == []
 
 
 def test_a_float_still_empty_its_minutes_after_the_tap_pages(app, client, db, sent):
@@ -810,8 +839,9 @@ def test_a_stale_page_from_the_clock_rule_clears_when_the_float_says_full(
 
 def test_tank_state_and_float_dead_read_the_size_the_tap_and_the_float(app, db):
     with sqlite3.connect(db) as con:
-        state = lambda: butler.tank_state(con, 0)  # noqa: E731
-        dead = lambda now: butler.float_dead(con, 0, now)  # noqa: E731
+        tapped = lambda: butler.latest_refill(con, 0)  # noqa: E731
+        state = lambda: butler.tank_state(con, 0, tapped())  # noqa: E731
+        dead = lambda now: butler.float_dead(con, 0, tapped(), now)  # noqa: E731
 
         def pumped(ml, sent_ts):
             con.execute(
@@ -843,6 +873,8 @@ def test_tank_state_and_float_dead_read_the_size_the_tap_and_the_float(app, db):
         con.execute("UPDATE status SET float_ok = 1")
         con.execute("INSERT INTO refills (ts, controller, float_ok) VALUES (2000, 0, 1)")
         assert state() == "ok"  # the counter restarts at the tap
+        # Judged from the tap it is handed, never one it reads for itself.
+        assert butler.tank_state(con, 0, (1000, 1)) == ("over", 221, 200, 1000)
         assert dead(3000) is None  # the float said full at the tap
         con.execute("UPDATE refills SET float_ok = 0 WHERE ts = 2000")
         con.execute("UPDATE status SET float_ok = 0, float_since = 2000")
@@ -854,5 +886,6 @@ def test_tank_state_and_float_dead_read_the_size_the_tap_and_the_float(app, db):
         assert dead(3000) is None  # it says full
         con.execute("UPDATE status SET float_ok = 0")
         assert dead(3000) == 2000
+        assert butler.float_dead(con, 0, (2500, 0), 3000) == 2500  # the tap handed
         con.execute("UPDATE refills SET float_ok = NULL WHERE ts = 2000")
         assert dead(3000) is None  # a tap that never saw the float

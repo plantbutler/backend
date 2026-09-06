@@ -868,40 +868,59 @@ def tank_ml(con: sqlite3.Connection, controller: int) -> int | None:
     return last[mid] if len(last) % 2 else (last[mid - 1] + last[mid]) // 2
 
 
+def is_over(tank: int | None, pumped: int, float_ok: int | None) -> bool:
+    """D6's judgement on its three numbers: more than the tank holds, plus
+    TANK_TOLERANCE_PCT, pumped since the latest tap while the float still
+    says full; never while the size is unknown. The one expression of it,
+    so the ticker, the rules and /health cannot disagree."""
+    return (
+        tank is not None
+        and pumped > tank * (100 + TANK_TOLERANCE_PCT) // 100
+        and float_ok == 1
+    )
+
+
 def tank_state(
-    con: sqlite3.Connection, controller: int
+    con: sqlite3.Connection,
+    controller: int,
+    tapped: tuple[int, int | None] | None,
 ) -> str | tuple[str, int, int, int]:
     """The float judged against the tank's size: "unknown" while the size
     is, or nobody has tapped; ("over", pumped, tank, refill_ts) when more
     than the tank holds, plus TANK_TOLERANCE_PCT, has been pumped since the
     latest tap and the float still says full — presumed stuck at full, the
     dangerous way; "ok" otherwise, since a float that reads empty is a
-    float that works, and the rules refuse on it already. One reader for
-    the ticker, the rules and /health, so the page, the refusal and the
-    phone cannot disagree (spec D6)."""
+    float that works, and the rules refuse on it already. `tapped` is
+    latest_refill's answer, read once by the caller: the ticker hands the
+    same tap to this and to float_dead (spec D6)."""
+    if tapped is None:
+        return "unknown"
     tank = tank_ml(con, controller)
-    tapped = latest_refill(con, controller)
-    if tank is None or tapped is None:
+    if tank is None:
         return "unknown"
     pumped = pumped_since(con, controller, tapped[0])
     row = con.execute(
         "SELECT float_ok FROM status WHERE controller = ?", (controller,)
     ).fetchone()
-    if pumped > tank * (100 + TANK_TOLERANCE_PCT) // 100 and row and row[0] == 1:
+    if is_over(tank, pumped, row[0] if row else None):
         return ("over", pumped, tank, tapped[0])
     return "ok"
 
 
-def float_dead(con: sqlite3.Connection, controller: int, now: int) -> int | None:
+def float_dead(
+    con: sqlite3.Connection,
+    controller: int,
+    tapped: tuple[int, int | None] | None,
+    now: int,
+) -> int | None:
     """The tap a float is presumed stuck at empty since, or None: the latest
-    refill was tapped with the float saying empty, it has had PERSIST_S to
-    settle, and it has said empty since before the tap. That last clause is
-    what keeps a float that rose after the tap and, days later, fell again
-    for real out of this: its `float_since` is after the tap. A tap that
-    never saw the float (NULL) judges nothing. Harmless, unlike its twin
-    above: the rules are dry on empty already, so this is a page and
-    nothing else (spec D7)."""
-    tapped = latest_refill(con, controller)
+    refill (`tapped`, latest_refill's answer, read by the caller) was tapped
+    with the float saying empty, it has had PERSIST_S to settle, and it has
+    said empty since before the tap. That last clause is what keeps a float
+    that rose after the tap and, days later, fell again for real out of
+    this: its `float_since` is after the tap. A tap that never saw the
+    float (NULL) judges nothing. Harmless, unlike its twin above: the rules
+    are dry on empty already, so this is a page and nothing else (spec D7)."""
     if tapped is None or tapped[1] != 0 or now - tapped[0] < PERSIST_S:
         return None
     row = con.execute(
@@ -2488,7 +2507,8 @@ def create_app(
             return  # a retired board keeps its readings and never waters
         if latch_of(con, r.controller) is not None:
             return  # the durable half of the board's latch: dry until a human resumes
-        if isinstance(tank_state(con, r.controller), tuple):
+        tapped = latest_refill(con, r.controller)
+        if isinstance(tank_state(con, r.controller, tapped), tuple):
             return  # over: more than the tank holds and the float still says full
         if r.float_ok != 1 or r.pos != "ok":
             return  # no reservoir, no known position, no report field: dry
@@ -3723,8 +3743,9 @@ def create_app(
         ):
             if controller in retired:
                 continue
+            tapped = latest_refill(con, controller)  # once, for both rules
             key = f"over:{controller}"
-            state = tank_state(con, controller)
+            state = tank_state(con, controller, tapped)
             if isinstance(state, tuple):
                 _, pumped, tank, refill_ts = state
                 if not raised(key) and floor_ok(key):
@@ -3753,8 +3774,8 @@ def create_app(
                     )
                 )
             key = f"stale:{controller}"
-            tapped = float_dead(con, controller, now)
-            if tapped is not None:
+            dead = float_dead(con, controller, tapped, now)
+            if dead is not None:
                 if not raised(key) and floor_ok(key):
                     found.append(
                         Alert(
@@ -3762,8 +3783,8 @@ def create_app(
                             "high",
                             "warning",
                             f"the float on board {controller} still says empty "
-                            f"{(now - tapped) // 60} min after the refill at "
-                            f"{hhmm(tapped)}: presumed stuck at empty, look at "
+                            f"{(now - dead) // 60} min after the refill at "
+                            f"{hhmm(dead)}: presumed stuck at empty, look at "
                             "the magnet",
                             mark(key),
                         )
@@ -4817,15 +4838,19 @@ def create_app(
                     e = known.setdefault(controller, entry(controller))
                     e["last_refill"] = ts
                     e["pumped_ml"] = pumped_since(con, controller, ts)
-                    e["over"] = int(
-                        isinstance(tank_state(con, controller), tuple)
-                    )
                 for controller, n in con.execute(
                     "SELECT controller, COUNT(*) FROM tank_samples GROUP BY controller"
                 ):
                     e = known.setdefault(controller, entry(controller))
                     e["tank_samples"] = n
                     e["tank_ml"] = tank_ml(con, controller)
+                for e in known.values():
+                    # Judged on the size, the counter and the float the
+                    # entry already carries — the three numbers tank_state
+                    # reads, through the same predicate, read once.
+                    e["over"] = int(
+                        is_over(e["tank_ml"], e["pumped_ml"], e["float"])
+                    )
                 raised = [
                     {"key": key, "raised_ts": ts}
                     for key, ts in con.execute(

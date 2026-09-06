@@ -61,11 +61,14 @@ last word, kept across such a report — in the `CREATE` and in `ADDED_COLUMNS`,
 not mean: one tap that was not a fill must not move the number by much. The median of two is
 their mean; that is fine.
 
-**D6 — Stuck at full, the dangerous one.** `tank_state(con, controller) -> "unknown" | "ok" |
-tuple`: `"unknown"` while `tank_ml` is None or there is no refill; `("over", pumped, tank,
+**D6 — Stuck at full, the dangerous one.** `tank_state(con, controller, tapped) -> "unknown" |
+"ok" | tuple`: `"unknown"` while `tank_ml` is None or there is no refill; `("over", pumped, tank,
 refill_ts)` when `pumped_since(refill_ts) > tank * (100 + TANK_TOLERANCE_PCT) // 100` **and**
 `status.float_ok == 1`; `"ok"` otherwise (a float that reads 0 is a float that works, and
-`float=0` already refuses). `water_rules` skips the controller on `"over"` (dry, decision #5),
+`float=0` already refuses). `tapped` is `latest_refill`'s answer, read once by the caller and
+handed to D6 and D7 alike; the comparison itself is one predicate, `is_over(tank, pumped,
+float_ok)`, which `/health` applies to the three numbers it already carries rather than reading
+them again. `water_rules` skips the controller on `"over"` (dry, decision #5),
 after the retired and latch checks. The ticker raises `over:<c>` (high, with `floor_ok`): "board N
 pumped X ml since the refill at HH:MM, more than its tank holds (Y ml), and the float still says
 full: presumed stuck, the rules will not water until the next refill". It clears when raised and
@@ -74,13 +77,14 @@ the clear: the counter restarts at it, and a person who tapped looked at the tan
 flow. `POST /command` is **not** gated, as D6 of the old spec chose: a human is at the phone, the
 board's own float check still runs, and the no-flow abort is beneath both.
 
-**D7 — Stuck at empty, the harmless one.** `float_dead(con, controller, now) -> int | None`: the
-latest refill has `float_ok = 0`, `now - r.ts >= PERSIST_S`, and `status` still says `float_ok =
-0` with `float_since <= r.ts` → `r.ts`. Trap that the `float_since` clause exists for: a float
-that went 0 → 1 after the tap and, days later, legitimately back to 0 must not read as dead; its
-`float_since` is after the tap. The ticker raises `stale:<c>` (high, with `floor_ok`; the key is
-kept so a `stale:` standing from 0.18.0 clears through the same path): "the float on board N
-still says empty M min after the refill at HH:MM: presumed stuck at empty, look at the magnet".
+**D7 — Stuck at empty, the harmless one.** `float_dead(con, controller, tapped, now) -> int |
+None`: the latest refill `r` (`tapped`, as in D6) has `float_ok = 0`, `now - r.ts >= PERSIST_S`,
+and `status` still says `float_ok = 0` with `float_since <= r.ts` → `r.ts`. Trap that the
+`float_since` clause exists for: a float that went 0 → 1 after the tap and, days later,
+legitimately back to 0 must not read as dead; its `float_since` is after the tap. The ticker
+raises `stale:<c>` (high, with `floor_ok`; the key is kept so a `stale:` standing from 0.18.0
+clears through the same path): "the float on board N still says empty M min after the refill at
+HH:MM: presumed stuck at empty, look at the magnet".
 It clears when raised and `status.float_ok == 1`: "the float on board N moved". Page only: the
 rules are already dry on `float=0`, and this rule is not in `water_rules`. A refill with
 `float_ok` NULL judges nothing.
