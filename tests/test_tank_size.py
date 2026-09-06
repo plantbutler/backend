@@ -498,6 +498,22 @@ def test_a_sample_off_the_size_it_knew_is_a_warning(app, client, db, sent):
     assert len(keys(sent)) == 5
 
 
+def test_the_count_is_the_samples_the_size_rests_on(app, client, db, sent):
+    """The size is the median of the last five, so the count beside it
+    stops at five: past that, the oldest run has left the number, however
+    many the board has closed in its life (spec D5, D8)."""
+    report(client, "c=0 ch0=1 float=1")
+    for ml in (1000, 200, 200, 200, 200):
+        run_the_tank_down(app, client, db, ml)
+    assert sent[-1].message.endswith("(tank 200 ml over 5 samples)")
+    since = run_the_tank_down(app, client, db, 200)  # the first is out
+    assert health(client)["tank_samples"] == 6
+    assert sent[-1].message == (
+        f"board 0 ran its tank down: 200 ml since the refill at "
+        f"{butler.hhmm(since)} (tank 200 ml over 5 samples)"
+    )
+
+
 def test_the_announcements_never_reach_the_app_or_the_up_count(
     app, client, db, sent
 ):

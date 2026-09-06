@@ -3850,6 +3850,11 @@ def create_app(
                 )
                 continue
             size = tank_median(history)
+            # The count beside the size is the samples it rests on: the
+            # median's window, not every run the board has closed in its
+            # life, or the sixth run would claim a first that has left
+            # the number. Learning, under two, they are the same count.
+            behind = min(len(history), TANK_MEDIAN_OF)
             found.append(
                 Alert(
                     key,
@@ -3858,9 +3863,9 @@ def create_app(
                     f"board {controller} ran its tank down: {ml} ml since the "
                     f"refill at {hhmm(refill_ts)} "
                     + (
-                        f"(tank {size} ml over {len(history)} samples)"
+                        f"(tank {size} ml over {behind} samples)"
                         if size is not None
-                        else f"(tank size learning, {len(history)} of "
+                        else f"(tank size learning, {behind} of "
                         f"{TANK_SAMPLES_TO_ARM})"
                     ),
                     mark(key),
