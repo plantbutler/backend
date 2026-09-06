@@ -254,11 +254,15 @@ later; a learning proposal waiting for approval (one nudge per hose per day); a 
 stopped itself — `ch207=1`, the float said full and the meter saw nothing, or `err=` turning to
 `resetmid`, it reset with the pump running (`err=` is the board's sticky last error, so only the
 change counts) — which latches the butler too: no rule waters it and `POST /command` refuses a
-dose until `POST /resume`, and that one pages high every time, floor or no floor; a float that
-never moved across a refill — the board's `ch204` says it last moved more than ten minutes before
-the refill you recorded (you pour first and tap second), and the three minutes are up — presumed
-stuck, so the rules will not water that board until it moves, and tapping "refilled" again does
-not count as moving (a dose typed at the phone still goes: the board's own float check runs). A
+dose until `POST /resume`, and that one pages high every time, floor or no floor; a float
+presumed stuck — still saying full after more than the tank holds (plus a tenth) has been pumped
+since the refill you recorded, so the rules will not water that board until you tap "refilled"
+again (a dose typed at the phone still goes: the board's own float check runs), or still saying
+empty three minutes after a tap made with it empty, a page and nothing more, since the rules are
+dry on empty already; and each time the float closes a measurement of the tank — what the meter
+counted between your tap and the float going empty, the tank's size being the median of the last
+five such runs (known after two), and a run more than a quarter off what it knew is a warning: a
+different tank, a clogging meter, or a tap that was not a fill. A
 cleared condition re-raises at most hourly and correlated dose failures page once per controller
 per hour — a muted phone is worse than a late alert — and a dose that worked is recorded
 silently: this tells you when it's *wrong*.

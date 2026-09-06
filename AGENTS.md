@@ -71,7 +71,8 @@ watering.
   `POST /approve` (proposed -> queued, slot permitting), `POST /verdict` (ok | too_much |
   too_little per executed dose), `GET /health` (count, last ts, the default interval, per-controller
   heartbeat/knob/open command/safety fields — since 0.18.0 also `err`, `err_ts`, `pos_ok_seen`,
-  `retired`, `latched` (`{since, reason}` or null) and `last_refill` — raised alerts), `GET /hello` (`butler=<VERSION>`, or
+  `retired`, `latched` (`{since, reason}` or null) and `last_refill`, since 0.19.0 `tank_ml`,
+  `tank_samples`, `pumped_ml` and `over` — raised alerts), `GET /hello` (`butler=<VERSION>`, or
   401 — the one gated route that neither writes nor reads the database, so a phone being set up can
   tell a wrong address from a wrong token, and a butler whose volume came unmounted can still say
   the token was wrong. `VERSION` lives in butler.py because the container installs no package; a
@@ -137,18 +138,30 @@ watering.
   `POST /command water=` answers 409, the queued dose expires, and `latch:<c>` pages high without
   the re-alert floor — until `POST /resume`, the human's half, which the app offers beside the
   words "type `clear contra` on the board". The float going empty does not latch: the rules
-  already refuse on it. `POST /refill` records a human refill; `float_state()` — one reader for
-  the ticker and the rules — answers none, moved, waiting or frozen from the latest `ch204` and
-  the latest refill: moved at or after the refill, or within `REFILL_SLACK_S` (ten minutes)
-  before the tap, is *moved* (you pour first and tap second); not moved and inside `PERSIST_S` of
-  the tap is *waiting*; after that, *frozen*. `stale:<c>` pages on frozen and clears on moved
-  only (a second tap is waiting, not moved), the rules stay dry on frozen, manual water is not
-  gated. `POST /controller c= retired=1` retires a board: reports land (the latch row included —
+  already refuse on it. `POST /refill` records a human refill, and the tap means "full to the
+  top": the row snapshots `status.float_ok`, and everything the tank knows counts from the latest
+  tap (`latest_refill()`, read once per board and handed to the two rules of the next bullet).
+  `POST /controller c= retired=1` retires a board: reports land (the latch row included —
   it comes back with the board), nothing pages or waters — the dose judgement included — and
   whatever page stood for it is cleared, since no rule would ever clear it now. `MAX_DOSE_ML` is
   250, the board's own ceiling, at `/command` and at pot save. The daily cap charges acked water
   only (a lost response is likelier than a lost ack; the cooldown still counts the handed dose).
   `pos:<c>` pages only once a board has ever said `pos=ok`.
+- **The tank has a size (0.19.0).** `pumped_since()` is the acked water handed out after the tap,
+  the daily cap's own expression. The report path closes a `tank_samples` row when the board's
+  word on the float (`status.float_word`, kept across a report that omits `float=`) goes 1 → 0
+  with water on the counter — one per tap, `INSERT OR IGNORE`, nothing on zero pumped, nothing for
+  a retired board. `tank_ml()` is the median of the last `TANK_MEDIAN_OF` (5) samples, `None`
+  under `TANK_SAMPLES_TO_ARM` (2). The float is judged against that volume, never a clock:
+  `tank_state()` answers "over" when more than the size plus `TANK_TOLERANCE_PCT` (10) has been
+  pumped since the tap and the float still says 1 — `water_rules` goes dry, `over:<c>` pages high,
+  and the next tap is the clear; `POST /command water=` is not gated. `float_dead()` — a tap made
+  with the float at 0, `PERSIST_S` gone, and still 0 since before the tap — pages `stale:<c>` and
+  nothing else, cleared when the float reads 1 (the key is the 0.18.0 clock rule's, so a page
+  standing from it clears through the same path). Every sample is announced once as
+  `tank:<c>:<refill_ts>`, marked like `dose:<id>` and left out of `/health` and the up-probe count
+  like it, as a warning when it is more than `TANK_DRIFT_PCT` (25) off the median of the samples
+  before it. `ch204` still lands and nothing reads it.
 - The controller is an INTEGER on the wire and in every column, 0..255 (`MAX_CONTROLLER`), since
   0.17.0. It was free text, which made `c=` the one field a typo could turn into a second garden:
   a report from `bench1 ` opened its own controller row, heartbeat and alerts and nothing said the
