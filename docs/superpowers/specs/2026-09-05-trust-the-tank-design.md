@@ -66,6 +66,8 @@ tells the operator to type `clear contra` on the board as well — the backend c
 **D5 — `POST /refill`**, body `c=<controller>`, token. Inserts `refills(now, c)`; answers
 `refill=<ts>`. `/health` carries `last_refill` per controller.
 
+*Superseded 2026-09-06 by `2026-09-06-tank-size-design.md`: the float is judged against the tank's measured volume, not against a clock after a tap.*
+
 **D6 — The stuck-float rule.** One helper, `float_state(con, controller, now)`, used by the
 ticker and by `water_rules` so the two cannot disagree. Take the controller's latest `ch204`
 reading `(ts, v)` and its latest refill `r`; the float last moved at `moved = ts − v`. Four
