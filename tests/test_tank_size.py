@@ -1216,7 +1216,7 @@ def test_the_carried_clocks_come_only_with_the_word(db):
     neither is a clock for it — a clock without a word would read as a
     float that has not moved since before any tap. A word of empty brings
     its clock and no rise (float_since is its fall); a word of full brings
-    both. The firm word is the word, under the same gate (spec D3,
+    both. The firm word is the word, wherever there is one (spec D3,
     amended, then thrice)."""
     with sqlite3.connect(db) as con:
         con.executescript(
@@ -1236,6 +1236,28 @@ def test_the_carried_clocks_come_only_with_the_word(db):
         (1, 0, 6, None, 0),
         (2, 1, 5, 5, 1),
     ]
+
+
+def test_the_firm_word_is_carried_from_the_word_alone(db):
+    """The firm word's carry reads the word and nothing else. On the
+    0.18.0 shape the word is carried first, from float_ok, so a second
+    gate on float_ok let through exactly the rows the word had and told
+    nothing apart; this shape does: a word that stands under a blank
+    float_ok — the last report omitted float= — carries its firm word
+    all the same, and no word carries none."""
+    with sqlite3.connect(db) as con:
+        con.executescript(
+            OLD_STATUS
+            + """
+            ALTER TABLE status ADD COLUMN float_word INTEGER;
+            INSERT INTO status (controller, ts, float_ok, float_since, float_word)
+            VALUES (0, 9, NULL, 7, 1), (1, 9, NULL, 7, NULL);
+            """
+        )
+    TestClient(create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900))
+    assert run_sql(
+        db, "SELECT controller, float_word, float_firm FROM status ORDER BY controller"
+    ) == [(0, 1, 1), (1, None, None)]
 
 
 def test_a_tank_already_empty_at_the_upgrade_starts_at_its_next_tap(db):

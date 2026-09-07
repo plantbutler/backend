@@ -8,6 +8,7 @@ about the token, and only the user can tell which mistake they made.
 """
 
 import pathlib
+import subprocess
 import tomllib
 
 import pytest
@@ -78,3 +79,19 @@ def test_the_version_matches_pyproject():
     root = pathlib.Path(__file__).resolve().parent.parent
     declared = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
     assert butler.VERSION == declared
+
+
+def test_a_coverage_run_leaves_nothing_for_git_to_add():
+    """coverage.py writes `.coverage` beside pyproject: a SQLite file with
+    this checkout's absolute paths in it, rewritten on every run. One was
+    committed once and dirtied the tree after every run since. Untracked
+    and ignored, a `git add -A` cannot bring it back."""
+    root = pathlib.Path(__file__).resolve().parent.parent
+
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True)
+
+    if git("rev-parse", "--is-inside-work-tree").stdout.strip() != "true":
+        pytest.skip("not a git checkout")
+    assert git("ls-files", ".coverage").stdout == ""
+    assert git("check-ignore", "-q", ".coverage").returncode == 0

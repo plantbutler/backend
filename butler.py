@@ -366,8 +366,10 @@ ADDED_COLUMNS = (
     # without its word would read as a float that has not moved since
     # before any tap. The rise comes only with a word of full;
     # float_since under a word of empty is its fall. The firm word is
-    # the word, under the same gate: the upgrade has one report to go on
-    # and takes it at its word, rather than have every board wait a
+    # the word wherever there is one — the carry's own `source IS NOT
+    # NULL` is its whole gate; a second one on float_ok let through
+    # exactly the rows the word's had — and the upgrade has one report to
+    # go on and takes it at its word, rather than have every board wait a
     # report to be believed.
     Added("refills", "float_ok", "INTEGER"),
     Added("refills", "drop_ts", "INTEGER"),
@@ -377,7 +379,7 @@ ADDED_COLUMNS = (
     ),
     Added("status", "float_rise", "INTEGER", "float_since", gate="float_ok = 1"),
     Added("status", "contra", "INTEGER NOT NULL DEFAULT 0"),
-    Added("status", "float_firm", "INTEGER", "float_word", gate="float_ok IS NOT NULL"),
+    Added("status", "float_firm", "INTEGER", "float_word"),
     Added("status", "float_forced", "INTEGER NOT NULL DEFAULT 0"),
 )
 
@@ -861,13 +863,20 @@ def latch_reason(r: Report, prev_err: str | None) -> str | None:
     on every report until a later dose ends with something else and never
     touched by the console, so `err=contra` is not a trigger — it would
     re-latch a resumed board forever — and resetmid is an edge: the value
-    turning into it in this report. The float going empty is deliberately
-    not here either: the rules already refuse on float=0, and a refill is
-    the human event for that (spec D2)."""
-    if r.channels.get(CONTRA_CHANNEL) == 1:
-        return "contra"
+    turning into it in this report. Both on one report — the contra lives
+    in .noinit through a reset, so a board that resets mid-dose under it
+    says so — name the edge: it is seen this once (the upsert makes
+    status.err resetmid whatever is named here), while the level repeats
+    on every report until `clear contra` is typed, so after `dry off` and
+    the resume the contra re-latches with its own words. Named the other
+    way round, the contra hid the reset for ever, and `clear contra` was
+    the only step a person was ever told (spec D12). The float going empty
+    is deliberately not here either: the rules already refuse on float=0,
+    and a refill is the human event for that (spec D2)."""
     if r.err == "resetmid" and prev_err != "resetmid":
         return "resetmid"
+    if r.channels.get(CONTRA_CHANNEL) == 1:
+        return "contra"
     return None
 
 

@@ -109,6 +109,28 @@ def test_a_lost_response_expires_the_command_it_carried(client, db):
     assert states(db) == {1: "expired"}
 
 
+def test_a_retry_of_the_acking_report_is_heard_once(client, db):
+    # The board keeps the body when the response is lost, the ack with
+    # it. The retry is the same report, not the next: answered 200, its
+    # readings stored once, and the command it acked stays acked with the
+    # flow it carried — stamped once, and not expired as one the board
+    # never answered for.
+    command(client, "c=0 water=3 ml=50 cap_s=30")
+    report(client, "c=0 t=1000 ch0=8000")
+    report(client, "c=0 t=61000 ch0=8000 ack=1 flow_ml=48")
+    with sqlite3.connect(db) as con:  # so a second stamp would differ
+        con.execute("UPDATE commands SET acked_ts = acked_ts - 60")
+        stamp = con.execute("SELECT acked_ts FROM commands WHERE id = 1").fetchone()[0]
+
+    retry = report(client, "c=0 t=61000 ch0=8000 ack=1 flow_ml=48")
+    assert retry.status_code == 200 and retry.text == "next=60\n"
+    with sqlite3.connect(db) as con:
+        assert con.execute(
+            "SELECT state, acked_ts, flow_ml FROM commands WHERE id = 1"
+        ).fetchone() == ("acked", stamp, 48)
+        assert con.execute("SELECT COUNT(*) FROM readings").fetchone()[0] == 2
+
+
 def test_a_late_ack_for_an_expired_command_changes_nothing(client, db):
     command(client, "c=0 water=3 ml=50 cap_s=30")
     report(client, "c=0 t=1000 ch0=8000")

@@ -532,6 +532,41 @@ def test_the_latch_keeps_its_first_stamp_and_names_its_newest_reason(client, db)
     assert fresh["reason"] == "resetmid" and fresh["since"] > stamp
 
 
+def test_a_reset_under_a_standing_contra_names_the_reset(client, db):
+    # The contra latch lives in .noinit on the board and outlives a reset,
+    # so a board that resets mid-dose while it stands says both on one
+    # report: ch207=1 still, and err= turning to resetmid. The reset is
+    # the one named: the edge is seen this once — status.err is resetmid
+    # from here on whatever is named — while the contra repeats on every
+    # report until `clear contra`, so after `dry off` and the resume it
+    # re-latches with its own words. Named the other way round, the reset
+    # hid for ever behind a step already taken (spec D12).
+    report(client, "c=0 ch0=1 float=0 pos=ok ch207=1")
+    run_sql(db, "UPDATE status SET latched_ts = latched_ts - 60")
+    stamp = health(client)["latched"]["since"]
+    report(client, "c=0 ch0=1 float=0 pos=ok ch207=1 err=resetmid")
+    assert health(client)["latched"] == {"since": stamp, "reason": "resetmid"}
+    answer = post(client, "/command", "c=0 water=3 ml=50")
+    assert answer.status_code == 409
+    assert answer.text.rstrip().endswith(
+        "check the tank, type dry off on the board, then resume"
+    )
+    # `dry off` typed and resumed; the contra still stands on the board,
+    # and it is the next latch, with its own step, then `clear contra`.
+    assert post(client, "/resume", "c=0").text == "resumed=0\n"
+    report(client, "c=0 ch0=1 float=0 pos=ok ch207=1 err=resetmid")
+    again = health(client)["latched"]
+    assert again["reason"] == "contra" and again["since"] > stamp
+    answer = post(client, "/command", "c=0 water=3 ml=50")
+    assert answer.status_code == 409
+    assert answer.text.rstrip().endswith(
+        "check the tank, type clear contra on the board, then resume"
+    )
+    assert post(client, "/resume", "c=0").text == "resumed=0\n"
+    report(client, "c=0 ch0=1 float=1 pos=ok err=resetmid")  # ch207 gone
+    assert health(client)["latched"] is None
+
+
 def test_a_latch_expires_what_was_waiting_and_refuses_new_water(client, db):
     assert post(client, "/command", "c=0 water=3 ml=50").status_code == 200
     report(client, "c=0 ch0=1 float=1 pos=ok ch207=1 ack=99")  # the queued one is NOT handed
