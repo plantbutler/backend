@@ -421,6 +421,8 @@ def test_one_sighting_of_empty_between_two_of_full_moves_nothing(client, db):
     report(client, "c=0 ch0=1")  # a report that says nothing sits between
     report(client, "c=0 ch0=1 float=1")  # and full again: no rise
     assert firm(db) == 1 and rise(db) == risen
+    report(client, "c=0 ch0=1 float=1")  # the next agrees: no rise either
+    assert firm(db) == 1 and rise(db) == risen
     assert origin(db) == (since, "tap") and health(client)["pumped_ml"] == 90
     dose(client, 50, flow=50)
     answer = post(client, "/command", "c=0 water=3 ml=40")
@@ -444,22 +446,70 @@ def test_the_firm_words_clocks_are_where_the_word_moved(client, db):
     clock set at the confirmation would put that dose before the rise and
     off the counter. The tests around this one confirm inside a second,
     where the two are one number; here a beat sits between, on the drop
-    and on the rise (spec D3, D4, thrice)."""
+    and on the rise. And one sighting moves neither clock: the rise the
+    tap found stands until the next report agrees, and a rise stamped at
+    the sighting would be the fall's clock, not the word's (spec D3, D4,
+    thrice)."""
     full(client)
-    tap(client, db)
+    tap(client, db)  # in the rise's second
     report(client, "c=0 ch0=1 float=0")  # the word fell here...
     age(db, 30)
     fell = word_since(db)
-    assert firm(db) == 1 and drops(db) == [None]
+    assert firm(db) == 1 and drops(db) == [None] and rise(db) == taps(db)[0]
     report(client, "c=0 ch0=1 float=0")  # ...and is confirmed a beat later
-    assert firm(db) == 0 and drops(db) == [fell]
+    assert firm(db) == 0 and drops(db) == [fell] and rise(db) == taps(db)[0]
     report(client, "c=0 ch0=1 float=1")  # rose here...
-    assert firm(db) == 0  # one sighting moves nothing
     age(db, 30)
     rose = word_since(db)
+    assert firm(db) == 0 and rise(db) == taps(db)[0]  # one sighting moves nothing
+    assert origin(db) == (taps(db)[0], "tap")
     report(client, "c=0 ch0=1 float=1")  # ...and is confirmed a beat later
-    assert firm(db) == 1 and rise(db) == rose
+    assert firm(db) == 1 and rise(db) == rose and rose > drops(db)[0]
     assert origin(db) == (rose, "rise")
+
+
+def test_a_slosh_after_an_untapped_refill_moves_neither_rise_nor_counter(client, db):
+    """Once the origin is a rise — the tank ran down and someone refilled
+    it without tapping — the raw word sloshing at the line is no edge of
+    the firm word, and the counter must not move on it. Empty again, a
+    0 -> 1 -> 0 is no rise: the origin stays the rise and the water since
+    it stays on the counter, rather than restarting at the slosh with the
+    run's water laundered. Full again, a 1 -> 0 -> 1 that the next report
+    confirms is no rise either: the rise is where the firm word rose, not
+    where a glitch recovered. The rise's guard is two conditions — the
+    last word agreeing with this one, the firm word not already full —
+    and each slosh gets past one of them alone (spec D3, thrice)."""
+    full(client)
+    tap(client, db)
+    dose(client, 100, flow=100)
+    empty(client)  # ran down: the tap's drop
+    age(db, 60)
+    full(client)  # refilled, untapped: the rise is the origin
+    age(db, 60)
+    dose(client, 80, flow=80)
+    age(db, 60)
+    risen = rise(db)
+    assert origin(db) == (risen, "rise") and health(client)["pumped_ml"] == 80
+    empty(client)  # a second drain keeps the rise
+    assert rise(db) == risen and origin(db) == (risen, "rise")
+    report(client, "c=0 ch0=1 float=1")  # a slosh at the line...
+    report(client, "c=0 ch0=1 float=0")  # ...and back: the firm word never left 0
+    assert firm(db) == 0 and rise(db) == risen and origin(db) == (risen, "rise")
+    assert health(client)["pumped_ml"] == 80
+    age(db, 60)
+    full(client)  # a second untapped refill is a rise, and restarts the counter
+    assert rise(db) > drops(db)[0] and origin(db) == (rise(db), "rise")
+    assert health(client)["pumped_ml"] == 0
+    age(db, 60)
+    dose(client, 30, flow=30)
+    age(db, 60)
+    risen = rise(db)
+    assert origin(db) == (risen, "rise") and health(client)["pumped_ml"] == 30
+    report(client, "c=0 ch0=1 float=0")  # a slosh...
+    report(client, "c=0 ch0=1 float=1")  # ...and back...
+    report(client, "c=0 ch0=1 float=1")  # ...which the next agrees with: no rise
+    assert firm(db) == 1 and rise(db) == risen and origin(db) == (risen, "rise")
+    assert health(client)["pumped_ml"] == 30
 
 
 def test_a_forced_zero_is_not_a_drop(client, db):
