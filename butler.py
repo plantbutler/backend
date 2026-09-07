@@ -973,16 +973,16 @@ def pumped_since(con: sqlite3.Connection, controller: int, since_ts: int) -> int
 
 
 def tank_median(samples: list[int]) -> int | None:
-    """The size a run of samples says, oldest first as tank_history hands
-    them: the median of the last TANK_MEDIAN_OF, None until
-    TANK_SAMPLES_TO_ARM. A median, not a mean, so one tap that was not a
-    fill moves the number little; of two, their mean, which is fine (spec
-    D5)."""
-    last = sorted(samples[-TANK_MEDIAN_OF:])
-    if len(last) < TANK_SAMPLES_TO_ARM:
+    """The size a run of samples says. `samples` is oldest first and newest
+    last, as tank_history hands them, and the median is of the newest
+    TANK_MEDIAN_OF — the tail of the list — None until TANK_SAMPLES_TO_ARM.
+    A median, not a mean, so one tap that was not a fill moves the number
+    little; of two, their mean, which is fine (spec D5)."""
+    newest = sorted(samples[-TANK_MEDIAN_OF:])
+    if len(newest) < TANK_SAMPLES_TO_ARM:
         return None
-    mid = len(last) // 2
-    return last[mid] if len(last) % 2 else (last[mid - 1] + last[mid]) // 2
+    mid = len(newest) // 2
+    return newest[mid] if len(newest) % 2 else (newest[mid - 1] + newest[mid]) // 2
 
 
 def tank_history(
@@ -3697,12 +3697,12 @@ def create_app(
         # leaves it out. Nothing waters from it, so "watering is on hold" has
         # nothing to tell; and the pages that stood when it was retired were
         # cleared by set_retired, since nobody here would ever clear them.
-        retired = {
-            controller
-            for (controller,) in con.execute(
-                "SELECT controller FROM controllers WHERE retired = 1"
-            )
-        }
+        # Read once, for every rule below: the boards, and which of them
+        # are retired.
+        boards = con.execute(
+            "SELECT controller, retired FROM controllers ORDER BY controller"
+        ).fetchall()
+        retired = {controller for controller, flag in boards if flag}
 
         def raised(key: str) -> bool:
             row = standing.get(key)
@@ -4056,9 +4056,9 @@ def create_app(
         # fill. A retired board's waits, like its doses. Board by board,
         # each bounded to its pending few: the samples a board has closed
         # in its life are not a tick's cost.
-        for (controller,) in con.execute(
-            "SELECT controller FROM controllers WHERE retired = 0 ORDER BY controller"
-        ).fetchall():
+        for controller, _flag in boards:
+            if controller in retired:
+                continue
             for ts, rowid, refill_ts, ml in unannounced_samples(con, controller):
                 key = f"tank:{controller}:{refill_ts}"
                 # The sample and the five before it: the size it is judged
