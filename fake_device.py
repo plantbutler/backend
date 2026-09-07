@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Pretend to be the board.
+"""Pretend to be the board — the whole wire, without hardware.
 
-Reports like the firmware will — `c= t= chN=` once per interval — obeying
-the `next=` the backend answers, executing the one command a response may
-carry, and acking it on the FOLLOWING report, the same offbeat the real
-board uses. On a lost exchange it retries the IDENTICAL report once (same
-`t=`, like the firmware) and then discards it, so the backend's dedup and
-expiry rules get exercised for real. Standard library only; point it at a
-local `uv run uvicorn butler:create_app --factory` or at the NAS:
+Reports `c= t= chN=` once per interval, obeys the `next=` the backend answers,
+executes the one command a response may carry, and acks it on the FOLLOWING
+report: the same offbeat the real board uses. On a lost exchange it retries the
+IDENTICAL report once (same `t=`, like the firmware) and then discards it, so
+the backend's dedup and expiry rules are exercised for real. Standard library
+only; point it at a local `uv run uvicorn butler:create_app --factory` or at
+the NAS:
 
     python fake_device.py --token dev [--url http://localhost:8000]
         [--controller 9] [--channels 5] [--cycles 0]

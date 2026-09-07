@@ -9,44 +9,15 @@ from fastapi.testclient import TestClient
 
 import butler
 from butler import create_app, in_quiet, parse_quiet, parse_report
+from conftest import TOKEN, make_pot, post
 
-TOKEN = "test-token"
 DRY = 11000  # pct 12 with the calibration below
 WET = 8000  # pct 50
 
 
 @pytest.fixture
-def db(tmp_path):
-    return tmp_path / "butler.db"
-
-
-@pytest.fixture
-def client(db):
-    # quiet="0-0": the tests must not care what time it is
-    return TestClient(
-        create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900, quiet="0-0")
-    )
-
-
-def make_pot(client, drop=None, **over):
-    fields = {
-        "name": "basil",
-        "controller": 0,
-        "channel": 0,
-        "outlet": 3,
-        "dry_raw": 12000,
-        "wet_raw": 4000,
-        "target_low_pct": 30,
-        "target_high_pct": 60,
-        "dose_ml": 100,
-        "mode": "auto",
-    } | over
-    if drop:
-        del fields[drop]
-    body = " ".join(f"{k}={v}" for k, v in fields.items())
-    answer = client.post("/pot", content=body, headers={"X-Token": TOKEN})
-    assert answer.status_code == 200, answer.text
-    return answer.text.split()[0].removeprefix("pot=")
+def settings():
+    return {"quiet": "0-0"}  # the tests must not care what time it is
 
 
 def report(client, raw=DRY, safe=True, extra="", token=TOKEN):
@@ -78,10 +49,6 @@ def commands(db):
         return con.execute(
             "SELECT id, state, source, ml, cap_s, outlet FROM commands ORDER BY id"
         ).fetchall()
-
-
-def post(client, path, body, token=TOKEN):
-    return client.post(path, content=body, headers={"X-Token": token})
 
 
 # --------------------------------------------------------------------------- #
@@ -142,10 +109,10 @@ def test_a_buried_pot_never_waters(client, db):
 
 def test_a_new_pot_does_not_inherit_the_dead_ones_dryness(client, db):
     """The socket has changed hands. The rules read the newest five
-    readings, so a channel-keyed window makes the decision almost entirely
-    on rows taken through a different probe, in a different pot, and reads
-    them through the new pot's calibration. The direction of that error is
-    WET, which is the one direction decision 5 forbids.
+    readings, so a channel-keyed window would read rows taken through a
+    different probe, in a different pot, through the new pot's calibration.
+    The direction of that error is WET, the one direction watering must
+    never risk on unknown state.
     """
     old = make_pot(client, name="old", mode="manual")
     soak(client, 5)  # five bone-dry readings, all `old`'s
@@ -173,11 +140,10 @@ def test_a_pot_waits_for_its_own_readings_after_a_remap(client, db):
 
 
 def test_a_dose_the_stamp_missed_still_holds_the_cooldown(client, db):
-    """The regression this pair exists for. A manual dose queued before the
-    pot was registered carried no pot stamp; the pot half of the cooldown
-    could not see it, and the hose floor stopped covering it the moment the
-    pot was rewired — so BOTH layers of decision 7 went at once and the
-    plant was watered twice within minutes.
+    """A manual dose queued before its pot is registered carries no stamp;
+    the pot half of the cooldown cannot see it, and the hose floor stops
+    covering it the moment the pot is rewired — so both watering floors can
+    miss the same dose at once.
 
     The stamp is re-read when the board is handed the command, so the row
     records who actually got the water.
@@ -197,10 +163,10 @@ def test_a_dose_the_stamp_missed_still_holds_the_cooldown(client, db):
 
 
 def test_a_dose_is_recorded_against_the_pot_that_received_it(client, db):
-    """A hose rearranged while a command waited used to file the water under
-    the pot that no longer holds that outlet — so the verdict trained the
-    learning log against the wrong soil, and the judgement read a sensor
-    that got no water and paged that the dose had failed."""
+    """A hose rearranged while a command waits must not file the water under
+    the pot that no longer holds that outlet: the verdict would train the
+    learning log against the wrong soil, and the judgement would read a
+    sensor that got no water and page a false dose failure."""
     basil = make_pot(client, mode="manual")
     post(client, "/command", "c=0 water=3 ml=100")
     post(client, "/pot", f"id={basil} outlet=5")
@@ -489,8 +455,8 @@ def test_the_cap_credits_a_dose_that_underflowed(client, db):
 
 def test_a_handed_but_unacked_dose_is_not_charged_to_the_cap(client, db):
     # A response that never arrived is likelier than an ack that was lost,
-    # so the cap charges acked water only (spec D9). The cooldown, keyed on
-    # sent_ts, is what still spaces a dose the board may have poured.
+    # so the cap charges acked water only. The cooldown, keyed on sent_ts,
+    # is what still spaces a dose the board may have poured.
     make_pot(client, cooldown_h=0, daily_cap_ml=150)
     soak(client, 5)  # cmd=1 handed
 
@@ -574,9 +540,7 @@ def test_a_dose_stays_with_the_pot_when_the_hoses_are_swapped(client, db):
 
 
 def test_a_water_now_on_a_hose_the_pot_has_left_is_not_its_dose(client, db):
-    """The sentence the README owes the app's author, pinned.
-
-    `last_dose` is not "the newest command on that hose": basil is dosed
+    """`last_dose` is not "the newest command on that hose": basil is dosed
     on outlet 3, then moves to outlet 4 while mint takes outlet 3, and the
     water-now that goes down outlet 3 next is MINT's. A client written to
     the older wording files basil's verdict against mint's soil — into the
@@ -724,7 +688,7 @@ def test_a_dose_the_pot_cannot_claim_still_holds_its_cooldown(client, db):
     that have nothing to do with the plant being dry: a hand dose before
     the pot was ever registered, a clock that stepped while the wiring was
     saved. Reading that emptiness as "never watered" is fail-OPEN, and
-    decision #5 says unknown state makes watering less likely, not more.
+    unknown state must make watering less likely, not more.
     So the pot-keyed gate has the old hose-keyed one underneath it: 120 ml
     went down this hose a minute ago, whoever it belonged to.
     """

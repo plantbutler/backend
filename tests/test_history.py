@@ -4,31 +4,15 @@ import sqlite3
 import time
 
 import pytest
-from fastapi.testclient import TestClient
 from starlette.datastructures import QueryParams
 
-from butler import create_app, parse_history
-
-TOKEN = "test-token"
-
-
-@pytest.fixture
-def db(tmp_path):
-    return tmp_path / "butler.db"
-
-
-@pytest.fixture
-def client(db):
-    return TestClient(
-        create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900)
-    )
+from butler import parse_history
 
 
 def plant(db, rows):
     """Readings stated outright — (ts, controller, channel, raw, pot_id) —
-    instead of posted and aged, so the test says its timestamps instead of
-    computing them. The pot stamp is written here because the chart reads it;
-    what puts it there in production is handle_report (see test_report)."""
+    instead of posted and aged, so the test says its timestamps directly.
+    In production handle_report is what writes the pot stamp (see test_report)."""
     with sqlite3.connect(db) as con:
         con.executemany(
             "INSERT INTO readings (ts, controller, channel, raw, pot_id) "
@@ -82,8 +66,8 @@ def test_the_window_and_the_bucket_size_are_knobs(client, db):
 
 
 def test_a_pot_nobody_reported_for_is_an_empty_list(client):
-    """And a 200, not a 404: a pot with no readings yet and a pot that never
-    existed look the same from here on purpose, so an unauthenticated caller
+    """A 200, not a 404: a pot with no readings yet and a pot that never
+    existed look the same here on purpose, so an unauthenticated caller
     learns nothing from the status code."""
     body = client.get("/history?pot=pot-aaaaaa").json()
     assert body["points"] == []
@@ -91,8 +75,8 @@ def test_a_pot_nobody_reported_for_is_an_empty_list(client):
 
 
 def test_a_reading_nobody_was_mapped_for_belongs_to_no_chart(client, db):
-    """An environment channel, or a socket nobody has claimed. The row is
-    kept — raw counts always are — and no pot's chart shows it."""
+    """An environment channel, or a socket nobody has claimed: the row is
+    kept, raw counts always are, but no pot's chart shows it."""
     plant(db, [(int(time.time()) - 60, 0, 0, 5000, None)])
     assert client.get("/history?pot=pot-aaaaaa").json()["points"] == []
 
@@ -149,8 +133,8 @@ def test_the_whole_window_fits_at_the_default_bucket():
 
 
 def test_a_month_back_is_askable_at_a_sane_bucket(client, db):
-    """The app's widest chart window. A month at hourly buckets is 744
-    points; the bucket cap, not the hours cap, is what still bounds this."""
+    """A month at hourly buckets is 744 points; the bucket cap, not the
+    hours cap, is what still bounds this."""
     now = int(time.time())
     plant(
         db,

@@ -22,7 +22,24 @@ watering.
 
 ## What is here (2026-09-01)
 
-- `butler.py` — the whole service: `create_app` factory (env: `BUTLER_TOKEN` required,
+- `butler/` — the whole service, a package since the split. `__init__.py` is the facade: it holds
+  `create_app` and re-exports every public name from the modules beside it, so `from butler import
+  X`, `butler.X` and `monkeypatch.setattr(butler, ...)` mean what they always did. Those modules
+  are `constants`, `notify`, `species`, `band`, `wire` (every `k=v` parser), `schema` (the DDL,
+  the ids, the ALTER and the one rebuild), `pots` (the live-status allow-list, the key families,
+  `moisture_pct`), `tank`, `config` (every `BUTLER_*` variable and the eight refusals to start),
+  `store` (the connection and the photograph bytes), `care` (the GBIF/Trefle hops and their
+  caches), `rules` (the watering ladder), `alerts` (eight alert rules, the tick and its loop),
+  `commands` (the report path, the queue, the knobs) and `garden` (a pot made, edited, buried,
+  erased). Inside the package a module imports other modules rather than names; three of them
+  import a name instead, each with the reason in its own header, and all three are a local that
+  would shadow the module. The 21 routes are `butler/routes/`, one module per thing they answer
+  about plus `common` for the preamble twelve write routes share; `create_app` mounts them and
+  hands each the configuration and the clock. **The clock is `create_app`'s own `clock()`** — every
+  write path is handed its `now` — so `monkeypatch.setattr(butler, "time", ...)` still moves the
+  backend's idea of the time and nothing else's. `schema.sql` sits inside the package now, beside
+  `schema.py` that reads it.
+  `create_app` factory (env: `BUTLER_TOKEN` required,
   `BUTLER_DB`, `BUTLER_NEXT_S`, `BUTLER_CMD_TTL_S`, `BUTLER_QUIET`,
   `BUTLER_NTFY_TOPIC`, `BUTLER_NTFY_URL`, `BUTLER_DEADMAN_URL`, `BUTLER_SILENT_S`,
   `BUTLER_TREFLE_TOKEN` — unset means every care number is typed in, which is a working path and
@@ -76,7 +93,7 @@ watering.
   (`butler=<VERSION>`, or
   401 — the one gated route that neither writes nor reads the database, so a phone being set up can
   tell a wrong address from a wrong token, and a butler whose volume came unmounted can still say
-  the token was wrong. `VERSION` lives in butler.py because the container installs no package; a
+  the token was wrong. `VERSION` lives in `butler/__init__.py` because the container installs no package; a
   test asserts it matches pyproject.toml),
   `POST /photo` (`?pot=&w=&h=` with the JPEG as the body — the one route whose payload is not k=v;
   JPEG checked by its first bytes so what is served back can always be labelled image/jpeg and never
@@ -356,7 +373,7 @@ watering.
   `plant_height_cm` and reads them as a water buffer and the demand on it, and answers `kind` from
   GBIF's family so the dropdown opens pre-selected; 0.18.0 with the tank on 2026-09-06; 0.19.0 with the measured tank on 2026-09-07; 0.20.0 with the latches on the wire the same day, verified live: three columns added at startup, a fake board sending `ch211=1` latched with reason `dry` and the 409 said `dry off`, `ch210=1` showed as `flap` on `/health`, and the fake board was resumed, retired and deleted): container
   `plantbutler`
-  on the NAS, port 9380, image `plantbutler-backend:0.20.0`, built on the NAS from the three files (`Dockerfile`, `butler.py`, `schema.sql`) copied over ssh into `/volume1/docker/plantbutler/build` (the NAS has no sftp, so `cat >` over ssh, not scp; docker is `sudo -n /usr/local/bin/docker`, the env is carried from the old container with `docker inspect` into a 0600 file that is shredded after `docker run`), database on `/volume1/docker/plantbutler/data`, secrets in `deploy.env` beside it
+  on the NAS, port 9380, image `plantbutler-backend:0.20.0`, built on the NAS from the `Dockerfile` and the `butler/` package (`schema.sql` lives inside it), copied over ssh into `/volume1/docker/plantbutler/build` (the NAS has no sftp, so `cat >` over ssh, not scp, one file at a time — the package's modules included, and `mkdir -p build/butler/routes` first, since the routes are a subpackage; docker is `sudo -n /usr/local/bin/docker`, the env is carried from the old container with `docker inspect` into a 0600 file that is shredded after `docker run`), database on `/volume1/docker/plantbutler/data`, secrets in `deploy.env` beside it
   (600, not in git: the token, the ntfy topic, the healthchecks.io ping URL, the Trefle token),
   `-e TZ=Europe/Zurich` so BUTLER_QUIET means local night. Photographs share that volume —
   `/data/photos`, one directory per pot — so they are backed up or lost with the database rather

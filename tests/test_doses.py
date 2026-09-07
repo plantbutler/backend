@@ -4,31 +4,16 @@ import sqlite3
 import time
 
 import pytest
-from fastapi.testclient import TestClient
 from starlette.datastructures import QueryParams
 
-from butler import create_app, parse_doses
-
-TOKEN = "test-token"
-
-
-@pytest.fixture
-def db(tmp_path):
-    return tmp_path / "butler.db"
-
-
-@pytest.fixture
-def client(db):
-    return TestClient(
-        create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900)
-    )
+from butler import parse_doses
+from conftest import TOKEN
 
 
 def pot(db, pot_id, name, controller=0, outlet=0, from_ts=0, to_ts=None):
-    """A pot and one mapping window, stated outright. The windows no longer
-    decide whose dose it was — the stamp on the row does — but they still
-    say which sensor a pot was on, and enqueue reads the open one to choose
-    the stamp, so they stay part of the fixture."""
+    """A pot and one mapping window. The window no longer decides whose
+    dose it was — the row's stamp does — but it says which sensor the pot
+    was on, which enqueue reads to pick that stamp."""
     with sqlite3.connect(db) as con:
         con.execute(
             "INSERT OR IGNORE INTO pots (id, name) VALUES (?, ?)", (pot_id, name)
@@ -115,10 +100,9 @@ def test_a_pot_gets_the_doses_it_was_handed_newest_first(client, db):
 
 
 def test_a_remap_takes_the_pots_history_with_it(client, db):
-    """A dose belongs to whoever the board was told to water, not to whoever
-    hangs on that hose now. Driven through POST /pot so the remap and the
-    stamps are the real ones, not hand-written windows: with the pot on the
-    row, a fixture that wrote its own windows would prove nothing."""
+    """A dose belongs to whoever the board was told to water, not whoever
+    holds the hose now. Driven through POST /pot so the remap and stamps
+    are the real ones, not hand-written windows."""
     basil = post_pot(client, "name=basil controller=0 channel=0 outlet=0")
     water(client, basil, 0, 0)  # 1: basil, on outlet 0
     post_pot(client, f"id={basil} outlet=3")  # basil moves hose
@@ -130,7 +114,6 @@ def test_a_remap_takes_the_pots_history_with_it(client, db):
 
 
 def test_the_odd_rows_are_listed_not_filtered_out(client, db):
-    """The row worth reading is the one that went wrong."""
     now = int(time.time())
     pot(db, "pot-1", "basil")
     dose(db, 1, now - 400, state="expired")  # handed out, never acked
@@ -152,17 +135,16 @@ def test_a_proposal_is_not_history(client, db):
 
 
 def test_the_garden_list_keeps_a_dose_nobody_can_be_blamed_for(client, db):
-    """An unattributable dose is the most interesting row there is: it must
-    not vanish just because no window claims it."""
+    """An unattributable dose must not vanish just because no window claims it."""
     now = int(time.time())
     pot(db, "pot-1", "basil", outlet=0, from_ts=now - 100)
-    dose(db, 1, now - 500, outlet=7, acked_ts=now - 490, pot_id=None)  # no pot
+    dose(db, 1, now - 500, outlet=7, acked_ts=now - 490, pot_id=None)
     dose(db, 2, now - 50, acked_ts=now - 40)
     rows = get(client)
     assert [r["id"] for r in rows] == [2, 1]
     assert rows[1]["pot"] is None and rows[1]["pot_name"] is None
     assert rows[0]["pot"] == "pot-1"
-    # A pot's own list can only hold what it was handed.
+    # a pot's own list can only hold what it was handed
     assert [r["id"] for r in get(client, pot="pot-1")] == [2]
 
 
@@ -170,8 +152,7 @@ def test_a_dose_never_handed_out_has_no_pot_and_sorts_by_when_it_was_made(client
     now = int(time.time())
     pot(db, "pot-1", "basil")
     dose(db, 1, now - 500, acked_ts=now - 490)
-    # Stamped for basil and never handed out: the stamp says whom it was
-    # made for, and `sent_ts IS NOT NULL` is what makes it not yet a dose.
+    # not handed out yet: sent_ts IS NOT NULL is what makes a row a dose
     dose(db, 2, None, state="queued", created_ts=now - 10)
     rows = get(client)
     assert [r["id"] for r in rows] == [2, 1]
@@ -203,10 +184,8 @@ def test_limit_bounds_the_list_and_the_newest_survive(client, db):
 
 
 def test_two_open_windows_on_one_hose_cannot_split_a_dose(client, db):
-    """This used to need a GROUP BY: two overlapping windows claimed one
-    dose and the garden list showed it twice. A stamped row has exactly one
-    owner, so overlapping windows cannot reach it at all — which is also why
-    the backstop in the mapping write matters more than it did (test_pots)."""
+    """A stamped row has exactly one owner: two overlapping mapping windows
+    on one hose cannot both claim the same dose."""
     now = int(time.time())
     pot(db, "pot-1", "basil", outlet=0, from_ts=0)
     pot(db, "pot-2", "mint", outlet=0, from_ts=0)
@@ -217,9 +196,8 @@ def test_two_open_windows_on_one_hose_cannot_split_a_dose(client, db):
 
 
 def test_a_stop_is_not_a_dose(client, db):
-    """A stop has no outlet and no millilitres: it could never be
-    attributed, and listing it as an unattributable dose would bury the row
-    that actually matters."""
+    """A stop has no outlet or millilitres, so it could never be attributed;
+    listing it as an unattributable dose would bury the row that matters."""
     now = int(time.time())
     pot(db, "pot-1", "basil")
     dose(db, 1, now - 100, acked_ts=now - 90)
@@ -230,9 +208,8 @@ def test_a_stop_is_not_a_dose(client, db):
 
 
 def test_the_cursor_pages_back_through_doses_that_share_a_second(client, db):
-    """The commands table is never pruned, so the older history has to be
-    reachable — and several doses can share a second, which a cursor on the
-    timestamp alone would skip or repeat."""
+    """A cursor on the timestamp alone would skip or repeat doses that
+    share a second."""
     now = int(time.time())
     pot(db, "pot-1", "basil")
     for i in range(1, 6):  # ids 1..5, all handed out in the same second
@@ -244,7 +221,6 @@ def test_the_cursor_pages_back_through_doses_that_share_a_second(client, db):
     assert [r["id"] for r in second] == [3, 2]
     third = get(client, pot="pot-1", limit=2, before=second[-1]["sent_ts"], before_id=second[-1]["id"])
     assert [r["id"] for r in third] == [1]
-    # Nothing was skipped and nothing came twice.
     assert [r["id"] for r in first + second + third] == [5, 4, 3, 2, 1]
 
 

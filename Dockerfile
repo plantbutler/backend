@@ -10,7 +10,7 @@ FROM --platform=linux/amd64 python:3.12-slim
 RUN pip install --no-cache-dir "fastapi>=0.115,<1" "uvicorn>=0.30,<1"
 
 WORKDIR /app
-COPY butler.py schema.sql /app/
+COPY butler/ /app/butler/
 
 EXPOSE 9380
 

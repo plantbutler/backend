@@ -21,63 +21,37 @@ from butler import (
     create_app,
     post_ntfy,
 )
+from conftest import (
+    TOKEN,
+    age_controller,
+    capturing,
+    keys,
+    make_app,
+    make_pot,
+    post,
+    run_sql,
+    tick,
+)
 
-TOKEN = "test-token"
 DRY = 11000  # pct 12 with the calibration below
 WET = 8000  # pct 50
 
 
-@pytest.fixture
-def db(tmp_path):
-    return tmp_path / "butler.db"
-
-
-@pytest.fixture
-def sent():
-    return []
-
-
-@pytest.fixture
-def pinged():
-    return []
-
-
 def build_app(db, sent, pinged, **over):
-    settings = {
-        "db_path": str(db),
-        "token": TOKEN,
-        "next_s": 60,
-        "cmd_ttl_s": 900,
-        "quiet": "0-0",
-        "send": lambda alert: sent.append(alert) or True,
-        "ping": lambda: pinged.append(True) or True,
-    } | over
-    return create_app(**settings)
+    """The `app` fixture's own app, for the tests that want two of them."""
+    return make_app(db, **({"quiet": "0-0"} | capturing(sent, pinged) | over))
 
 
 @pytest.fixture
-def app(db, sent, pinged):
-    return build_app(db, sent, pinged)
-
-
-@pytest.fixture
-def client(app):
-    return TestClient(app)
-
-
-def tick(app, now=None):
-    return app.state.tick(now)
+def settings(sent, pinged):
+    # quiet="0-0": the tests must not care what time it is
+    return {"quiet": "0-0"} | capturing(sent, pinged)
 
 
 def see_everything(app):
-    # Silence is measured from the later of last_seen and the butler's own
-    # observation start, so a test that backdates last_seen must backdate
-    # the observation window too.
+    # Silence is measured from the later of last_seen and the observation
+    # start, so backdating last_seen must also backdate the window.
     app.state.observed["since"] = 0
-
-
-def post(client, path, body):
-    return client.post(path, content=body, headers={"X-Token": TOKEN})
 
 
 def report(client, raw=DRY, safe=True, extra=""):
@@ -89,30 +63,6 @@ def report(client, raw=DRY, safe=True, extra=""):
     answer = post(client, "/report", body)
     assert answer.status_code == 200, answer.text
     return answer
-
-
-def make_pot(client, **over):
-    fields = {
-        "name": "basil",
-        "controller": 0,
-        "channel": 0,
-        "outlet": 3,
-        "dry_raw": 12000,
-        "wet_raw": 4000,
-        "target_low_pct": 30,
-        "target_high_pct": 60,
-        "dose_ml": 100,
-        "mode": "auto",
-    } | over
-    body = " ".join(f"{k}={v}" for k, v in fields.items())
-    answer = post(client, "/pot", body)
-    assert answer.status_code == 200, answer.text
-    return answer.text.split()[0].removeprefix("pot=")
-
-
-def run_sql(db, sql, *params):
-    with sqlite3.connect(db) as con:
-        return con.execute(sql, params).fetchall()
 
 
 def alert_rows(db):
@@ -128,11 +78,6 @@ def dose_rows(db):
     )
 
 
-def age_controller(db, seconds):
-    with sqlite3.connect(db) as con:
-        con.execute("UPDATE controllers SET last_seen = last_seen - ?", (seconds,))
-
-
 def age_status(db, seconds):
     with sqlite3.connect(db) as con:
         con.execute(
@@ -142,10 +87,6 @@ def age_status(db, seconds):
             "pos_bad_prev = pos_bad_prev - ?",
             (seconds,) * 6,
         )
-
-
-def keys(sent):
-    return [a.key for a in sent if a.message is not None]
 
 
 def plant_dose(
@@ -161,18 +102,17 @@ def plant_dose(
     outlet=3,
     channel=0,
 ):
-    """One executed dose and its readings, timestamps fully controlled.
+    """One executed dose and its readings, with fully controlled timestamps.
 
-    The command carries the stamp production would have written, and the
-    readings carry theirs: both are what the judgement reads."""
+    The command carries the stamp production would write, and the readings
+    carry theirs: both are what the judgement reads."""
     now = int(time.time())
     sent_ts = now - sent_ago
     acked_ts = None if acked_ago is None else now - acked_ago
     with sqlite3.connect(db) as con:
-        # A pot is wired before it is watered. make_pot stamps its mapping
-        # window milliseconds ago and the dose is planted well in the past,
-        # so the window has to move back with it, or the judgement cannot
-        # find which SENSOR the pot was on when the water went down.
+        # make_pot stamps its mapping window milliseconds ago, but the dose
+        # is planted well in the past, so the window must move back with it
+        # or the judgement can't find which sensor the pot was on.
         con.execute(
             "UPDATE pot_mappings SET from_ts = ? WHERE to_ts IS NULL AND from_ts > ?",
             (sent_ts - 10, sent_ts - 10),
@@ -239,7 +179,7 @@ def test_a_returning_controller_clears_once_and_reflaps_are_floored(
     age_controller(db, 700)
     tick(app, now)
 
-    report(client)  # it is back
+    report(client)
     tick(app, now)
     assert [a.key for a in sent] == ["silent:0", "silent:0"]
     assert sent[1].priority == "default"
@@ -446,7 +386,7 @@ def test_a_dead_sensor_channel_pages_while_the_controller_reports(
     make_pot(client, mode="manual")
     report(client)
     see_everything(app)
-    with sqlite3.connect(db) as con:  # the wire comes loose; the board go on
+    with sqlite3.connect(db) as con:  # the wire comes loose; the board goes on
         con.execute("UPDATE readings SET ts = ts - 700")
     tick(app, int(time.time()))
     assert keys(sent) == ["sensor:0:0"]
@@ -523,7 +463,7 @@ def test_a_dose_short_on_the_meter_alerts_high(app, client, db, sent):
 
 def test_a_dose_never_acknowledged_alerts_high_and_immediately(app, client, db, sent):
     make_pot(client)
-    plant_dose(db, state="expired", acked_ago=None, sent_ago=90)  # 90 s ago
+    plant_dose(db, state="expired", acked_ago=None, sent_ago=90)
     tick(app, int(time.time()))
     assert [a.key for a in sent] == ["dose:1"]  # no pointless soak wait
     assert sent[0].priority == "high"
@@ -585,7 +525,7 @@ def test_doses_older_than_a_day_are_history_not_news(app, client, db, sent):
 def test_correlated_dose_failures_page_once_per_controller(app, client, db, sent):
     make_pot(client)
     make_pot(client, name="mint", channel=1, outlet=4)
-    plant_dose(db, flow_ml=10, after_raw=WET)  # the shared pump died:
+    plant_dose(db, flow_ml=10, after_raw=WET)  # the shared pump died
     plant_dose(db, flow_ml=10, after_raw=WET, outlet=4, channel=1)
     tick(app, int(time.time()))
 

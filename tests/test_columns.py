@@ -13,11 +13,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from butler import add_columns, create_app
+from conftest import TOKEN
 
-TOKEN = "test-token"
 
-# The shape 0.14.0 left behind: pots already keyed on `pot-xxxxxx`, wiring
-# already in pot_mappings, but the two sizes still free text.
+# The pre-upgrade shape: pots already keyed on `pot-xxxxxx`, wiring already
+# in pot_mappings, but the two sizes still free text.
 PRE_SIZES = """
 CREATE TABLE pots (
   id              TEXT PRIMARY KEY,
@@ -53,7 +53,7 @@ CREATE TABLE species_names (
 
 @pytest.fixture
 def old(tmp_path):
-    """A database in the pre-0.15.0 shape, with a pot of each kind of size."""
+    """A database in the pre-upgrade shape, with a pot of each kind of size."""
     path = tmp_path / "butler.db"
     con = sqlite3.connect(path)
     con.executescript(PRE_SIZES)
@@ -83,9 +83,8 @@ def columns(path, table):
 
 def test_the_columns_arrive_and_the_old_ones_stay(old):
     con = sqlite3.connect(old)
-    # `readings` and `commands` are not in this fixture at all, and
-    # add_columns skips a table it cannot find without claiming it did
-    # anything — which is why only the pots and species_names entries show.
+    # readings and commands aren't in this fixture, and add_columns skips a
+    # table it can't find without claiming it did anything.
     assert add_columns(con) == [
         "pots.plant_height_cm",
         "pots.pot_diameter_cm",
@@ -93,8 +92,8 @@ def test_the_columns_arrive_and_the_old_ones_stay(old):
         "pots.status",
     ]
     con.close()
-    # Additive means additive: nothing is dropped, so a rollback to the
-    # previous container still reads every pot it wrote.
+    # nothing is dropped, so a rollback to the previous container still
+    # reads every pot it wrote
     assert "plant_size" in columns(old, "pots")
     assert "pot_size" in columns(old, "pots")
     assert "enabled" in columns(old, "pots")
@@ -111,8 +110,8 @@ def test_a_measurement_carries_over_and_a_word_does_not(old):
     )
     con.close()
     assert got["measured"] == (40.0, 14.0)  # "40" and "14cm" were numbers
-    # "small" meant something to the keyword table it was written for, and
-    # inventing centimetres out of it would be worse than asking again.
+    # "small" meant something to a keyword table; inventing centimetres out
+    # of it would be worse than asking again
     assert got["worded"] == (None, None)
 
 
@@ -125,23 +124,21 @@ def test_running_twice_adds_nothing_the_second_time(old):
 
 def test_a_fresh_database_needs_none_of_it(tmp_path):
     con = sqlite3.connect(tmp_path / "fresh.db")
-    assert add_columns(con) == []  # no tables yet: nothing to alter
+    assert add_columns(con) == []  # no tables yet, nothing to alter
     con.close()
 
 
 def test_the_app_starts_on_the_old_shape_and_serves_the_new_one(old):
-    """The whole point. A view is created without checking its columns
-    exist, so getting the order wrong here fails on every read rather than
-    at startup, which is the worst way to find out."""
+    """The view is created without checking its columns exist, so getting
+    the order wrong here fails on every read rather than at startup."""
     client = TestClient(create_app(db_path=str(old), token=TOKEN))
     pots = {p["name"]: p for p in client.get("/pots").json()["pots"]}
     assert pots["measured"]["pot_diameter_cm"] == 14.0
     assert pots["measured"]["plant_height_cm"] == 40.0
     assert pots["worded"]["pot_diameter_cm"] is None
     assert "plant_size" not in pots["measured"]  # the view moved on
-    # And the carried-over numbers reach the band engine, which is what
-    # they were carried over for. The pot is the reference 14 cm and so
-    # moves nothing and is not named; the plant is 40 cm and is.
+    # the carried-over numbers reach the band engine: 14 cm is the
+    # reference pot size and moves nothing, 40 cm plant height does
     assert pots["measured"]["advice"]["why"] == "herb, 40 cm plant"
 
 
@@ -154,17 +151,15 @@ def test_the_cached_names_gain_a_family_they_can_be_refilled_with(old):
         "SELECT family FROM species_names WHERE query = 'ocimum basilicum'"
     ).fetchone()
     con.close()
-    # The ALTER cannot invent what GBIF was never asked for, so the carried
-    # row starts empty. What stops it staying empty for ever is taxon_for:
-    # a row that resolved a name but carries no family counts as stale
-    # rather than as a hit, so the next lookup re-asks and fills it in.
-    # (That half is tested in test_species; here the point is only that the
-    # column arrives NULL rather than wrong.)
+    # the ALTER cannot invent what GBIF was never asked for, so the carried
+    # row starts empty rather than wrong; taxon_for treats a resolved row
+    # with no family as stale, not a hit, so a later lookup fills it in
+    # (see test_species for that half)
     assert family is None
 
 
 def test_the_pots_carried_over_are_alive(old):
-    """The switch became a word, and the fixture's pots were all enabled."""
+    """The enabled flag became a status word; the fixture's pots were all enabled."""
     client = TestClient(create_app(db_path=str(old), token=TOKEN))
     answer = client.get("/pots")
     assert answer.status_code == 200, answer.text

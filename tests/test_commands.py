@@ -3,24 +3,10 @@
 import sqlite3
 
 import pytest
-from fastapi.testclient import TestClient
 
 import butler
 from butler import cap_for, create_app, parse_command, parse_report
-
-TOKEN = "test-token"
-
-
-@pytest.fixture
-def db(tmp_path):
-    return tmp_path / "butler.db"
-
-
-@pytest.fixture
-def client(db):
-    return TestClient(
-        create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900)
-    )
+from conftest import TOKEN
 
 
 def report(client, body, token=TOKEN):
@@ -90,17 +76,17 @@ def test_a_command_waits_for_its_own_controller(client, db):
 
 def test_a_report_without_the_ack_expires_the_sent_command(client, db):
     command(client, "c=0 water=3 ml=50 cap_s=30")
-    report(client, "c=0 t=1000 ch0=8000")  # handed here
+    report(client, "c=0 t=1000 ch0=8000")
 
-    answer = report(client, "c=0 t=61000 ch0=8000")  # no ack
+    answer = report(client, "c=0 t=61000 ch0=8000")
     assert "cmd=" not in answer.text
     assert states(db) == {1: "expired"}
 
 
 def test_a_lost_response_expires_the_command_it_carried(client, db):
-    # The board retries the same report when the response is lost; the retry
-    # cannot carry an ack, so the command the lost response carried is gone —
-    # never re-handed, because the board might still be executing a copy.
+    # a retry of a lost-response report can't carry an ack, so the command it
+    # carried is gone for good, never re-handed, since the board might still
+    # be executing a copy of it
     command(client, "c=0 water=3 ml=50 cap_s=30")
     report(client, "c=0 t=1000 ch0=8000")
 
@@ -110,11 +96,8 @@ def test_a_lost_response_expires_the_command_it_carried(client, db):
 
 
 def test_a_retry_of_the_acking_report_is_heard_once(client, db):
-    # The board keeps the body when the response is lost, the ack with
-    # it. The retry is the same report, not the next: answered 200, its
-    # readings stored once, and the command it acked stays acked with the
-    # flow it carried — stamped once, and not expired as one the board
-    # never answered for.
+    # a retry of the same report must be answered 200, its readings stored
+    # once, and the ack it carried applied once, not expired as unanswered
     command(client, "c=0 water=3 ml=50 cap_s=30")
     report(client, "c=0 t=1000 ch0=8000")
     report(client, "c=0 t=61000 ch0=8000 ack=1 flow_ml=48")
@@ -134,7 +117,7 @@ def test_a_retry_of_the_acking_report_is_heard_once(client, db):
 def test_a_late_ack_for_an_expired_command_changes_nothing(client, db):
     command(client, "c=0 water=3 ml=50 cap_s=30")
     report(client, "c=0 t=1000 ch0=8000")
-    report(client, "c=0 t=61000 ch0=8000")  # expires it
+    report(client, "c=0 t=61000 ch0=8000")
 
     report(client, "c=0 t=121000 ch0=8000 ack=1 flow_ml=48")
     assert states(db) == {1: "expired"}
@@ -354,5 +337,7 @@ def test_parse_command_shapes():
 def test_cap_for_stays_under_the_firmware_cap_after_a_retune(monkeypatch):
     assert cap_for(1) == 5  # the slack alone
     assert cap_for(butler.MAX_DOSE_ML) == 17  # under MAX_CAP_S at today's flow floor
-    monkeypatch.setattr(butler, "FLOW_FLOOR_ML_S", 1)  # a bench retune
+    # On the module that owns it: cap_for reads it through `constants`, so
+    # patching the name butler re-exports would not reach the call.
+    monkeypatch.setattr(butler.constants, "FLOW_FLOOR_ML_S", 1)  # a bench retune
     assert cap_for(butler.MAX_DOSE_ML) == butler.MAX_CAP_S
