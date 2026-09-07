@@ -247,8 +247,8 @@ def test_a_pot_the_board_is_holding_a_dose_for_cannot_be_erased(client, db):
 
 
 def test_wiring_a_pot_that_is_already_buried_is_refused(client, db):
-    """The same contradiction one body saying both is already refused for,
-    said instead across two requests."""
+    """The same contradiction already refused in one body, said instead
+    across two requests."""
     basil = pot(client, "name=basil controller=0 channel=0 outlet=0")
     post(client, "/pot", f"id={basil} status=graveyard")
 
