@@ -3617,17 +3617,15 @@ def create_app(
                         "WHERE pot_id = ? AND to_ts IS NULL",
                         (edge, pot_id),
                     )
-                    # One hose, one pot. A live pot on this wiring was
-                    # refused above, and a graveyard one let go of its window
-                    # when it was buried — so this should find nothing, and
-                    # it stays because it is the only thing that would. A
-                    # database that arrived with two open windows on one hose
-                    # (the defect fixed on 2026-09-03) now has no read-time
-                    # GROUP BY papering over it: the reading stamp would pick
-                    # one of the two arbitrarily and the pick would be
-                    # permanent. Each displaced window closes on its own
-                    # edge, so a backwards clock cannot invert it or orphan
-                    # a dose it already holds.
+                    # One hose, one pot. A live pot on this wiring was refused
+                    # above and a graveyard one let go of its window when it
+                    # was buried, so this should find nothing and stays
+                    # because it is the only thing that would: nothing papers
+                    # over two open windows on one hose at read time any more,
+                    # and the reading stamp would pick one of them arbitrarily
+                    # and permanently. Each displaced window closes on its own
+                    # edge, so a backwards clock cannot invert it or orphan a
+                    # dose it already holds.
                     displaced = con.execute(
                         "SELECT DISTINCT m.pot_id FROM pot_mappings m "
                         "JOIN pots p ON p.id = m.pot_id "
@@ -3659,11 +3657,10 @@ def create_app(
                         current["outlet"],
                     )
             if sets.get("status") == "graveyard" and current["status"] != "graveyard":
-                # Burying a pot is what UNPLUGS it, and that is the whole
-                # difference from the switch this replaced: the hose and the
-                # socket go back to the garden. window_edge, never `now` —
-                # a to_ts before a dose the window already holds orphans
-                # that dose's cooldown and cap for good.
+                # Burying a pot is what UNPLUGS it: the hose and the socket
+                # go back to the garden. window_edge, never `now` — a to_ts
+                # before a dose the window already holds orphans that dose's
+                # cooldown and cap for good.
                 edge = window_edge(con, pot_id, now)
                 con.execute(
                     "UPDATE pot_mappings SET to_ts = ? "
@@ -4061,12 +4058,11 @@ def create_app(
                     )
 
         # The durable latch. High, and without the re-alert floor: a board
-        # that latches again ten minutes after a human resumed it is exactly
-        # the repeat that must not wait an hour to be heard. The row's
-        # detail is the reason the page named, and a standing latch whose
-        # reason changed — the newest fault overwrites it (latch_reason) —
-        # pages again with its new words, floor or no floor: a person told
-        # "clear contra" must also be told "dry off" (spec D12, D14).
+        # that latches again ten minutes after a human resumed it is the
+        # repeat that must not wait an hour to be heard. The row's detail is
+        # the reason the page named, and a standing latch whose reason changed
+        # pages again with its new words, floor or no floor — a person told
+        # "clear contra" must also be told "dry off".
         for controller, latched_ts, reason in con.execute(
             "SELECT controller, latched_ts, latch_reason FROM status "
             "WHERE latched_ts IS NOT NULL"
@@ -4087,34 +4083,28 @@ def create_app(
                     )
                 )
 
-        # The float judged against the tank's size, never a clock. Stuck at
-        # full is the dangerous one: more than the tank holds pumped since
-        # the origin (the tap, or the float's own rise once it has dropped
-        # since the tap) with the float's firm word still saying full is a
-        # float presumed stuck, the rules stay dry on it, and the tap is
-        # the only clear — made in its own transaction (record_refill),
-        # with no page, the person having done the thing — where the word
-        # dropping to 0 is a contra, a flap or an omitted float= as often
-        # as an empty tank. This is where the page is raised, once ntfy
-        # takes the message; it is never cleared here. Stuck at empty is
-        # harmless: the rules are dry on empty already, so it is a page and
-        # nothing else, cleared when the float says full — and the page
-        # says which of the two it is: the board's own float check tripped
-        # (status.flap, ch210 in its latest report: a tap answers that,
-        # for one dose — and while the try that tap bought is still to
-        # come, queued or with the board or the rules' to make once an
-        # auto pot on the board dries, the page would tell the person to
-        # do what they just did, so it waits for the refusal; on a board
-        # with no such pot nobody will make the try, and it does not wait)
-        # or, with no flap on the wire, a float presumed stuck at empty.
-        # Its `stale:` key is the clock rule's, kept so a page standing
-        # from 0.18.0 clears through the same path. Neither is raised
-        # while the board's latch stands, nor while its latest report
-        # carried ch207=1 or ch211=1 — a /resume before `clear contra` or
-        # `dry off` is typed lifts the one and not the other: a contra
-        # forces the word to 0, "float OK, zero pulses" is a fault and not
-        # a float, a board held dry is the latch page's business, and that
-        # page already says what to do (spec A1, A2).
+        # The float judged against the tank's size, never a clock.
+        #
+        # Stuck at full is the dangerous one: past what the tank holds since
+        # the origin with the float's firm word still saying full. The rules
+        # stay dry on it, and a tap is the only clear — made in its own
+        # transaction with no page, the person having done the thing — since
+        # the word dropping to 0 is a contra, a flap or an omitted float= as
+        # often as an empty tank. Raised here and never cleared here.
+        #
+        # Stuck at empty is harmless — the rules are dry on empty already, so
+        # it is a page and nothing else, cleared when the float says full —
+        # but the page must say which of the two it is: the board's own float
+        # check tripped, which a tap answers for one dose, or a float presumed
+        # stuck. While the try that tap bought is still to come the page would
+        # tell the person to do what they just did, so it waits for the
+        # refusal; on a board where nobody will make that try it does not
+        # wait.
+        #
+        # Neither is raised while the board's latch stands, nor while its
+        # latest report carried ch207=1 or ch211=1 — a /resume lifts the
+        # backend's latch and not the board's own. A contra forces the word to
+        # 0, and a board held dry is the latch page's business.
         for controller, float_ok, latched_ts, contra, flap, dry in con.execute(
             "SELECT controller, float_ok, latched_ts, contra, flap, dry FROM status"
         ):
