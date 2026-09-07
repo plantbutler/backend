@@ -1,7 +1,7 @@
 # Plant Butler backend
 
-The service in the middle: one Python container with a SQLite database, running on a home
-network server. The board posts its readings here, this decides when to water and hands one
+The service in the middle: one Python program in a container, storing everything in SQLite, a
+database that is a single file, and running on a home network server. The board posts its readings here, this decides when to water and hands one
 command back, and the phone app reads and edits everything through it. How the three parts fit
 together is in the [umbrella README](https://github.com/plantbutler/plantbutler#readme); the
 words are in its [glossary](https://github.com/plantbutler/plantbutler/blob/main/GLOSSARY.md).
@@ -58,6 +58,16 @@ Every setting is an environment variable. Only the first has no usable default.
 
 The image is built on the server, which is x86_64, and the token never enters the image.
 
+`deploy.env` is a file you write on the server, one `NAME=value` per line, from the table above.
+At least:
+
+```
+BUTLER_TOKEN=<the shared secret, the same one the board and the app send>
+BUTLER_NTFY_TOPIC=<something unguessable, or leave it out for no alerts>
+```
+
+It stays out of git, and so does the server's address.
+
 ```bash
 docker build --platform=linux/amd64 -t plantbutler-backend:<version> .
 docker run -d --name plantbutler --restart unless-stopped \
@@ -65,8 +75,8 @@ docker run -d --name plantbutler --restart unless-stopped \
   plantbutler-backend:<version>
 ```
 
-`deploy.env` holds `BUTLER_TOKEN` and the rest. It stays out of git, and so does the server's
-address. Nothing here is ever exposed to the internet.
+The container listens on 9380 rather than the 8000 used above, which is only the default when
+you run it by hand. Nothing here is ever exposed to the internet.
 
 ## What it answers
 
@@ -106,7 +116,7 @@ re-exports every public name, so a caller can keep saying `from butler import X`
 | `butler/garden.py`, `butler/store.py` | creating, editing, burying and erasing a pot; the photograph files |
 | `butler/care.py`, `butler/species.py`, `butler/band.py` | the species lookup, its two sources, and the target range offered locally |
 | `butler/notify.py`, `butler/constants.py` | the push service and the dead-man ping; the numbers |
-| `butler/routes/` | one router per subject, and the preamble twelve write routes share |
+| `butler/routes/` | one router per subject: `board`, `garden`, `photos`, `species` and `service`, plus the preamble twelve write routes share |
 | `fake_device.py` | a board that never existed, for driving the service without hardware |
 | `tests/` | one file per subject, named for it; `conftest.py` holds the fixtures they share |
 | `Dockerfile` | the image; the database is a bind mount, never a volume |
