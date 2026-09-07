@@ -55,7 +55,7 @@ def test_hello_answers_when_the_database_cannot_be_opened(db, client):
 
 
 def test_the_version_matches_pyproject():
-    """The container copies butler.py and installs no package, so VERSION
+    """The container copies the source and installs no package, so VERSION
     cannot be read from package metadata; nothing else keeps the two in step."""
     root = pathlib.Path(__file__).resolve().parent.parent
     declared = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]

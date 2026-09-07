@@ -42,7 +42,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import QueryParams
 from starlette.requests import ClientDisconnect
 
-# The container installs no package — it copies butler.py beside fastapi and
+# The container installs no package — it copies this one beside fastapi and
 # runs it — so the version lives here. A test holds it to pyproject.toml.
 VERSION = "0.20.0"
 
