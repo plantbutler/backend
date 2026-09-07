@@ -1,10 +1,8 @@
 """GET /hello: is this a butler, and is that the token?
 
-The phone asks this once, on the setup screen, and the whole point is that
-its three answers are three different sentences: nothing answered at all
-(wrong address, or the tailnet is down), something answered but not a
-butler, and a butler that did not accept the token. Only the last one is
-about the token, and only the user can tell which mistake they made.
+Three distinct answers: nothing answered at all, something answered but not
+a butler, and a butler that did not accept the token. Only the last is about
+the token.
 """
 
 import pathlib
@@ -44,7 +42,7 @@ def test_the_right_token_gets_the_version(client):
 def test_a_wrong_token_is_refused_in_the_backend_s_own_words(client):
     answer = hello(client, token="not-the-token")
     assert answer.status_code == 401
-    # The app shows refusals verbatim, so this text is user-facing.
+    # the app shows refusals verbatim, so this text is user-facing
     assert answer.text.strip() == "bad token"
 
 
@@ -53,29 +51,25 @@ def test_no_token_header_at_all_is_a_wrong_token(client):
 
 
 def test_a_non_ascii_token_is_a_401_and_not_a_500(client):
-    # Bytes, because httpx will not encode a non-ASCII header itself — which
-    # is also why this is the shape the mistake really arrives in. Starlette
-    # hands it on as latin-1 mojibake; compare_digest raises TypeError on a
-    # non-ASCII str, so bad_token compares bytes, and a token pasted with a
-    # smart quote in it must be a 401 rather than a traceback.
+    # httpx won't encode a non-ASCII header itself; Starlette hands it on as
+    # latin-1 mojibake, and compare_digest needs bytes here or this is a 500.
     answer = client.get("/hello", headers={"X-Token": "tökén".encode("utf-8")})
     assert answer.status_code == 401
 
 
 def test_hello_answers_when_the_database_cannot_be_opened(db, client):
-    """The claim in the docstring, tested: /hello is about the address and
-    the token, never about the disk. A butler whose volume came unmounted
-    must still be able to say the token was wrong."""
+    """/hello is about the address and the token, never the disk: a butler
+    whose volume came unmounted must still say whether the token was wrong."""
     for leftover in db.parent.glob("butler.db*"):
         leftover.unlink()
-    db.mkdir()  # sqlite cannot open a directory
+    db.mkdir()  # sqlite cannot open a path that is a directory
     assert client.get("/health").status_code == 503
     assert hello(client).status_code == 200
 
 
 def test_the_version_matches_pyproject():
     """The container copies butler.py and installs no package, so VERSION
-    cannot be read from the metadata; this is what keeps the two in step."""
+    cannot be read from package metadata; nothing else keeps the two in step."""
     root = pathlib.Path(__file__).resolve().parent.parent
     declared = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
     assert butler.VERSION == declared
@@ -83,9 +77,8 @@ def test_the_version_matches_pyproject():
 
 def test_a_coverage_run_leaves_nothing_for_git_to_add():
     """coverage.py writes `.coverage` beside pyproject: a SQLite file with
-    this checkout's absolute paths in it, rewritten on every run. One was
-    committed once and dirtied the tree after every run since. Untracked
-    and ignored, a `git add -A` cannot bring it back."""
+    this checkout's absolute paths in it, rewritten on every run, so it must
+    stay untracked and ignored."""
     root = pathlib.Path(__file__).resolve().parent.parent
 
     def git(*args):
