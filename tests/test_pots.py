@@ -69,8 +69,8 @@ def test_a_pot_is_born_from_one_line(client):
         "plant_type=herb plant_height_cm=21 pot_diameter_cm=14 soil=peat",
     )
     assert answer.status_code == 200
-    # The contract changed with the pot's identity: the answer names the id
-    # the caller must key on from now on, and the nickname it went in under.
+    # The answer names the id the caller must key on from now on, and the
+    # nickname it went in under.
     assert answer.text == f"pot={pot_id(answer)} name=basil\n"
     assert pot_id(answer).startswith("pot-")
 
@@ -219,13 +219,13 @@ def test_burying_a_pot_and_wiring_it_in_one_body_is_refused(client):
 
 
 def test_the_displacement_backstop_still_closes_a_stray_open_window(client, db):
-    """The invariant here INVERTED with the graveyard: burying a pot now
-    closes its window, so this can no longer be reached through the app.
-    It is reached by hand instead, because the backstop is the only defence
-    left — a reading is stamped with one pot as it lands, and two open
-    windows on one channel would make that pick arbitrary and permanent."""
+    """Reached by hand, not through the app — burying now closes the window
+    itself, so this state is otherwise unreachable. The backstop is the
+    last defence: a reading is stamped with one pot as it lands, and two
+    open windows on one channel would make that pick arbitrary and
+    permanent."""
     basil = pot_id(pot(client, "name=basil controller=0 channel=0 outlet=3"))
-    with sqlite3.connect(db) as con:  # the 2026-09-03 defect, recreated
+    with sqlite3.connect(db) as con:
         con.execute("UPDATE pots SET status = 'graveyard' WHERE id = ?", (basil,))
     assert mappings(db, basil) == [(0, 3, None)], "open, as the old defect left it"
 
@@ -236,8 +236,8 @@ def test_the_displacement_backstop_still_closes_a_stray_open_window(client, db):
 
 def test_a_pot_may_not_park_on_a_working_pots_hose(client, db):
     """The collision check is asked whatever the SAVED pot's own status is:
-    the point is the other pot. It used to be skipped for a disabled pot,
-    which let one open a second window on a working pot's hose."""
+    the point is the other pot. Skipping it for a disabled pot would let
+    one open a second window on a working pot's hose."""
     pot(client, "name=basil controller=0 channel=0 outlet=3")
 
     answer = pot(client, "name=mint controller=0 outlet=3")
@@ -326,9 +326,9 @@ def test_unknown_keys_are_ignored_like_everywhere_else(client):
     assert pot(client, "name=basil colour=green").status_code == 200
     (entry,) = garden(client)
     assert "colour" not in entry
-    # `photo` IS an answer key now — the newest picture, for the thumbnail
-    # beside the name — but it is not a writable field, so a pot that has
-    # never been photographed carries a null rather than nothing.
+    # `photo` is an answer key — the newest picture, for the thumbnail
+    # beside the name — but not a writable field, so a pot that has never
+    # been photographed carries a null rather than nothing.
     assert entry["photo"] is None
 
 
@@ -362,11 +362,10 @@ def test_a_pot_can_be_renamed_by_id(client):
 
 
 def test_a_save_by_name_after_a_rename_creates_a_second_pot(client):
-    """Which is why every edit keys on the id, and why the README says so.
-
-    A `name=` save is a create when that name is free, so a client that
-    remembered the nickname and missed the rename does not recalibrate the
-    pot — it forks it, and calibrates a pot nobody is watering.
+    """Every edit keys on the id for this reason: a `name=` save is a
+    create when that name is free, so a client that remembered the
+    nickname and missed the rename does not recalibrate the pot — it
+    forks it, and calibrates a pot nobody is watering.
     """
     pid = pot_id(pot(client, "name=basil controller=0 channel=0"))
     pot(client, f"id={pid} name=genovese")
@@ -529,9 +528,9 @@ def test_species_round_trips(client):
 
 
 def test_a_create_never_edits_the_pot_that_already_has_that_name(client, db):
-    """The whole pitch: an id-less POST /pot is a create, always. It used to
-    look the name up and edit whatever answered to it, so a "new pot" made
-    against a stale list quietly overwrote an existing one."""
+    """An id-less POST /pot is always a create. Looking the name up and
+    editing whatever answered to it would mean a "new pot" made against a
+    stale list could quietly overwrite an existing one."""
     basil = pot_id(pot(client, "name=basil controller=0 channel=0 soil=peat"))
 
     answer = pot(client, "name=basil soil=peat")
