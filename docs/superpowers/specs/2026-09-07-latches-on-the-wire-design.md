@@ -82,3 +82,38 @@ specifics now). Tests for the three.
 DECISIONS #31 in the umbrella: the board's three latches are on the wire and the backend latches
 on levels; a tap answers the flap. plantbutler/firmware#4 and plantbutler/backend#27 closed by
 the PRs. Global constraints as in the tank-size spec §4.
+
+## 5. Amendments, 2026-09-07, after the review
+
+**A1 — The tap's one try must not wait out the refusal's cooldown, and the dead page must not
+fire before it.** The flap only trips on refusals, and a refusal is an acked dose with
+`flow_ml=0`, which the cooldown gate counts as watering (loop protection, #29). So the D3 try
+waited six hours while D7 paged at three minutes telling the person to do what they had just
+done. Now: while `tap_answers_flap` holds (the flap stands, a non-NULL-snapshot tap later than
+`flap_since`, no water handed since the tap — one try per tap, as implemented), the cooldown
+gate ignores doses acked with `flow_ml = 0` before the tap; and D7 is skipped while it holds —
+the try is pending. After the try: granted → `float=1`, all normal; refused → the ack spends the
+tap, the refusal cools the pot as before, and D7 pages "the board's float check tripped — refill
+to the top and tap refilled, and the butler will try one dose" on the next tick. The flap path
+requires `r.float_ok == 0` (the word the flap forces), never an omitted `float=`.
+
+**A2 — The level's reason is `dry`, and the edge stays beside it.** `ch211=1` is the board held
+dry by whoever did it: a reset with a dose in flight, or `dry on` at the console. Its reason is
+**`dry`**, text "the board is held dry: a reset with the pump running, or dry on at the
+console", step "type dry off on the board". The `err=resetmid` edge keeps its reason
+(`resetmid`, its text, the same step) and is consulted on **every** report, level or no level:
+`dry off` typed at the console before the first post-reset report (bring-up 7c, exactly) would
+otherwise hide the reset for good. When more than one applies on a report: `contra`, then `dry`,
+then `resetmid`. `status.dry` joins `status.contra` in the alerts' quiet gate: no `stale:` or
+`over:` page while the board's own dry level stands after a `/resume`. The app's `LATCH_WORDS`
+and `latchSteps` gain `dry`.
+
+**A3 — The app's flap line survives the page.** A flapped board earns the `float:<c>` page
+within two reports, and the strip then rendered "reservoir empty on board N" for the life of
+the flap. `problems()` renders a raised `float:<c>` for a board whose `flap == 1` as the tripped
+line ("board N's float check tripped: refill to the top and tap refilled"), and `learningGaps`
+says "the board reporting float=1 and pos=ok, or a tap after its float check tripped" when
+`flap == 1`.
+
+**A4 — Firmware tests assert the sibling.** Each latch test asserts the other channel is 0, and
+one test latches both and reads both 1: a merged or masking encoding must fail.
