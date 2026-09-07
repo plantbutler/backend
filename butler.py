@@ -1268,13 +1268,12 @@ POT_CM_FIELDS = {  # centimetres, and a plausible ceiling for each
 }
 POT_MAP_FIELDS = ("controller", "channel", "outlet")  # pot_mappings, not pots
 POT_MODES = ("manual", "learning", "auto")
-# What a pot IS, where `enabled` was what it was allowed to do. A closed set,
-# and shaped so a third word (paused-but-wired, say) is one entry here plus
-# one label in the app.
+# What a pot IS, not what it may do. A closed set, shaped so a third word
+# (paused-but-wired, say) is one entry here plus one label in the app.
 POT_STATUSES = ("alive", "graveyard")
-# A positive allow-list, never `!= 'graveyard'`. A status this build has not
-# heard of — a newer backend's word reaching an older reader — must not
-# water, propose or page. Failure direction is dry (DECISIONS #5).
+# A positive allow-list, never `!= 'graveyard'`: a status this build has not
+# heard of — a newer backend's word reaching an older reader — must not water,
+# propose or page. The failure direction is dry.
 LIVE_STATUSES = ("alive",)
 
 
@@ -1290,10 +1289,10 @@ def live_sql(col: str = "status") -> str:
     return f"{col} IN (" + ", ".join(f"'{s}'" for s in LIVE_STATUSES) + ")"
 
 
-# A pot the rules can water on a board (the one `?`): live, on a channel
-# and an outlet, calibrated, with a target and a dose. The ladder's own
-# candidate shape, and the stale page's "a try can still come" — one
-# predicate, so the page cannot wait on a pot the ladder would skip.
+# A pot the rules can water on a board (the one `?`): live, on a channel and
+# an outlet, calibrated, with a target and a dose. The ladder's candidates and
+# the stale page's "a try can still come" are one predicate, so the page
+# cannot wait on a pot the ladder would skip.
 RULES_POT_SQL = (
     f"{live_sql()} AND controller = ? AND channel IS NOT NULL "
     "AND outlet IS NOT NULL AND dry_raw IS NOT NULL AND wet_raw IS NOT NULL "
@@ -1301,11 +1300,11 @@ RULES_POT_SQL = (
 )
 
 
-# The key families that are recorded and never cleared: a dose judgement,
-# a hose's failure floor, a tank announcement, a proposal nudge and the
-# ticker's own rows. What stands raised, to /health's list and to the
-# up-probe's count, is a condition with none of these among it — one
-# predicate, so the list cannot show what the count leaves out.
+# The key families that are recorded and never cleared: a dose judgement, a
+# hose's failure floor, a tank announcement, a proposal nudge, the ticker's own
+# rows. What stands raised — to /health's list and to the up-probe's count
+# alike — is a condition with none of these among it, in one predicate, so the
+# list cannot show what the count leaves out.
 ONE_SHOT_KEYS = ("dose:", "dosefail:", "tank:", "proposal:", "meta:")
 RAISED_SQL = "cleared_ts IS NULL" + "".join(
     f" AND key NOT LIKE '{family}%'" for family in ONE_SHOT_KEYS
@@ -1364,19 +1363,18 @@ POT_COLUMNS = (  # the pots_now view's shape: pot columns plus the open mapping
 def window_edge(con: sqlite3.Connection, pot_id: str, now: int) -> int:
     """Where a pot's open mapping window closes and its next one opens.
 
-    `now`, except that the boundary is never allowed to move backwards
-    past what the database has already recorded. A window that ends before
-    it began, or before a dose it holds, matches nothing at all: the join
-    wants from_ts <= sent_ts <= to_ts, and the pot silently stops owning
-    that dose's cooldown and daily cap. Fixing the clock afterwards does
-    not rewrite the row, so unlike a clock that is merely wrong this is
-    permanent — and pot_mappings is what the watering gates read.
+    `now`, except that the boundary never moves backwards past what the
+    database has already recorded. A window that ends before it began, or
+    before a dose it holds, matches nothing: the join wants
+    from_ts <= sent_ts <= to_ts, so the pot silently stops owning that dose's
+    cooldown and daily cap, and fixing the clock afterwards does not rewrite
+    the row.
 
-    The server clock does step backwards: a container that starts before
-    the NAS has synced runs minutes or hours off until NTP corrects it,
-    and a wiring save on either side of that correction is ordinary. So
-    the floor is the window's own start and the newest dose that went down
-    its hose inside it. With the clock behaving, all three are `now`.
+    The server clock does step backwards — a container that starts before the
+    NAS has synced runs hours off until NTP corrects it, and a wiring save on
+    either side of that is ordinary. So the floor is the window's own start
+    and the newest dose that went down its hose inside it; with the clock
+    behaving, all three are `now`.
     """
     row = con.execute(
         "SELECT from_ts, controller, outlet FROM pot_mappings "
@@ -1397,20 +1395,19 @@ def window_edge(con: sqlite3.Connection, pot_id: str, now: int) -> int:
 def _hose_since(pot: str, controller: str, outlet: str) -> str:
     """A scalar SQL expression: when this pot's HOSE last changed.
 
-    A dose belongs to a pot and travels with it, but a proposal is an offer
-    to open a hose, so it counts only while this pot is still the one on
-    that hose. The open mapping window is the wrong fence for that: a
-    correction to the sensor CHANNEL closes it and opens another without
-    the hose having moved anywhere, and a pending proposal would silently
-    leave the card while its 'proposed' row went on holding the hose slot.
+    A dose belongs to a pot and travels with it, but a proposal is an offer to
+    open a hose, so it counts only while this pot is still on that hose. The
+    open mapping window is the wrong fence: a correction to the sensor CHANNEL
+    closes it and opens another without the hose moving, and a pending
+    proposal would leave the card while its 'proposed' row went on holding the
+    hose slot.
 
-    So: the start of the contiguous run of this pot's windows that share
-    its current (controller, outlet). Windows are contiguous by
-    construction — a remap closes the open row and opens the next in the
-    same second — so that start is the last time a window of this pot
-    named a DIFFERENT hose, and the pot's first window when none ever did.
-    The three arguments are SQL expressions naming the pot and its current
-    hose, never values off the wire.
+    So: the start of the contiguous run of this pot's windows sharing its
+    current (controller, outlet). Windows are contiguous by construction — a
+    remap closes the open row and opens the next in the same second — so that
+    start is the last time a window of this pot named a DIFFERENT hose, and
+    the pot's first window when none ever did. The three arguments are SQL
+    expressions, never values off the wire.
     """
     return (
         "COALESCE("
@@ -1466,21 +1463,18 @@ def parse_pot(text: str) -> dict:
                 raise ValueError(f"mode= must be one of {'|'.join(POT_MODES)}")
             fields[key] = value
         elif key == "plant_type":
-            # A closed set on the way in, tolerant on the way out: a value
-            # written before this set existed still reads, it simply matches
-            # no band. Refusing it here is what keeps the dropdown honest —
-            # a free-text "basil" used to look saved and quietly pick
-            # nothing.
+            # Closed on the way in, tolerant on the way out: a value from
+            # outside the set still reads and simply matches no band. The
+            # refusal here is what stops a free-text "basil" looking saved
+            # while it picks no watering band at all.
             if value not in PLANT_KINDS:
                 raise ValueError(
                     f"plant_type= must be one of {'|'.join(PLANT_KINDS)}"
                 )
             fields[key] = value
         elif key == "soil":
-            # Closed on the way in for the same reason as plant_type, and
-            # tolerant on the way out for the same reason: a row still
-            # holding free text from before this set reads fine and simply
-            # matches no shift.
+            # Closed in and tolerant out, as plant_type is: a value from
+            # outside the set reads fine and matches no shift.
             if value not in SOIL_SHIFTS:
                 raise ValueError(f"soil= must be one of {'|'.join(SOIL_SHIFTS)}")
             fields[key] = value
@@ -1618,8 +1612,8 @@ def parse_photo(params: QueryParams) -> tuple[str, int | None, int | None]:
 def parse_photos(params: QueryParams) -> tuple[str, int]:
     """`GET /photos?pot=<id>&limit=<1..500>`: one pot's strip, newest first.
 
-    A pot is required, unlike /doses. A garden-wide roll of photographs is
-    a gallery, and the pitch is a pot carrying its own growth history.
+    A pot is required, unlike /doses: a photograph belongs to a plant's own
+    growth history, and a garden-wide roll of them is a gallery.
     """
 
     def one(key: str, default: str | None = None) -> str | None:
@@ -1633,9 +1627,8 @@ def parse_photos(params: QueryParams) -> tuple[str, int]:
         raise ValueError("no pot= in the request")
     if not SAFE_ID.fullmatch(pot):
         raise ValueError(f"not a pot id: {pot!r}")
-    # +1 like every other bound in this file (DOSES_MAX, MAX_CHANNEL,
-    # MAX_CAP_S): _int_in's top is exclusive, and the named max is meant to
-    # be a limit somebody can actually ask for.
+    # +1 like every other bound here: _int_in's top is exclusive, and the
+    # named max is meant to be a limit somebody can actually ask for.
     return pot, _int_in(one("limit", str(PHOTO_LIMIT)) or "", "limit", 1, MAX_PHOTO_LIMIT + 1)
 
 
@@ -1711,7 +1704,7 @@ def in_quiet(hour: int, start: int, end: int) -> bool:
     return hour >= start or hour < end
 
 
-# --- What does this plant want? (cycle 2) --------------------------------
+# --- The care lookup -----------------------------------------------------
 #
 # Two hops, both cached, and neither of them a source of watering numbers.
 # GBIF turns whatever somebody typed into the accepted binomial: free, no
@@ -1719,11 +1712,11 @@ def in_quiet(hour: int, start: int, end: int) -> bool:
 # filed under "Dracaena trifasciata". Trefle then answers about that
 # binomial, when it knows it at all.
 #
-# The target band comes from target_band() below and from nowhere else.
-# Trefle carries no watering regime: probed with a real key on 2026-09-04,
-# `soil_humidity` was NULL for every species asked, houseplants included.
-# What it does carry — light and atmospheric humidity on its own 0-10
-# scales — is context for a human, not an input to a number.
+# The target band comes from target_band() below and from nowhere else. The
+# care source carries no watering regime — `soil_humidity` is NULL for every
+# species, houseplants included — and what it does carry, light and
+# atmospheric humidity on its own 0-10 scales, is context for a human rather
+# than an input to a number.
 
 GBIF_MATCH_URL = "https://api.gbif.org/v1/species/match"
 TREFLE_BASE = "https://trefle.io/api/v1"
