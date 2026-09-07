@@ -356,12 +356,12 @@ ADDED_COLUMNS = (
     # the word's clock: carry_drops, a lambda for the same reason as
     # above), the board's last word on the float with when it last
     # changed and last rose, the ch207 of its last report (none yet), and
-    # the firm word — the word two consecutive reports agreed on — with
-    # its clock. The word and its clocks are carried from float_ok and
-    # float_since so a tank sitting at full through the upgrade still
-    # closes its sample and its rise is where it was — all under one
-    # gate: a last pre-upgrade report that omitted float= blanked float_ok
-    # and restarted float_since, and a clock carried without its word would
+    # the firm word — the word two consecutive reports agreed on. The
+    # word and its clocks are carried from float_ok and float_since so a
+    # tank sitting at full through the upgrade still closes its sample
+    # and its rise is where it was — all under one gate: a last
+    # pre-upgrade report that omitted float= blanked float_ok and
+    # restarted float_since, and a clock carried without its word would
     # read as a float that has not moved since before any tap. The rise
     # comes only with a word of full; float_since under a word of empty
     # is its fall. The firm word is the word, under the same gate: the
@@ -376,13 +376,6 @@ ADDED_COLUMNS = (
     Added("status", "float_rise", "INTEGER", "float_since", gate="float_ok = 1"),
     Added("status", "contra", "INTEGER NOT NULL DEFAULT 0"),
     Added("status", "float_firm", "INTEGER", "float_word", gate="float_ok IS NOT NULL"),
-    Added(
-        "status",
-        "float_firm_since",
-        "INTEGER",
-        "float_word_since",
-        gate="float_ok IS NOT NULL",
-    ),
 )
 
 
@@ -3001,10 +2994,9 @@ def create_app(
                 "INSERT INTO status (controller, ts, float_ok, float_since, "
                 "pos, pos_since, float_seen, pos_seen, float_bad, "
                 "float_bad_prev, pos_bad, pos_bad_prev, err, err_ts, pos_ok_seen, "
-                "float_word, float_word_since, float_rise, contra, "
-                "float_firm, float_firm_since) "
+                "float_word, float_word_since, float_rise, contra, float_firm) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?, ?, ?, "
-                "NULL, ?, NULL, NULL) "
+                "NULL, ?, NULL) "
                 "ON CONFLICT(controller) DO UPDATE SET ts = excluded.ts, "
                 "float_ok = excluded.float_ok, pos = excluded.pos, "
                 "float_since = CASE WHEN status.float_ok IS excluded.float_ok "
@@ -3037,9 +3029,11 @@ def create_app(
                 # after a report that said nothing. The firm word is the
                 # word once this report and the last that carried float=
                 # agree — one sighting is a glitch by the board's own
-                # design — and its clock, like the rise (the firm word
-                # going to 1, the first firm word of full included), is
-                # where the word moved, not where it was confirmed: the
+                # design. Its clocks are the two edges the tank is
+                # measured on and no other: the rise here (the firm word
+                # going to 1, the first firm word of full included) and
+                # the drop the report path stamps on the tap below, each
+                # where the word moved, not where it was confirmed — the
                 # report that raises the word hands its queued dose with
                 # that clock, and the counter must not lose it. Every SET
                 # reads the row before this update, so float_word_since
@@ -3052,10 +3046,6 @@ def create_app(
                 "float_firm = CASE WHEN excluded.float_word IS NOT NULL "
                 "AND status.float_word IS excluded.float_word "
                 "THEN excluded.float_word ELSE status.float_firm END, "
-                "float_firm_since = CASE WHEN excluded.float_word IS NOT NULL "
-                "AND status.float_word IS excluded.float_word "
-                "AND status.float_firm IS NOT excluded.float_word "
-                "THEN status.float_word_since ELSE status.float_firm_since END, "
                 "float_rise = CASE WHEN excluded.float_word = 1 "
                 "AND status.float_word = 1 AND status.float_firm IS NOT 1 "
                 "THEN status.float_word_since ELSE status.float_rise END, "

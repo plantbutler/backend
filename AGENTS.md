@@ -164,10 +164,10 @@ watering.
 - **The tank has a size (0.19.0).** `pumped_since()` is the acked water handed out at or after
   the origin's second (the rise's own report hands a dose with the same clock), the daily cap's
   own expression; without an origin it is 0 and nothing arms. The float is read on its **firm**
-  word — `status.float_firm`, the word once two consecutive reports carrying `float=` agree,
-  with `float_firm_since`; `float_word` stays the last real word, kept across a report that
-  omits `float=` — because one sighting is a glitch by the board's own design, and a slosh at
-  report time must not close a sample early and hand the origin to its recovery. On the firm
+  word — `status.float_firm`, the word once two consecutive reports carrying `float=` agree;
+  `float_word` stays the last real word, kept across a report that omits `float=` — because
+  one sighting is a glitch by the board's own design, and a slosh at report time must not
+  close a sample early and hand the origin to its recovery. On the firm
   word's first 1 → 0 after the tap that saw it full, the report path stamps that tap's
   `drop_ts` where the word fell (`base_tap(fell)`: the latest tap before the fall, so a person
   who filled and tapped between the two sightings keeps a clean tap and the earlier one gets the

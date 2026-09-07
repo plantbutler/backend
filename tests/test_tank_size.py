@@ -90,9 +90,9 @@ def age(db, seconds):
         con.execute(
             "UPDATE status SET float_since = float_since - ?, "
             "float_word_since = float_word_since - ?, float_rise = float_rise - ?, "
-            "float_firm_since = float_firm_since - ?, float_seen = float_seen - ?, "
-            "float_bad = float_bad - ?, float_bad_prev = float_bad_prev - ?",
-            (seconds,) * 7,
+            "float_seen = float_seen - ?, float_bad = float_bad - ?, "
+            "float_bad_prev = float_bad_prev - ?",
+            (seconds,) * 6,
         )
         con.execute(
             "UPDATE commands SET created_ts = created_ts - ?, "
@@ -207,11 +207,9 @@ def rise(db):
 
 
 def firm(db):
-    """The float's firm word and its clock: what two consecutive reports
-    agreed on, and where the word moved to it."""
-    return run_sql(
-        db, "SELECT float_firm, float_firm_since FROM status WHERE controller = 0"
-    )[0]
+    """The float's firm word: what two consecutive reports agreed on. Its
+    clocks are the edges the tank is measured on, `drops` and `rise`."""
+    return run_sql(db, "SELECT float_firm FROM status WHERE controller = 0")[0][0]
 
 
 def drops(db):
@@ -416,13 +414,13 @@ def test_one_sighting_of_empty_between_two_of_full_moves_nothing(client, db):
     full(client)
     since = tap(client, db)
     dose(client, 100, flow=90)
-    risen, settled = rise(db), firm(db)
-    assert settled == (1, risen)
+    risen = rise(db)
+    assert firm(db) == 1
     report(client, "c=0 ch0=1 float=0")  # a slosh
-    assert firm(db) == settled and drops(db) == [None] and samples(db) == []
+    assert firm(db) == 1 and drops(db) == [None] and samples(db) == []
     report(client, "c=0 ch0=1")  # a report that says nothing sits between
     report(client, "c=0 ch0=1 float=1")  # and full again: no rise
-    assert firm(db) == settled and rise(db) == risen
+    assert firm(db) == 1 and rise(db) == risen
     assert origin(db) == (since, "tap") and health(client)["pumped_ml"] == 90
     dose(client, 50, flow=50)
     answer = post(client, "/command", "c=0 water=3 ml=40")
@@ -430,35 +428,38 @@ def test_one_sighting_of_empty_between_two_of_full_moves_nothing(client, db):
     cmd_id = int(answer.text.strip().removeprefix("cmd="))
     handed = report(client, "c=0 ch0=1 float=0 pos=ok").text  # the first sighting
     assert f"cmd={cmd_id} water=3 ml=40" in handed
-    assert firm(db) == settled and drops(db) == [None] and samples(db) == []
+    assert firm(db) == 1 and drops(db) == [None] and samples(db) == []
     fell = word_since(db)
     # The next agrees, and acks the dose the first sighting handed.
     report(client, f"c=0 ch0=1 float=0 pos=ok ack={cmd_id} flow_ml=35")
-    assert firm(db) == (0, fell) and drops(db) == [fell]
+    assert firm(db) == 0 and drops(db) == [fell]
     assert samples(db) == [(since, 90 + 50 + 35)]
 
 
-def test_the_firm_words_clock_is_where_the_word_moved(client, db):
-    """The firm word's clock is the word's own: where it moved, not where
-    the next report confirmed it. On a board the two agreeing reports are
-    a beat apart, and the report that raises the word hands its queued
-    dose with the move's clock — a clock set at the confirmation would
-    put that dose before the rise and off the counter. The tests around
-    this one confirm inside a second, where the two are one number; here
-    a beat sits between, on the drop and on the rise (spec D3, D4,
-    thrice)."""
+def test_the_firm_words_clocks_are_where_the_word_moved(client, db):
+    """The firm word's clocks — the drop on its tap, the rise — are the
+    word's own: where it moved, not where the next report confirmed it.
+    On a board the two agreeing reports are a beat apart, and the report
+    that raises the word hands its queued dose with the move's clock — a
+    clock set at the confirmation would put that dose before the rise and
+    off the counter. The tests around this one confirm inside a second,
+    where the two are one number; here a beat sits between, on the drop
+    and on the rise (spec D3, D4, thrice)."""
     full(client)
+    tap(client, db)
     report(client, "c=0 ch0=1 float=0")  # the word fell here...
     age(db, 30)
     fell = word_since(db)
+    assert firm(db) == 1 and drops(db) == [None]
     report(client, "c=0 ch0=1 float=0")  # ...and is confirmed a beat later
-    assert firm(db) == (0, fell)
+    assert firm(db) == 0 and drops(db) == [fell]
     report(client, "c=0 ch0=1 float=1")  # rose here...
-    assert firm(db) == (0, fell)  # one sighting moves nothing
+    assert firm(db) == 0  # one sighting moves nothing
     age(db, 30)
     rose = word_since(db)
     report(client, "c=0 ch0=1 float=1")  # ...and is confirmed a beat later
-    assert firm(db) == (1, rose) and rise(db) == rose
+    assert firm(db) == 1 and rise(db) == rose
+    assert origin(db) == (rose, "rise")
 
 
 def test_a_forced_zero_is_not_a_drop(client, db):
@@ -478,7 +479,7 @@ def test_a_forced_zero_is_not_a_drop(client, db):
     report(client, "c=0 ch0=1 float=0 pos=ok ch207=1")  # the forced 0...
     report(client, "c=0 ch0=1 float=0 pos=ok ch207=1")  # ...on every report
     assert health(client)["latched"]["reason"] == "contra"
-    assert firm(db)[0] == 0  # the word is what the board says, forced or not
+    assert firm(db) == 0  # the word is what the board says, forced or not
     assert drops(db) == [None] and samples(db) == []
     assert post(client, "/resume", "c=0").status_code == 200
     report(client, "c=0 ch0=1 float=1 pos=ok ch207=0")  # clear contra was typed
@@ -686,7 +687,7 @@ def test_a_bounce_while_the_firm_word_is_empty_is_no_drop(client, db):
     tap(client, db)
     dose(client, 100, flow=100)
     empty(client)  # ran down: the firm word's drop, and the tap's sample
-    assert firm(db)[0] == 0 and drops(db) == [word_since(db)]
+    assert firm(db) == 0 and drops(db) == [word_since(db)]
     assert samples(db) == [(taps(db)[0], 100)]
     report(client, "c=0 ch0=1 float=0")  # still empty: nothing moves
     assert drops(db) == [word_since(db)] and samples(db) == [(taps(db)[0], 100)]
@@ -704,7 +705,7 @@ def test_a_bounce_while_the_firm_word_is_empty_is_no_drop(client, db):
     assert health(client)["pumped_ml"] == 77
     report(client, "c=0 ch0=1 float=1")  # a slosh...
     report(client, "c=0 ch0=1 float=0")  # ...and back: the word's clock passes the tap
-    assert word_since(db) > second and firm(db)[0] == 0
+    assert word_since(db) > second and firm(db) == 0
     report(client, "c=0 ch0=1 float=0")  # the next agrees with the bounce's fall
     assert drops(db) == [dropped, None] and samples(db) == [(first, 100)]
     assert origin(db) == (second, "tap") and health(client)["pumped_ml"] == 77
@@ -1045,15 +1046,15 @@ def test_an_existing_database_carries_the_floats_last_word_at_startup(db):
         create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900)
     )
     # The word, its clock and its rise, carried from float_ok and
-    # float_since, and the firm word with its clock from those: the rise
-    # the float had before the upgrade is where it was, the one report
-    # the upgrade has to go on is taken at its word, and no report has
-    # carried ch207 yet.
+    # float_since, and the firm word from the word: the rise the float
+    # had before the upgrade is where it was, the one report the upgrade
+    # has to go on is taken at its word, and no report has carried ch207
+    # yet.
     assert run_sql(
         db,
-        "SELECT float_word, float_word_since, float_rise, contra, "
-        "float_firm, float_firm_since FROM status",
-    ) == [(1, 5, 5, 0, 1, 5)]
+        "SELECT float_word, float_word_since, float_rise, contra, float_firm "
+        "FROM status",
+    ) == [(1, 5, 5, 0, 1)]
     assert post(client, "/refill", "c=0").status_code == 200  # snapshots the carried 1
     run_sql(db, "UPDATE refills SET ts = ts - 60 WHERE float_ok IS NOT NULL")
     assert refills(db) == [(None,), (1,)]
@@ -1075,8 +1076,8 @@ def test_the_carried_clocks_come_only_with_the_word(db):
     neither is a clock for it — a clock without a word would read as a
     float that has not moved since before any tap. A word of empty brings
     its clock and no rise (float_since is its fall); a word of full brings
-    both. The firm word and its clock are the word's, under the same gate
-    (spec D3, amended, then thrice)."""
+    both. The firm word is the word, under the same gate (spec D3,
+    amended, then thrice)."""
     with sqlite3.connect(db) as con:
         con.executescript(
             OLD_STATUS
@@ -1088,12 +1089,12 @@ def test_the_carried_clocks_come_only_with_the_word(db):
     TestClient(create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900))
     assert run_sql(
         db,
-        "SELECT controller, float_word, float_word_since, float_rise, "
-        "float_firm, float_firm_since FROM status ORDER BY controller",
+        "SELECT controller, float_word, float_word_since, float_rise, float_firm "
+        "FROM status ORDER BY controller",
     ) == [
-        (0, None, None, None, None, None),
-        (1, 0, 6, None, 0, 6),
-        (2, 1, 5, 5, 1, 5),
+        (0, None, None, None, None),
+        (1, 0, 6, None, 0),
+        (2, 1, 5, 5, 1),
     ]
 
 
@@ -1167,9 +1168,9 @@ def test_a_tank_already_empty_at_the_upgrade_carries_its_drop(db):
     # The firm word is the word the row had, this shape having no other.
     assert run_sql(
         db,
-        "SELECT controller, float_firm, float_firm_since FROM status "
+        "SELECT controller, float_firm FROM status "
         "WHERE controller IN (0, 3) ORDER BY controller",
-    ) == [(0, 0, 30), (3, 1, 30)]
+    ) == [(0, 0), (3, 1)]
     # Board 0 pumped a tank's worth between its tap and the fall — the run
     # the old code closed — and is now refilled by someone who forgot to
     # tap: the rise is the origin, nothing is on the counter, and the

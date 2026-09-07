@@ -96,7 +96,9 @@ ml)`. `UNIQUE(controller, refill_ts)`: one sample per tap, so a float bouncing a
 nothing after the first crossing (`INSERT OR IGNORE`). Zero pumped stores nothing: a tank
 drained by something the meter never saw (evaporation, a tap that was not a fill) is not a
 measurement. *Amended 2026-09-07, twice, then thrice:* on a 1 → 0 of the **firm** word — `status.float_firm`,
-the word once two consecutive reports that carry `float=` agree, with `float_firm_since`; the
+the word once two consecutive reports that carry `float=` agree — its clocks are this drop
+(`drop_ts`) and the rise (`float_rise`), and no other: *2026-09-07, from the review*, a
+`float_firm_since` beside it had no reader and went; the
 wire's word is one glitch to 0 by design (`safety.cpp:35-41` fails any of three samples), and a
 slosh at report time must not close a sample early and hand the origin to the glitch's recovery
 — the latest non-NULL-snapshot tap's `drop_ts` is set if it was NULL, **unless the report carries

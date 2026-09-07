@@ -615,9 +615,9 @@ def age(db, seconds):
         con.execute(
             "UPDATE status SET float_since = float_since - ?, "
             "float_word_since = float_word_since - ?, float_rise = float_rise - ?, "
-            "float_firm_since = float_firm_since - ?, float_seen = float_seen - ?, "
-            "float_bad = float_bad - ?, float_bad_prev = float_bad_prev - ?",
-            (seconds,) * 7,
+            "float_seen = float_seen - ?, float_bad = float_bad - ?, "
+            "float_bad_prev = float_bad_prev - ?",
+            (seconds,) * 6,
         )
         # The pages too, the ticker's own bookkeeping rows excepted (they
         # are its clock): a tap clears `over:` only when it is later than

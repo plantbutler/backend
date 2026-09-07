@@ -231,16 +231,16 @@ CREATE TABLE IF NOT EXISTS status (
                                     -- being 0: the board's own contradiction
                                     -- latch stands until `clear contra` is typed,
                                     -- and over: and stale: keep quiet while it does
-  float_firm     INTEGER,           -- the word once two consecutive reports that
+  float_firm     INTEGER            -- the word once two consecutive reports that
                                     -- carry float= agree: one sighting is a
                                     -- glitch by the board's own design, and the
                                     -- edges the tank is measured on — the drop
-                                    -- that closes a sample, the rise that
-                                    -- restarts the counter — are this word's
-  float_firm_since INTEGER          -- when the firm word last changed: where the
-                                    -- word moved, not where the next report
-                                    -- confirmed it, so a dose handed as the
-                                    -- float rose is on the counter
+                                    -- that closes a sample (refills.drop_ts),
+                                    -- the rise that restarts the counter
+                                    -- (float_rise) — are this word's, each
+                                    -- stamped where the word moved, not where
+                                    -- the next report confirmed it, so a dose
+                                    -- handed as the float rose is on the counter
 );
 
 -- A refill is a human event (pitch "Trust the tank"): the app says so, the
