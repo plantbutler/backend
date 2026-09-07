@@ -84,8 +84,8 @@ def test_a_photograph_goes_up_and_comes_back_byte_for_byte(client):
     assert got.status_code == 200
     assert got.content == JPEG
     assert got.headers["content-type"] == "image/jpeg"
-    # The store holds JPEGs only, checked on the way in, and this says so:
-    # no browser gets to sniff a picture into markup.
+    # the store holds JPEGs only, checked on the way in: no browser gets
+    # to sniff a picture into markup
     assert got.headers["x-content-type-options"] == "nosniff"
 
 
@@ -109,9 +109,8 @@ def test_the_newest_picture_is_first(client):
     first = photo_id(upload(client, pot))
     second = photo_id(upload(client, pot))
     listed = [row["id"] for row in strip(client, pot).json()["photos"]]
-    # Both land in the same second, so this is the tiebreak doing the work,
-    # not the clock: without the rowid the order would be arbitrary and the
-    # strip would shuffle itself between refreshes.
+    # both land in the same second, so this is the tiebreak doing the work,
+    # not the clock — without it the order would be arbitrary
     assert listed == [second, first]
 
 
@@ -127,14 +126,14 @@ def test_the_file_lands_under_the_pot_s_own_directory(client, store):
     pot = make_pot(client)
     pid = photo_id(upload(client, pot))
     assert (store / pot / f"{pid}.jpg").read_bytes() == JPEG
-    # And nothing half-written is left beside it.
+    # nothing half-written is left beside it
     assert list((store / pot).glob("*.part")) == []
 
 
 def test_the_species_of_the_day_is_stamped_on_the_picture(client):
-    """A pot outlives its plant. The strip draws the break where one plant
-    ended and the next began, and this is what it draws it from — no
-    replant event, just what the pot said it was at the time."""
+    """A pot outlives its plant: the strip draws the break where one plant
+    ended and the next began from what the pot said it was at the time,
+    since there is no replant event."""
     pot = make_pot(client, "name=windowsill species=Ocimum_basilicum")
     upload(client, pot)
     client.post(
@@ -157,7 +156,7 @@ def test_every_photo_route_wants_the_token(client, token):
     assert strip(client, pot, token=token).status_code == 401
     assert fetch(client, pid, token=token).status_code == 401
     assert forget(client, pid, token=token).status_code == 401
-    # And a refused delete really did not delete.
+    # a refused delete really did not delete
     assert fetch(client, pid).status_code == 200
 
 
@@ -177,8 +176,7 @@ def test_a_photograph_of_a_pot_that_does_not_exist_is_refused(client, store):
     answer = upload(client, "pot-abcdef")
     assert answer.status_code == 400
     assert "no such pot" in answer.text
-    # Refused before anything was written: an orphan file is harmless but
-    # this one would never even be an accident.
+    # refused before anything was written
     assert list(store.rglob("*.jpg")) == []
 
 
@@ -238,9 +236,9 @@ def test_an_impossible_limit_is_refused(client, limit):
 
 
 def test_the_biggest_limit_the_refusal_names_can_actually_be_asked_for(client):
-    """`_int_in`'s top is exclusive, so every named maximum in this service
-    needs a +1 to mean what its own refusal says it means. Without this
-    test the off-by-one is invisible: 501 is refused either way."""
+    """`_int_in`'s top is exclusive, so a named maximum needs a +1 to mean
+    what its own refusal says; without this the off-by-one is invisible,
+    since 501 is refused either way."""
     pot = make_pot(client)
     assert strip(client, pot, query="&limit=500").status_code == 200
 
@@ -288,8 +286,7 @@ def test_a_delete_of_something_that_is_not_an_id_is_refused(client):
 
 def test_a_row_whose_file_has_gone_is_listed_as_missing_not_served(client, store):
     """What a database restored from a newer backup than the volume looks
-    like. It cannot be hidden, so it is said out loud rather than served as
-    a picture that will not load."""
+    like: said out loud rather than served as a picture that will not load."""
     pot = make_pot(client)
     pid = photo_id(upload(client, pot))
     (store / pot / f"{pid}.jpg").unlink()
@@ -303,9 +300,8 @@ def test_a_row_whose_file_has_gone_is_listed_as_missing_not_served(client, store
 
 def test_a_file_no_row_knows_about_is_invisible(client, store):
     """The other direction — a crash between the two writes, or a volume
-    restored from a newer backup than the database. Nothing lists it and
-    nothing serves it: the strip is built from rows, never from the
-    directory."""
+    restored from a newer backup than the database: the strip is built
+    from rows, never from the directory."""
     pot = make_pot(client)
     orphan = store / pot
     orphan.mkdir(parents=True, exist_ok=True)
@@ -315,10 +311,10 @@ def test_a_file_no_row_knows_about_is_invisible(client, store):
 
 
 def test_a_failed_row_write_takes_its_file_with_it(client, db, store, monkeypatch):
-    """The bytes are written first, so this is the window where an orphan
-    could be minted deliberately rather than by a crash. The table is taken
-    away in that very window: the file is on disk, and the row that was
-    about to point at it never lands."""
+    """The bytes are written first; this is the window where an orphan can
+    be minted deliberately rather than by a crash — the table is taken away
+    while the file is on disk and the row that was about to point at it
+    never lands."""
     pot = make_pot(client)
     real = butler.write_new_file
 
@@ -359,9 +355,8 @@ def test_deleting_twice_is_refused_rather_than_pretended(client):
 
 
 def test_a_row_whose_file_is_already_gone_can_still_be_deleted(client, store):
-    """The listing is what the person is looking at, so the listing is what
-    has to go. A volume that will not give up the bytes is not a reason to
-    keep showing a picture somebody asked to remove."""
+    """A volume that will not give up the bytes is not a reason to keep
+    showing a picture somebody asked to remove."""
     pot = make_pot(client)
     pid = photo_id(upload(client, pot))
     (store / pot / f"{pid}.jpg").unlink()
@@ -381,17 +376,14 @@ def test_a_delete_without_a_photo_is_refused(client):
 
 
 def test_the_write_lock_is_not_held_across_the_disk_write(client, db, monkeypatch):
-    """Uploading a picture must not stop the garden reporting. The bytes go
-    to disk between two short connections, not inside one: a write
-    transaction held for the length of a multi-megabyte write to a NAS
-    volume would answer every board report in that window with "try
-    again"."""
+    """Uploading a picture must not stop the garden reporting: the bytes go
+    to disk between two short connections, not inside one, or a board
+    report landing mid-upload would get "try again"."""
     wrote = []
     real = butler.write_new_file
 
     def slow(path, blob):
-        # Stands in for POST /report landing mid-upload: a writer with a
-        # short timeout, which fails outright if the lock is held.
+        # a writer with a short timeout, which fails outright if the lock is held
         with sqlite3.connect(db, timeout=0.2) as other:
             other.execute(
                 "INSERT INTO readings (ts, controller, channel, raw) "
@@ -409,7 +401,7 @@ def test_the_write_lock_is_not_held_across_the_disk_write(client, db, monkeypatc
 
 
 def test_two_uploads_at_once_both_land(client):
-    """Two phones, or one impatient thumb. Ids are minted per upload, so
+    """Two phones, or one impatient thumb: ids are minted per upload, so
     neither may overwrite the other's file or row."""
     pot = make_pot(client)
     answers = []
@@ -444,9 +436,9 @@ def test_the_store_sits_beside_the_database_by_default(tmp_path):
 
 
 def test_a_photo_store_under_an_unmounted_data_is_refused(tmp_path, monkeypatch):
-    """The same refusal the database gets, for the same reason: a forgotten
-    bind mount would store photographs in the container's own layer and
-    lose every one of them on the next recreate, while looking healthy."""
+    """The same refusal the database gets: a forgotten bind mount would
+    store photographs in the container's own layer and lose every one of
+    them on the next recreate, while looking healthy."""
     monkeypatch.setattr(butler.os.path, "ismount", lambda path: False)
     with pytest.raises(ValueError, match="not a mounted volume"):
         create_app(
@@ -461,10 +453,9 @@ def test_a_photo_store_under_an_unmounted_data_is_refused(tmp_path, monkeypatch)
 
 
 def test_a_taken_id_is_given_up_rather_than_overwritten(client, store, monkeypatch):
-    """The dangerous half of a collision. Writing the file first and finding
-    out from the INSERT would destroy the picture already at that path — an
-    earlier photograph, already committed, whose row would then be left
-    pointing at nothing."""
+    """The dangerous half of a collision: writing the file first and
+    finding out from the INSERT would destroy the picture already at that
+    path, an earlier photograph whose row would then point at nothing."""
     pot = make_pot(client)
     minted = iter(["photo-aaaaaaaa", "photo-aaaaaaaa", "photo-bbbbbbbb"])
     monkeypatch.setattr(butler, "new_photo_id", lambda: next(minted))
@@ -474,7 +465,7 @@ def test_a_taken_id_is_given_up_rather_than_overwritten(client, store, monkeypat
     monkeypatch.undo()
     assert first == "photo-aaaaaaaa"
     assert second == "photo-bbbbbbbb"
-    # The first photograph is untouched, which is the whole point.
+    # the first photograph is untouched, which is the whole point
     assert fetch(client, first).content == JPEG
     assert fetch(client, second).content == second_bytes
     assert not any(row["missing"] for row in strip(client, pot).json()["photos"])
@@ -482,8 +473,8 @@ def test_a_taken_id_is_given_up_rather_than_overwritten(client, store, monkeypat
 
 def test_an_id_whose_row_outlived_its_file_is_also_given_up(client, store, monkeypatch):
     """The other way two ids collide: the file is gone but the row is not,
-    which is what a half-restored backup leaves. The new picture must not
-    take that row's id and must not touch that row."""
+    what a half-restored backup leaves. The new picture must not take that
+    row's id and must not touch that row."""
     pot = make_pot(client)
     minted = iter(["photo-aaaaaaaa", "photo-aaaaaaaa", "photo-bbbbbbbb"])
     monkeypatch.setattr(butler, "new_photo_id", lambda: next(minted))
@@ -507,9 +498,8 @@ def test_an_id_that_cannot_be_minted_is_a_try_again_and_not_a_500(client, monkey
 
 
 def test_only_one_of_two_racing_deletes_says_ok(client):
-    """A bare SELECT takes no lock, so both callers can see the row. The
-    DELETE decides, or "deleting twice is refused rather than pretended"
-    would hold only when nobody is in a hurry."""
+    """A bare SELECT takes no lock, so both callers can see the row; the
+    DELETE is what decides between them."""
     pot = make_pot(client)
     pid = photo_id(upload(client, pot))
     codes = []
@@ -531,8 +521,8 @@ def test_only_one_of_two_racing_deletes_says_ok(client):
 
 def test_an_empty_photos_dir_falls_back_like_an_empty_db_path(tmp_path):
     """`db_path=""` falls back to the default; this has to do the same, or
-    the store lands in the process's working directory and skips the
-    unmounted-/data refusal on the way."""
+    the store lands in the working directory and skips the unmounted-/data
+    refusal on the way."""
     db = tmp_path / "here" / "butler.db"
     client = TestClient(create_app(db_path=str(db), token=TOKEN, photos_dir=""))
     pot = make_pot(client)
@@ -547,10 +537,9 @@ def garden(client):
 
 
 def test_the_garden_carries_the_newest_picture_for_the_thumbnail(client, db):
-    """The list shows a small picture beside each name, so /pots has to say
-    which one — the id only, since the bytes come from GET /photo/<id> and
-    the app caches those. Newest, because a plant's most recent portrait is
-    the one that says what it looks like now."""
+    """/pots carries the id only — the bytes come from GET /photo/<id> and
+    the app caches those — and the newest one, since that's the portrait
+    that says what the plant looks like now."""
     pot_id = make_pot(client)
     assert garden(client)[0]["photo"] is None, "nothing photographed yet"
 
@@ -560,8 +549,7 @@ def test_the_garden_carries_the_newest_picture_for_the_thumbnail(client, db):
     second = photo_id(upload(client, pot_id))
     assert garden(client)[0]["photo"] == second, "the newest one"
 
-    # Forgetting it falls back to the one before, rather than to a broken
-    # picture: the row is the truth, and there is another row.
+    # forgetting it falls back to the one before, not to a broken picture
     client.post("/photo/delete", content=f"photo={second}", headers=auth())
     assert garden(client)[0]["photo"] == first
 

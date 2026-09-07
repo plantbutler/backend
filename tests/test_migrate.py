@@ -96,10 +96,9 @@ def test_migrate_leaves_a_backup(tmp_path):
 
 
 def test_a_pot_with_no_mapping_gets_no_mapping_row(tmp_path):
-    """The rebuild must not invent a window for a pot that was never wired:
-    a (NULL, NULL, NULL) row in pot_mappings would read back through
-    pots_now identically, but would also claim to be the pot on controller
-    NULL channel NULL, a wiring that does not exist."""
+    """A (NULL, NULL, NULL) row in pot_mappings would read back through
+    pots_now the same as no mapping at all, but would also claim to be the
+    pot on controller NULL channel NULL — a wiring that doesn't exist."""
     path, con = old_db(tmp_path)
     migrate(con, path)
     (unmapped,) = con.execute("SELECT id FROM pots WHERE name = 'unmapped'").fetchone()
@@ -127,17 +126,16 @@ def test_a_fresh_database_is_already_in_the_new_shape(tmp_path):
 
 
 def test_the_backup_carries_what_is_still_in_the_wal(tmp_path):
-    """The live database runs in WAL mode, so the main file lags behind. The
-    rebuild DROPs the pots table, and the backup is the only thing standing
-    between that and the garden — a plain copy of the main file would omit
-    every commit not yet checkpointed, exactly the rows at risk for a
-    container killed between a save and a restart."""
+    """WAL mode means the main file lags behind; the rebuild DROPs pots, so
+    the backup is the only thing standing between that and the garden — a
+    plain copy of the main file would omit commits not yet checkpointed,
+    exactly the rows at risk for a container killed between a save and a
+    restart."""
     path = str(tmp_path / "wal.db")
     con = sqlite3.connect(path)
     con.execute("PRAGMA journal_mode=WAL")
     con.executescript(OLD_POTS)
-    # '0' as TEXT: that column really was TEXT before the controller
-    # became an integer
+    # '0' as TEXT: the old schema's controller column really was TEXT
     con.execute(
         "INSERT INTO pots (name, controller, channel) VALUES ('basil', '0', 3)"
     )
@@ -149,18 +147,17 @@ def test_the_backup_carries_what_is_still_in_the_wal(tmp_path):
     assert backup.execute(
         "SELECT name, controller, channel FROM pots"
     ).fetchall() == [("basil", "0", 3)]
-    # the rebuilt mapping holds it as a number: pot_mappings declares
-    # INTEGER and sqlite's affinity converts a string that is one
+    # pot_mappings declares INTEGER; sqlite's affinity converts the string
     assert con.execute(
         "SELECT controller, channel FROM pot_mappings"
     ).fetchall() == [(0, 3)]
 
 
 def test_a_rebuild_killed_half_way_leaves_the_old_table_intact(tmp_path, monkeypatch):
-    """The whole rebuild is one transaction, or a killed container loses the
-    garden: if the DROP commits without the refill, `pots` comes back empty
-    AND in the new shape, which the idempotence guard reads as "already
-    migrated" — the next start does nothing and the loss is silent."""
+    """The whole rebuild must be one transaction: if the DROP committed
+    without the refill, `pots` would come back empty and in the new shape,
+    which the idempotence guard reads as "already migrated" — the next
+    start would do nothing and the loss would be silent."""
     path, con = old_db(tmp_path)
     real = butler.new_pot_id
     minted = []
@@ -193,9 +190,9 @@ def test_a_rebuild_killed_half_way_leaves_the_old_table_intact(tmp_path, monkeyp
 
 
 def test_the_rebuild_says_what_it_did(tmp_path, capsys):
-    """An irreversible rebuild that runs unannounced is one nobody can
-    audit: it rewrites every pot id, so the operator has to be told it
-    happened, how much it moved, and where the backup is."""
+    """An irreversible rebuild that runs unannounced can't be audited: the
+    operator has to be told it happened, how much moved, and where the
+    backup is."""
     path, con = old_db(tmp_path)
     migrate(con, path)
 
@@ -205,10 +202,9 @@ def test_the_rebuild_says_what_it_did(tmp_path, capsys):
 
 
 def test_starting_on_a_live_old_database_rebuilds_it(tmp_path):
-    """Every test above drives migrate() directly; this is the only one
-    exercising the call site in create_app and the startup ordering it
-    depends on — schema.sql creates pots_now over the OLD pots table before
-    migrate() drops it. Without that wiring, `GET /pots` would 503 on "no
+    """The only test exercising migrate() through create_app's startup
+    ordering — schema.sql creates pots_now over the OLD pots table before
+    migrate() drops it. Without that ordering, `GET /pots` would 503 on "no
     such column: p.species" while /report kept answering 200, so nothing
     would page and the garden would simply be gone."""
     path, con = old_db(tmp_path)
@@ -246,16 +242,15 @@ def test_starting_on_a_live_old_database_rebuilds_it(tmp_path):
 
 
 def overlapping_start(path, at):
-    """A connection standing in for the second of two overlapping container
+    """A connection standing in for the loser of two overlapping container
     starts on the same /data. The idempotence guard, `PRAGMA
     table_info(pots)`, is read outside any lock, so both starts can pass it
     before either has committed; the WAL-busy check doesn't stop that
-    either, since it only fires while another connection actually holds a
-    read transaction open.
+    either, since it only fires while another connection holds a read
+    transaction open.
 
-    This connection is the one that passed the guard and lost the race: the
-    FIRST container runs its whole rebuild, to completion, the moment this
-    one reaches `at` — "backup" just before it takes its own copy,
+    The FIRST container runs its whole rebuild, to completion, the moment
+    this one reaches `at` — "backup" just before it takes its own copy,
     "rebuild" once it has its rows and is on its way to BEGIN IMMEDIATE."""
     first = sqlite3.connect(path, timeout=5)
     ran = []
@@ -277,9 +272,8 @@ def overlapping_start(path, at):
 def test_an_overlapping_start_does_not_replace_the_backup(tmp_path):
     """The backup is the only copy of the pre-identity garden, written once.
     The loser of the race would otherwise copy the database AFTER the
-    winner has rebuilt it, so `<db>.pre-identity.bak` would end up holding
-    an already-migrated file and the original garden would be gone
-    irreversibly.
+    winner rebuilt it, so `<db>.pre-identity.bak` would end up holding an
+    already-migrated file and the original garden gone irreversibly.
 
     An existing backup is kept rather than overwritten: it is always a
     valid pre-identity snapshot, only ever written while `pots` still has

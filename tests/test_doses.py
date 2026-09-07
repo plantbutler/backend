@@ -25,10 +25,9 @@ def client(db):
 
 
 def pot(db, pot_id, name, controller=0, outlet=0, from_ts=0, to_ts=None):
-    """A pot and one mapping window, stated outright. The window no longer
-    decides whose dose it was — the stamp on the row does — but it still
-    says which sensor a pot was on, and enqueue reads the open one to choose
-    the stamp."""
+    """A pot and one mapping window. The window no longer decides whose
+    dose it was — the row's stamp does — but it says which sensor the pot
+    was on, which enqueue reads to pick that stamp."""
     with sqlite3.connect(db) as con:
         con.execute(
             "INSERT OR IGNORE INTO pots (id, name) VALUES (?, ?)", (pot_id, name)
@@ -115,9 +114,9 @@ def test_a_pot_gets_the_doses_it_was_handed_newest_first(client, db):
 
 
 def test_a_remap_takes_the_pots_history_with_it(client, db):
-    """A dose belongs to whoever the board was told to water, not to whoever
-    hangs on that hose now. Driven through POST /pot so the remap and the
-    stamps are the real ones, not hand-written windows."""
+    """A dose belongs to whoever the board was told to water, not whoever
+    holds the hose now. Driven through POST /pot so the remap and stamps
+    are the real ones, not hand-written windows."""
     basil = post_pot(client, "name=basil controller=0 channel=0 outlet=0")
     water(client, basil, 0, 0)  # 1: basil, on outlet 0
     post_pot(client, f"id={basil} outlet=3")  # basil moves hose
@@ -153,7 +152,7 @@ def test_the_garden_list_keeps_a_dose_nobody_can_be_blamed_for(client, db):
     """An unattributable dose must not vanish just because no window claims it."""
     now = int(time.time())
     pot(db, "pot-1", "basil", outlet=0, from_ts=now - 100)
-    dose(db, 1, now - 500, outlet=7, acked_ts=now - 490, pot_id=None)  # no pot
+    dose(db, 1, now - 500, outlet=7, acked_ts=now - 490, pot_id=None)
     dose(db, 2, now - 50, acked_ts=now - 40)
     rows = get(client)
     assert [r["id"] for r in rows] == [2, 1]
@@ -167,8 +166,7 @@ def test_a_dose_never_handed_out_has_no_pot_and_sorts_by_when_it_was_made(client
     now = int(time.time())
     pot(db, "pot-1", "basil")
     dose(db, 1, now - 500, acked_ts=now - 490)
-    # stamped for basil but never handed out: `sent_ts IS NOT NULL` is what
-    # makes it not yet a dose
+    # not handed out yet: sent_ts IS NOT NULL is what makes a row a dose
     dose(db, 2, None, state="queued", created_ts=now - 10)
     rows = get(client)
     assert [r["id"] for r in rows] == [2, 1]
@@ -200,9 +198,8 @@ def test_limit_bounds_the_list_and_the_newest_survive(client, db):
 
 
 def test_two_open_windows_on_one_hose_cannot_split_a_dose(client, db):
-    """A stamped row has exactly one owner, so two overlapping mapping
-    windows on one hose cannot both claim the same dose (see the mapping
-    write's backstop in test_pots)."""
+    """A stamped row has exactly one owner: two overlapping mapping windows
+    on one hose cannot both claim the same dose."""
     now = int(time.time())
     pot(db, "pot-1", "basil", outlet=0, from_ts=0)
     pot(db, "pot-2", "mint", outlet=0, from_ts=0)
@@ -213,9 +210,8 @@ def test_two_open_windows_on_one_hose_cannot_split_a_dose(client, db):
 
 
 def test_a_stop_is_not_a_dose(client, db):
-    """A stop has no outlet and no millilitres, so it could never be
-    attributed; listing it as an unattributable dose would bury the row
-    that actually matters."""
+    """A stop has no outlet or millilitres, so it could never be attributed;
+    listing it as an unattributable dose would bury the row that matters."""
     now = int(time.time())
     pot(db, "pot-1", "basil")
     dose(db, 1, now - 100, acked_ts=now - 90)
@@ -226,8 +222,8 @@ def test_a_stop_is_not_a_dose(client, db):
 
 
 def test_the_cursor_pages_back_through_doses_that_share_a_second(client, db):
-    """Several doses can share a second, which a cursor on the timestamp
-    alone would skip or repeat."""
+    """A cursor on the timestamp alone would skip or repeat doses that
+    share a second."""
     now = int(time.time())
     pot(db, "pot-1", "basil")
     for i in range(1, 6):  # ids 1..5, all handed out in the same second
