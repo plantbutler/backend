@@ -41,7 +41,8 @@ board when it was retired still acks.
 **D2 — The tap means "full to the top".** `POST /refill` is unchanged on the wire
 (`refill=<ts>`). The row gains `float_ok INTEGER`: `status.float_ok` at the tap, NULL when the
 board has never sent `float=`. Schema: column in the `CREATE` **and** in `ADDED_COLUMNS`; the
-rows already on the NAS get NULL, which D7 judges as nothing. The app's copy says what the tap
+rows already on the NAS get NULL, which D7 judges as nothing. Likewise `refills.drop_ts INTEGER`
+(D3/D4), `status.float_rise INTEGER` and `status.contra INTEGER NOT NULL DEFAULT 0`. The app's copy says what the tap
 means (D9).
 
 **D3 — The counter.** `pumped_since(con, controller, since_ts) -> int`: `SUM(COALESCE(flow_ml,
@@ -52,12 +53,22 @@ latch stands behind it, as it does today. Accepted.
 
 *Amended 2026-09-07.* `since_ts` is the **origin**, `counter_origin(con, controller) -> (ts, kind) |
 None`: the later of the latest tap whose snapshot is not NULL (`kind = "tap"`, its `refills` row)
-and the float's latest rise, `status.float_word_since` while `status.float_word = 1` (`kind =
-"rise"`) — the word and its own clock, not `float_ok`/`float_since`, which a report that omits
-`float=` blanks and restarts (the `fields:` rule counts from that): a float that said nothing once
-neither rose nor fell, so the rise it had stands and none is invented when it speaks again.
-`float_word_since` moves on 1 → 0 and 0 → 1 only; `ADDED_COLUMNS` carries it from `float_since`. Two
-reasons. A tap from 0.18.0 (NULL snapshot) never meant "full to the top" — a month of untapped
+and the float's latest rise, `status.float_rise`: when the board's word last went 0 → 1, kept by
+the status upsert beside `float_word_since` (`kind = "rise"`) — the word and its own clocks, not
+`float_ok`/`float_since`, which a report that omits `float=` blanks and restarts (the `fields:`
+rule counts from that): a float that said nothing once neither rose nor fell, so the rise it had
+stands and none is invented when it speaks again. `float_word_since` moves on 1 → 0 and 0 → 1
+only; `ADDED_COLUMNS` carries it from `float_since` under the same `float_ok IS NOT NULL` gate as
+`float_word`, so a last pre-upgrade report that omitted `float=` cannot carry a clock without its
+word. *Amended 2026-09-07, twice:* the rise is the origin **only after a drop that followed the
+tap** — the tap's `refills` row carries `drop_ts`, the first time the word went 1 → 0 after it (D4
+sets it, sample or not), and the origin is the rise iff `drop_ts` is set and `float_rise >
+drop_ts`. A 0 → 1 with no drop after the tap is the tap's own refill arriving on the wire after a
+tap made at empty, a `clear contra` after a tap, the manual dose lifting the flap after a tap: all
+leave the tap as the origin (the second review found the first wording lost the ordinary "tank
+empty, fill, tap" run's sample to exactly this). Sticky: a second drain after an untapped refill
+keeps the rise as the origin — `float_rise` stays where it was — rather than falling back to the
+tap and resurrecting water already sampled. Same second: the tap. Two reasons. A tap from 0.18.0 (NULL snapshot) never meant "full to the top" — a month of untapped
 top-ups behind it would have become a 12 L sample and a threshold no stuck float ever reaches — so
 it is no origin for anything. And a float that went 1 → 0 → 1 since the tap is a tank that ran down
 and was refilled by someone who forgot to tap: the float demonstrably moved, so the counter restarts
@@ -74,9 +85,11 @@ the field hides no edge). When it was 1 and this report says 0, and the origin (
 ml)`. `UNIQUE(controller, refill_ts)`: one sample per tap, so a float bouncing at the line adds
 nothing after the first crossing (`INSERT OR IGNORE`). Zero pumped stores nothing: a tank
 drained by something the meter never saw (evaporation, a tap that was not a fill) is not a
-measurement. *Amended 2026-09-07:* no sample on a report carrying `ch207=1`, nor on a board
-whose latch stands, nor for a retired board (§1, D1); and none when the origin is a rise — the
-tank was refilled untapped and nobody said it was full, so its content is unknown. Trap: `status`
+measurement. *Amended 2026-09-07, twice:* on a 1 → 0 of the word, the latest non-NULL-snapshot tap's
+`drop_ts` is set if it was NULL, whatever else is true; a sample is inserted only when that
+`drop_ts` **was** NULL (the first drop after this tap — a second drain after an untapped refill
+stores nothing, which is the rise-origin case: nobody said that refill was full), `pumped_since(tap)
+> 0`, the report does not carry `ch207=1`, no latch stands, and the board is not retired (§1, D1). Trap: `status`
 rows exist only once a controller has reported; a first report has no previous word and closes
 nothing.
 
@@ -97,7 +110,8 @@ the controller on `"over"` (dry, decision #5), after the retired and latch check
 lets go on a float bouncing 0 → 1 with nobody tapping (a rise, a fresh origin, a counter at 0), and
 the page was raised on a pump presumed stuck at full; the page is the fact until a tap answers it,
 for the rules as for `/health`. The ticker raises `over:<c>` (high, with `floor_ok`; skipped while
-the board's latch stands or it is retired): "board N pumped X ml since HH:MM, more than its tank
+the board's latch stands, while the latest report carried `ch207=1` — `status.contra`, kept by
+the upsert from the report's `ch207`, absent means 0 — or while it is retired): "board N pumped X ml since HH:MM, more than its tank
 holds (Y ml), and the float still says full: presumed stuck, the rules will not water until the next
 refill". *Amended 2026-09-07:* the tap is the **only** clear — the page clears when raised and a tap
 with a non-NULL snapshot is later than the alert's `raised_ts`: "the tank on board N was refilled".
@@ -116,8 +130,9 @@ or behind a WiFi drop has said nothing yet and is judged on nothing, as the 0.18
 did. Trap that the `float_word_since` clause exists for: a float that went 0 → 1 after the tap and,
 days later, legitimately back to 0 must not read as dead; its word last changed after the tap. Not
 `float_since`: a report that omits `float=` restarts that one, and a float that said nothing once
-has not moved. Skipped while the board's latch stands (contra forces the word to 0; the latch page
-already says what to do) and for a retired board. The ticker raises `stale:<c>` (high, with
+has not moved. Skipped while the board's latch stands or the latest report carried `ch207=1`
+(`status.contra`: a `/resume` before `clear contra` must not page the forced 0 as dead; contra
+forces the word to 0, and the latch page already says what to do) and for a retired board. The ticker raises `stale:<c>` (high, with
 `floor_ok`; the key is kept so a `stale:` standing from 0.18.0 clears through the same path): "the
 float on board N still says empty M min after the refill at HH:MM: a stuck float, or the board's own
 float check tripped — look at the magnet, or water once from the phone (a granted dose resets the
