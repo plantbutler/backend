@@ -252,6 +252,7 @@ def test_health_lists_a_configured_but_never_seen_controller(client, db):
 
 
 def test_a_dose_without_a_cap_gets_the_rules_own_cap(client, db):
+    # One owner for the flow constant: the app never copies the formula.
     assert command(client, "c=0 water=3 ml=50").status_code == 200
     handed = report(client, "c=0 ch0=1").text
     assert "cmd=1 water=3 ml=50 cap_s=7" in handed  # 50 // 20 + 5
@@ -302,7 +303,7 @@ def test_a_malformed_interval_is_refused(client, db, body):
 
 def test_the_knob_cannot_let_a_live_board_outlive_the_command_ttl(client, db):
     # next=3600 parses, but with a 900s TTL the board's on-time report would
-    # land after its own command had been swept aside
+    # land after its own command had been swept aside — the double-dose hole.
     answer = interval(client, "c=0 next=3600")
     assert answer.status_code == 400
     assert "BUTLER_CMD_TTL_S" in answer.text
