@@ -145,7 +145,9 @@ watering.
   the reason and keeps the stamp: the newest fault is the one to fix, and a fault the board
   merely repeats is not a second one; both on one report name `resetmid`, the edge seen this
   once — the contra level re-asserts the latch under that name until the resume, then
-  re-latches with its own words. The float
+  re-latches with its own words. The `latch:<c>` row's `detail` is the reason its page named,
+  and a standing latch whose reason changed pages again with the new words, floor or no floor:
+  a person told `clear contra` must also be told `dry off`. The float
   going empty does not latch: the rules already refuse on it. `POST /refill` records a human
   refill, and the tap means "full to the top": the row snapshots `status.float_word`, the
   board's last real word (a report that omits `float=` blanks `float_ok`, and a tap made under
@@ -174,7 +176,11 @@ watering.
   word — `status.float_firm`, the word once two consecutive reports carrying `float=` agree;
   `float_word` stays the last real word, kept across a report that omits `float=` — because
   one sighting is a glitch by the board's own design, and a slosh at report time must not
-  close a sample early and hand the origin to its recovery. On the firm
+  close a sample early and hand the origin to its recovery. It starts NULL — the first report
+  sets nothing firm, and the upgrade carries none: one report is not two, and the first
+  post-upgrade report that agrees with the carried word makes it firm — and NULL is never an
+  edge: the firm word becoming 1 out of it is no rise, becoming 0 no drop, and nothing is
+  forced. On the firm
   word's first 1 → 0 after the tap that saw it full, the report path stamps that tap's
   `drop_ts` where the word fell (`base_tap(fell)`: the latest tap before the fall, so a person
   who filled and tapped between the two sightings keeps a clean tap and the earlier one gets the
@@ -185,9 +191,11 @@ watering.
   OK, zero pulses" is a fault, not a drop, and stamped it let `clear contra` read as a rise that
   laundered the counter — while under any other latch the drop is stamped and only the sample
   waits, and no sample for a retired board. A firm drop that came with `ch207=1` is remembered
-  (`status.float_forced`), and the firm word coming back out of it stamps no rise and clears
-  the flag, so `clear contra` is never the origin — not even when the tap's `drop_ts` was
-  already set, an untapped refill's run being exactly that. The duplicate check on
+  (`status.float_forced`), and the firm word coming back out of it stamps no rise, so `clear
+  contra` is never the origin — not even when the tap's `drop_ts` was already set, an untapped
+  refill's run being exactly that; the flag is the last firm drop's, written again only by the
+  next one (nothing reads it between a rise and that drop, so a clearing on the rise had no
+  effect and there is none). The duplicate check on
   `(controller, t)` runs before the status upsert and the edge, not only before the readings:
   the firmware retries with the body kept, and a retried glitch must not confirm itself. The
   rise (`float_rise`) is the firm word's too, stamped where the word rose rather than where
@@ -196,18 +204,19 @@ watering.
   after the upgrade starts everything. `tank_ml()` is the
   median of the last `TANK_MEDIAN_OF` (5) samples, `None` under `TANK_SAMPLES_TO_ARM` (2). The
   float is judged against that volume, never a clock: `tank_state()` answers "over" when more
-  than the size plus `TANK_TOLERANCE_PCT` (10) has been pumped since the origin and the float
-  still says 1 — `water_rules` goes dry, `over:<c>` pages high ("since HH:MM", the origin; not
-  while latched, not while the latest report carried `ch207=1` — `status.contra`, kept by the
-  upsert, since a `/resume` before `clear contra` is typed lifts the latch and not the board's
-  own — and not while retired), and a tap that saw the float, later than the page, is the only
-  clear — not the float word dropping to 0, which is a contra, a flap or an omitted `float=` as
-  often as an empty tank; the rules stay dry while the page stands (`over_stands()`: raised,
-  not cleared, and no tap that saw the float later than the raise — the tap frees the rules
-  and `/health` the moment it lands, as `/resume` lifts the latch, while the ticker's clear
-  waits for ntfy to accept it), not on the live predicate alone, which a float bouncing 0 → 1
-  untapped lets go of; `/health`'s `over` is 1 while the predicate holds or the page stands, 0
-  for a retired board; `POST /command water=` is not gated. `float_dead()` — a tap made with
+  than the size plus `TANK_TOLERANCE_PCT` (10) has been pumped since the origin and the float's
+  **firm** word still says 1 (`is_over()`, on `float_firm`: the origin waits for the firm word,
+  and judged on the raw one the beat between a 0 → 1 sighting and its confirmation called every
+  run a tenth over the median stuck) — `water_rules` goes dry, `over:<c>` pages high ("since
+  HH:MM", the origin; not while latched, not while the latest report carried `ch207=1` —
+  `status.contra`, kept by the upsert, since a `/resume` before `clear contra` is typed lifts
+  the latch and not the board's own — and not while retired), and the tap is the only clear —
+  made in `record_refill`, in the tap's own transaction and with no page, as `/resume` clears
+  `latch:<c>`: the person did the thing — not the float word dropping to 0, which is a contra,
+  a flap or an omitted `float=` as often as an empty tank; the rules stay dry while the page
+  stands (`over_stands()`: raised and not cleared), not on the live predicate alone, which a
+  float bouncing 0 → 1 untapped lets go of; `/health`'s `over` is 1 while the predicate holds
+  or the page stands, 0 for a retired board; `POST /command water=` is not gated. `float_dead()` — a tap made with
   the float at 0, a `float=` reading `PERSIST_S`
   or more after it (`status.float_seen`, not the wall clock: a board behind a WiFi drop has said
   nothing and is judged on nothing), and still 0 (`float_ok`: a report that said nothing said

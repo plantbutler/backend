@@ -240,13 +240,17 @@ CREATE TABLE IF NOT EXISTS status (
                                     -- (float_rise) — are this word's, each
                                     -- stamped where the word moved, not where
                                     -- the next report confirmed it, so a dose
-                                    -- handed as the float rose is on the counter
+                                    -- handed as the float rose is on the counter.
+                                    -- NULL until two agree (the first report
+                                    -- sets nothing firm, the upgrade carries
+                                    -- none), and NULL is never an edge. The
+                                    -- stuck-at-full rule reads this word
   float_forced   INTEGER NOT NULL DEFAULT 0  -- the firm word's last drop came
                                     -- with ch207=1: the contra latch forcing
                                     -- the word, not the tank. The firm word
                                     -- coming back out of it is `clear contra`
-                                    -- typed, no rise (float_rise stays), and
-                                    -- clears this
+                                    -- typed, no rise (float_rise stays); only
+                                    -- the next firm drop writes this again
 );
 
 -- A refill is a human event (pitch "Trust the tank"): the app says so, the
@@ -304,13 +308,16 @@ CREATE TABLE IF NOT EXISTS alerts (
                                 -- pos:<c> | fields:<kind>:<c> | dose:<id> |
                                 -- dosefail:<c> | proposal:<c>:<outlet> |
                                 -- latch:<c> (the board stopped itself) |
-                                -- over:<c> (pumped past the tank, float still full) |
+                                -- over:<c> (pumped past the tank, the firm float
+                                --   still full; the tap clears it inline) |
                                 -- stale:<c> (float still empty after a refill) |
                                 -- tank:<c>:<refill_ts> (a sample announced, once), plus
                                 -- meta:tick / meta:up bookkeeping rows
   raised_ts  INTEGER NOT NULL,
   cleared_ts INTEGER,           -- NULL while the condition stands
-  detail     TEXT               -- dose judgements: 'ok'|'failed'|'unverified'
+  detail     TEXT               -- dose judgements: 'ok'|'failed'|'unverified';
+                                -- latch:<c>: the reason its page named, so a
+                                -- latch renamed while standing pages again
 );
 
 -- What does this plant want? (cycle 2). Two caches, because the two hops

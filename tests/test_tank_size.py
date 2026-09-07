@@ -312,9 +312,10 @@ def test_the_counter_starts_at_the_latest_tap_that_saw_the_float_or_the_rise(
     age(db, 60)
     assert origin(db) is None  # a tap that saw nothing is no origin
     report(client, "c=0 ch0=1 float=1")  # the float's first word...
-    assert rise(db) is None  # ...is one sighting, not yet a rise
-    report(client, "c=0 ch0=1 float=1")  # the next agrees: the first firm full
-    assert rise(db) is not None and origin(db) is None  # a rise with no tap is none
+    assert rise(db) is None  # ...is one sighting, not yet the firm word
+    report(client, "c=0 ch0=1 float=1")  # the next agrees: the first firm full...
+    assert firm(db) == 1 and rise(db) is None  # ...out of NULL, which is no rise
+    assert origin(db) is None
     age(db, 60)
     dose(client, 100, flow=100)
     assert health(client)["pumped_ml"] == 0  # nothing to count from
@@ -347,17 +348,85 @@ def test_the_counter_starts_at_the_latest_tap_that_saw_the_float_or_the_rise(
     full(client)  # and a second untapped refill restarts it
     assert rise(db) > risen - 60 and origin(db) == (rise(db), "rise")
     assert health(client)["pumped_ml"] == 0
-    # A rise in the tap's own second is the tap's: the human's word wins.
+    # A tap after the rise is the latest base, with no drop after it: the
+    # origin, whatever second the rise fell in — the human's word wins.
     empty(client)
     full(client)
     since = tap(client, db)
-    assert rise(db) == since and origin(db) == (since, "tap")
-    # A drop and a rise in one second are a float bouncing, not a refill:
-    # the tap stays.
+    assert drops(db)[-1] is None and origin(db) == (since, "tap")
+    # The rise is the origin only strictly past the tap's drop: a drop and
+    # a rise in one second are a float bouncing, not a refill, and the tap
+    # stays. Pinned by hand — whether the two reports land in one second
+    # is the wall clock's business, not this test's.
     age(db, 60)
     empty(client)
     full(client)
-    assert rise(db) == drops(db)[-1] and origin(db) == (since - 60, "tap")
+    dropped = drops(db)[-1]
+    run_sql(db, "UPDATE status SET float_rise = ?", dropped)
+    assert origin(db) == (since - 60, "tap")
+    run_sql(db, "UPDATE status SET float_rise = ?", dropped + 1)
+    assert origin(db) == (dropped + 1, "rise")
+
+
+def test_the_firm_word_starts_null_and_null_is_no_edge(client, db):
+    """The first report that carries float= sets nothing firm: the firm
+    word is what two consecutive float-carrying reports agree on, and
+    starts NULL. NULL is never an edge — the firm word becoming 1 out of
+    NULL is no rise, becoming 0 out of NULL is no drop, and a forced
+    report confirming it forces nothing (spec D14 c)."""
+    report(client, "c=0 ch0=1 float=1")
+    assert firm(db) is None and rise(db) is None
+    report(client, "c=0 ch0=1 float=1")  # the next agrees: the word is firm...
+    assert firm(db) == 1 and rise(db) is None  # ...and NULL -> 1 is no rise
+    for board, contra in ((1, ""), (2, " ch207=1")):
+        report(client, f"c={board} ch0=1 float=1")  # one word of full...
+        assert post(client, "/refill", f"c={board}").status_code == 200  # ...tapped
+        since = run_sql(db, "SELECT ts FROM refills WHERE controller = ?", board)[0][0]
+        run_sql(
+            db,
+            "INSERT INTO commands (created_ts, controller, kind, outlet, ml, cap_s, "
+            "state, source, sent_ts, acked_ts, flow_ml) "
+            "VALUES (?, ?, 'water', 3, 100, 30, 'acked', 'manual', ?, ?, 100)",
+            since + 1, board, since + 1, since + 2,
+        )
+        report(client, f"c={board} ch0=1 float=0{contra}")
+        report(client, f"c={board} ch0=1 float=0{contra}")  # firm, out of NULL
+        assert run_sql(
+            db,
+            "SELECT float_firm, float_forced FROM status WHERE controller = ?",
+            board,
+        ) == [(0, 0)]
+        assert run_sql(
+            db, "SELECT drop_ts FROM refills WHERE controller = ?", board
+        ) == [(None,)]
+        assert run_sql(db, "SELECT 1 FROM tank_samples WHERE controller = ?", board) == []
+
+
+def test_the_forced_flag_is_the_last_firm_drops(client, db):
+    """float_forced says whether the firm word's last drop came with
+    ch207=1, and only the next firm drop writes it again: the firm word
+    coming back out of a forced 0 stamps no rise and leaves the flag —
+    nothing reads it between a rise and the next drop, so a clearing
+    there had no effect and is gone (spec D4, D14 c)."""
+    full(client)
+    since = tap(client, db)
+    dose(client, 100, flow=100)
+    report(client, "c=0 ch0=1 float=0 pos=ok ch207=1")  # the forced 0...
+    report(client, "c=0 ch0=1 float=0 pos=ok ch207=1")  # ...confirmed: forced
+    assert firm(db) == 0 and forced(db) == 1 and drops(db) == [None]
+    assert post(client, "/resume", "c=0").status_code == 200
+    report(client, "c=0 ch0=1 float=1 pos=ok")  # clear contra was typed...
+    report(client, "c=0 ch0=1 float=1 pos=ok")  # ...and the word is firmly back
+    assert firm(db) == 1 and rise(db) is None  # no rise out of a forced 0
+    assert forced(db) == 1  # the last firm drop was forced, and still is
+    assert origin(db) == (since, "tap") and health(client)["pumped_ml"] == 100
+    dose(client, 120, flow=110)
+    empty(client)  # the real drain: this drop is not forced
+    assert forced(db) == 0 and drops(db) == [word_since(db)]
+    assert samples(db) == [(since, 210)]
+    age(db, 60)
+    full(client)  # refilled, untapped: a rise, the flag being the drain's
+    assert origin(db) == (rise(db), "rise") and health(client)["pumped_ml"] == 0
 
 
 def test_a_rise_before_any_drop_after_the_tap_leaves_the_tap(client, db):
@@ -479,22 +548,22 @@ def test_the_firm_words_clocks_are_where_the_word_moved(client, db):
     clock set at the confirmation would put that dose before the rise and
     off the counter. The tests around this one confirm inside a second,
     where the two are one number; here a beat sits between, on the drop
-    and on the rise. And one sighting moves neither clock: the rise the
-    tap found stands until the next report agrees, and a rise stamped at
-    the sighting would be the fall's clock, not the word's (spec D3, D4,
-    thrice)."""
+    and on the rise. And one sighting moves neither clock: there is no
+    rise yet — the first firm full, out of NULL, is none — and none until
+    the next report agrees; a rise stamped at the sighting would be the
+    fall's clock, not the word's (spec D3, D4, thrice, D14 c)."""
     full(client)
-    tap(client, db)  # in the rise's second
+    tap(client, db)
     report(client, "c=0 ch0=1 float=0")  # the word fell here...
     age(db, 30)
     fell = word_since(db)
-    assert firm(db) == 1 and drops(db) == [None] and rise(db) == taps(db)[0]
+    assert firm(db) == 1 and drops(db) == [None] and rise(db) is None
     report(client, "c=0 ch0=1 float=0")  # ...and is confirmed a beat later
-    assert firm(db) == 0 and drops(db) == [fell] and rise(db) == taps(db)[0]
+    assert firm(db) == 0 and drops(db) == [fell] and rise(db) is None
     report(client, "c=0 ch0=1 float=1")  # rose here...
     age(db, 30)
     rose = word_since(db)
-    assert firm(db) == 0 and rise(db) == taps(db)[0]  # one sighting moves nothing
+    assert firm(db) == 0 and rise(db) is None  # one sighting moves nothing
     assert origin(db) == (taps(db)[0], "tap")
     report(client, "c=0 ch0=1 float=1")  # ...and is confirmed a beat later
     assert firm(db) == 1 and rise(db) == rose and rose > drops(db)[0]
@@ -567,7 +636,7 @@ def test_a_forced_zero_is_not_a_drop(client, db):
     assert post(client, "/resume", "c=0").status_code == 200
     report(client, "c=0 ch0=1 float=1 pos=ok ch207=0")  # clear contra was typed
     report(client, "c=0 ch0=1 float=1 pos=ok ch207=0")
-    assert firm(db) == 1 and rise(db) == since and drops(db) == [None]
+    assert firm(db) == 1 and rise(db) is None and drops(db) == [None]
     assert origin(db) == (since, "tap") and health(client)["pumped_ml"] == 100
     dose(client, 120, flow=110)
     empty(client)  # the real drain
@@ -594,7 +663,7 @@ def test_clear_contra_after_a_tap_at_the_forced_zero_leaves_the_tap(client, db):
     assert post(client, "/resume", "c=0").status_code == 200
     report(client, "c=0 ch0=1 float=1 pos=ok")  # clear contra on the board
     report(client, "c=0 ch0=1 float=1 pos=ok")
-    assert firm(db) == 1 and rise(db) < since and drops(db) == [None, None]
+    assert firm(db) == 1 and rise(db) is None and drops(db) == [None, None]
     assert origin(db) == (since, "tap")
     dose(client, 120, flow=110)
     empty(client)
@@ -630,13 +699,13 @@ def test_a_contra_once_the_tank_is_empty_forces_nothing(client, db):
 def test_a_contra_after_an_untapped_refill_keeps_the_rise(client, db):
     """The contra latch is what forces the word to 0, so a firm 1 -> 0
     arriving with ch207=1 is remembered as forced, and the firm 0 -> 1
-    that ends it — `clear contra` typed — stamps no rise and clears the
-    flag. The second review found that rise became the origin whenever
-    the tap's drop_ts was already set, an untapped refill's run being
-    exactly that: the counter restarted at the clear with the run's water
-    laundered. A real drain after the clear is the untapped refill's
-    second, no sample; and the flag went with the clear, so the rise
-    after that drain counts (spec D3, D4, four times)."""
+    that ends it — `clear contra` typed — stamps no rise. The second
+    review found that rise became the origin whenever the tap's drop_ts
+    was already set, an untapped refill's run being exactly that: the
+    counter restarted at the clear with the run's water laundered. A real
+    drain after the clear is the untapped refill's second, no sample; and
+    that drain is the firm word's last, unforced, so the rise after it
+    counts (spec D3, D4, four times, D14 c)."""
     full(client)
     tap(client, db)
     dose(client, 100, flow=100)
@@ -662,7 +731,7 @@ def test_a_contra_after_an_untapped_refill_keeps_the_rise(client, db):
     assert samples(db) == [(taps(db)[0], 100)] and origin(db) == (risen, "rise")
     assert health(client)["pumped_ml"] == 450
     age(db, 60)
-    full(client)  # refilled, untapped again: the flag went with the clear
+    full(client)  # refilled, untapped again: the last firm drop was the drain's
     assert rise(db) > risen and origin(db) == (rise(db), "rise")
     assert health(client)["pumped_ml"] == 0
 
@@ -748,9 +817,13 @@ def test_a_dose_handed_in_the_taps_own_second_counts(client, db):
     age(db, 60)
     cmd_id = hand(client, 60)
     since = tap(client, db)
-    assert run_sql(db, "SELECT sent_ts FROM commands WHERE id = ?", cmd_id) == [(since,)]
     ack(client, cmd_id, flow=60)
+    # Pinned to the tap's second by hand — whether the hand-off and the
+    # tap land in one second is the wall clock's business. At, not after.
+    run_sql(db, "UPDATE commands SET sent_ts = ? WHERE id = ?", since, cmd_id)
     assert health(client)["pumped_ml"] == 60
+    run_sql(db, "UPDATE commands SET sent_ts = ? WHERE id = ?", since - 1, cmd_id)
+    assert health(client)["pumped_ml"] == 0
 
 
 def test_a_stop_acked_with_a_count_is_not_water(client, db):
@@ -1218,16 +1291,18 @@ def test_an_existing_database_carries_the_floats_last_word_at_startup(db):
         create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900)
     )
     # The word, its clock and its rise, carried from float_ok and
-    # float_since, and the firm word from the word: the rise the float
-    # had before the upgrade is where it was, the one report the upgrade
-    # has to go on is taken at its word, and no report has carried ch207
-    # yet.
+    # float_since: the rise the float had before the upgrade is where it
+    # was, no report has carried ch207 yet, and nothing is firm — the
+    # upgrade has one report to go on, and the first after it that agrees
+    # is the second of two.
     assert run_sql(
         db,
         "SELECT float_word, float_word_since, float_rise, contra, float_firm "
         "FROM status",
-    ) == [(1, 5, 5, 0, 1)]
-    assert post(client, "/refill", "c=0").status_code == 200  # snapshots the carried 1
+    ) == [(1, 5, 5, 0, None)]
+    report(client, "c=0 ch0=1 float=1")  # agrees with the carried word: firm
+    assert run_sql(db, "SELECT float_firm FROM status") == [(1,)]
+    assert post(client, "/refill", "c=0").status_code == 200  # snapshots the word
     run_sql(db, "UPDATE refills SET ts = ts - 60 WHERE float_ok IS NOT NULL")
     assert refills(db) == [(None,), (1,)]
     since = taps(db)[-1]
@@ -1248,8 +1323,8 @@ def test_the_carried_clocks_come_only_with_the_word(db):
     neither is a clock for it — a clock without a word would read as a
     float that has not moved since before any tap. A word of empty brings
     its clock and no rise (float_since is its fall); a word of full brings
-    both. The firm word is the word, wherever there is one (spec D3,
-    amended, then thrice)."""
+    both. The firm word is not carried: one report is not two (spec D3,
+    amended, then thrice, D14 c)."""
     with sqlite3.connect(db) as con:
         con.executescript(
             OLD_STATUS
@@ -1265,31 +1340,37 @@ def test_the_carried_clocks_come_only_with_the_word(db):
         "FROM status ORDER BY controller",
     ) == [
         (0, None, None, None, None),
-        (1, 0, 6, None, 0),
-        (2, 1, 5, 5, 1),
+        (1, 0, 6, None, None),
+        (2, 1, 5, 5, None),
     ]
 
 
-def test_the_firm_word_is_carried_from_the_word_alone(db):
-    """The firm word's carry reads the word and nothing else. On the
-    0.18.0 shape the word is carried first, from float_ok, so a second
-    gate on float_ok let through exactly the rows the word had and told
-    nothing apart; this shape does: a word that stands under a blank
-    float_ok — the last report omitted float= — carries its firm word
-    all the same, and no word carries none."""
+def test_the_firm_word_is_not_carried_at_the_upgrade(db):
+    """The firm word is what two consecutive float-carrying reports agree
+    on, and the upgrade has one report to go on: NULL, whatever the word
+    says. The carried word is the last float-carrying report's, so the
+    first post-upgrade report that agrees with it is the second of two,
+    and makes it firm; one that disagrees leaves NULL (spec D14 c)."""
     with sqlite3.connect(db) as con:
         con.executescript(
             OLD_STATUS
             + """
-            ALTER TABLE status ADD COLUMN float_word INTEGER;
-            INSERT INTO status (controller, ts, float_ok, float_since, float_word)
-            VALUES (0, 9, NULL, 7, 1), (1, 9, NULL, 7, NULL);
+            INSERT INTO status (controller, ts, float_ok, float_since)
+            VALUES (0, 9, 1, 5), (1, 9, 0, 6), (2, 9, NULL, 7);
             """
         )
-    TestClient(create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900))
+    client = TestClient(
+        create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900)
+    )
     assert run_sql(
         db, "SELECT controller, float_word, float_firm FROM status ORDER BY controller"
-    ) == [(0, 1, 1), (1, None, None)]
+    ) == [(0, 1, None), (1, 0, None), (2, None, None)]
+    report(client, "c=0 ch0=1 float=1")  # agrees with the carried word
+    report(client, "c=1 ch0=1 float=1")  # disagrees with it
+    report(client, "c=2 ch0=1 float=1")  # the first word this board ever said
+    assert run_sql(
+        db, "SELECT controller, float_word, float_firm FROM status ORDER BY controller"
+    ) == [(0, 1, 1), (1, 1, None), (2, 1, None)]
 
 
 def test_a_tank_already_empty_at_the_upgrade_starts_at_its_next_tap(db):
@@ -1313,7 +1394,7 @@ def test_a_tank_already_empty_at_the_upgrade_starts_at_its_next_tap(db):
         create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900)
     )
     assert refills(db) == [(None,)] and drops(db) == [None]
-    assert run_sql(db, "SELECT float_word, float_firm FROM status") == [(0, 0)]
+    assert run_sql(db, "SELECT float_word, float_firm FROM status") == [(0, None)]
     run_sql(
         db,
         "INSERT INTO tank_samples (ts, controller, refill_ts, ml) "

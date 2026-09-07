@@ -635,6 +635,34 @@ def test_the_latch_names_the_boards_word_for_its_reason(app, client, db, sent):
     )
 
 
+def test_a_renamed_latch_pages_again_with_its_new_words(app, client, db, sent):
+    """The latch: row's detail is the reason its page named, and a
+    standing latch whose reason changed — D12's overwrite, the reset
+    landing under a contra — pages again with the new words, floor or no
+    floor: a person told "clear contra" must also be told "dry off". Once
+    per name: the tick after that is quiet, and the row is one row (spec
+    D14 d)."""
+    report(client, "c=0 ch0=1 float=1 pos=ok ch207=1")
+    tick(app)
+    assert keys(sent) == ["latch:0"] and "type clear contra" in sent[0].message
+    assert run_sql(db, "SELECT detail FROM alerts WHERE key = 'latch:0'") == [
+        ("contra",)
+    ]
+    tick(app)
+    assert keys(sent) == ["latch:0"]  # the same name is not news
+    report(client, "c=0 ch0=1 float=1 pos=ok ch207=1 err=resetmid")  # the reset, under it
+    assert health(client)["latched"]["reason"] == "resetmid"
+    tick(app)
+    assert keys(sent) == ["latch:0", "latch:0"]
+    assert sent[1].priority == "high" and "type dry off on the board" in sent[1].message
+    assert run_sql(db, "SELECT detail FROM alerts WHERE key = 'latch:0'") == [
+        ("resetmid",)
+    ]
+    tick(app)
+    assert keys(sent) == ["latch:0", "latch:0"]  # once per name
+    assert alerts(client) == ["latch:0"]
+
+
 def test_the_latch_pages_once_and_resume_clears_row_and_page(app, client, db, sent):
     report(client, "c=0 ch0=1 float=1 pos=ok ch207=1 err=contra")
     tick(app)
@@ -946,34 +974,111 @@ def test_over_clears_on_a_tap_and_on_nothing_else(app, client, db, sent):
     entry = health(client)
     assert entry["pumped_ml"] == 0  # the counter restarted at the rise
     assert entry["over"] == 1  # the page is the fact until a tap answers it
-    # A tap the board never saw is no answer (a row from before 0.19.0).
-    refill(client)
-    run_sql(db, "UPDATE refills SET float_ok = NULL WHERE ts = ?", taps(db)[-1])
-    tick(app)
-    assert alerts(client) == ["over:0"]
-    # A tap that saw the float, later than the raise: answered the moment
-    # it lands, cleared on the tick, and that is all it says — "watering
-    # resumes" was untrue on a float at 0.
-    refill(client)
-    assert alerts(client) == ["over:0"] and health(client)["over"] == 0
-    tick(app)
-    assert sent[-1].key == "over:0" and sent[-1].priority == "default"
-    assert sent[-1].message == "the tank on board 0 was refilled"
+    # A tap: the row is cleared the moment it lands, in the tap's own
+    # transaction, and that is all — no page says so, the person did the
+    # thing, and "watering resumes" was untrue on a float at 0 anyway.
+    ts = refill(client)
     assert alerts(client) == [] and health(client)["over"] == 0
+    assert run_sql(db, "SELECT cleared_ts FROM alerts WHERE key = 'over:0'") == [
+        (ts,)
+    ]
+    tick(app)
+    assert [k for k in keys(sent) if k.startswith("over:")] == ["over:0"]
 
 
 def test_a_float_that_goes_empty_past_the_size_is_a_float_that_works(
     app, client, db, sent
 ):
+    """Judged on the firm word: one sighting of empty is not yet the float
+    saying so, and for that beat the firm word still says full over a run
+    a tenth past the median; the next report agrees, and a float that
+    reads empty is a float that works (spec D6, D14 a)."""
     learn_the_tank(app, client, db, sent, 200)
     tap(client, db)
     dose(client, 150)
-    dose(client, 71, float_ok=0)  # 221, and the float said so
+    dose(client, 71, float_ok=0)  # 221, and the float said so — once
+    assert health(client)["over"] == 1  # the firm word still says full
+    still_empty(client, db)  # ...and again: the float works
     assert health(client)["over"] == 0
-    still_empty(client, db)
     tick(app)
     assert keys(sent) == [f"tank:0:{taps(db)[-1]}"]  # a longer run, learned and told
     assert health(client)["tank_samples"] == 3
+
+
+def test_over_reads_the_firm_word_in_the_beat_before_the_rise(app, client, db, sent):
+    """The origin waits for the firm word — the rise is stamped once the
+    next report agrees — so in the beat between a 0 -> 1 sighting and its
+    confirmation the raw word says full while the origin is still the tap
+    whose run just closed. Read on float_ok, any run a tenth over the
+    median paged "presumed stuck" there and dried the rules until a tap;
+    on the firm word that beat is a float still firmly empty, the rules
+    water, and the confirmation moves the origin to the rise with the
+    counter at the dose handed in its second (spec D14 a)."""
+    make_pot(client, cooldown_h=0, daily_cap_ml=100_000)
+    learn_the_tank(app, client, db, sent, 200)
+    tap(client, db)
+    dose(client, 150)
+    # A run a tenth past the median, on dry readings: the last dose drains
+    # the tank, the float says so on its ack and again a window on.
+    answer = post(client, "/command", "c=0 water=3 ml=71")
+    assert answer.status_code == 200, answer.text
+    cmd_id = int(answer.text.strip().removeprefix("cmd="))
+    assert f"cmd={cmd_id}" in report(client, f"c=0 ch0={DRY} float=1 pos=ok").text
+    report(client, f"c=0 ch0={DRY} float=0 pos=ok ack={cmd_id} flow_ml=71")
+    age(db, FLAP_WINDOW_S + 1)
+    report(client, f"c=0 ch0={DRY} float=0 pos=ok")  # the firm drop: the run closed
+    entry = health(client)
+    assert entry["tank_samples"] == 3 and entry["pumped_ml"] == 221
+    age(db, 60)
+    # Refilled, untapped: the first sighting of full. The origin is still
+    # the tap, the counter still 221 over a tank of 200, the raw word full
+    # — and the firm word empty, so nothing is over: the rules water.
+    handed = report(client, f"c=0 ch0={DRY} float=1 pos=ok").text
+    assert "cmd=" in handed
+    dose_id = int(handed.split("cmd=")[1].split()[0])
+    entry = health(client)
+    assert entry["pumped_ml"] == 221 and entry["over"] == 0
+    tick(app)
+    assert [k.split(":")[0] for k in keys(sent)] == ["tank"]  # the run, no over
+    # The next agrees: the rise, and the dose it handed is on its counter.
+    report(client, f"c=0 ch0={DRY} float=1 pos=ok ack={dose_id} flow_ml=100")
+    entry = health(client)
+    assert entry["pumped_ml"] == 100 and entry["over"] == 0
+    with sqlite3.connect(db) as con:
+        assert butler.counter_origin(con, 0)[1] == "rise"
+    tick(app)
+    assert [k.split(":")[0] for k in keys(sent)] == ["tank"]
+
+
+def test_the_tap_clears_over_inline_and_sends_no_page(app, client, db, sent):
+    """The tap clears the over: row in record_refill's own transaction,
+    cleared_ts being the tap, as /resume clears latch: — the person did
+    the thing, so no "was refilled" page follows and the ticker has
+    nothing to clear — and over_stands is raised-and-not-cleared, for the
+    rules, /health and the phone's strip alike: a row standing is the
+    fact, whatever taps are on file (spec D14 b)."""
+    learn_the_tank(app, client, db, sent, 200)
+    tap(client, db)
+    dose(client, 250)
+    tick(app)
+    assert keys(sent) == ["over:0"] and alerts(client) == ["over:0"]
+    age(db, 60)
+    ts = refill(client)
+    assert run_sql(db, "SELECT cleared_ts FROM alerts WHERE key = 'over:0'") == [
+        (ts,)
+    ]
+    assert alerts(client) == [] and health(client)["over"] == 0
+    with sqlite3.connect(db) as con:
+        assert butler.over_stands(con, 0) is False
+    tick(app)
+    tick(app)
+    assert keys(sent) == ["over:0"]  # nothing said: the person did the thing
+    # Raised and not cleared is the whole of it: a row standing after a
+    # tap is a page standing.
+    run_sql(db, "UPDATE alerts SET cleared_ts = NULL WHERE key = 'over:0'")
+    assert alerts(client) == ["over:0"] and health(client)["over"] == 1
+    with sqlite3.connect(db) as con:
+        assert butler.over_stands(con, 0) is True
 
 
 def test_over_holds_the_rules_not_the_phone_and_the_tap_is_the_clear(
@@ -992,23 +1097,23 @@ def test_over_holds_the_rules_not_the_phone_and_the_tap_is_the_clear(
     dose(client, 50)
     age(db, 60)  # a minute on...
     tap(client, db)  # ...the tap, later than the page
-    # Answered the moment it lands, before the ticker hears of it: the
-    # window is already five dry readings deep, and the next report waters.
-    assert alerts(client) == ["over:0"] and health(client)["over"] == 0
+    # Answered the moment it lands, the row cleared with it: the window is
+    # already five dry readings deep, and the next report waters. The
+    # ticker has nothing to add.
+    assert alerts(client) == [] and health(client)["over"] == 0
     assert "cmd=" in dry_reports(client, n=1)
     assert len(rules_water(db)) == 1
     tick(app)
-    assert keys(sent) == ["over:0", "over:0"]
-    assert sent[-1].priority == "default"
-    assert sent[-1].message == "the tank on board 0 was refilled"
+    assert keys(sent) == ["over:0"]
     assert alerts(client) == [] and health(client)["over"] == 0
 
 
-def test_the_tap_frees_the_rules_before_ntfy_hears_of_it(db, sent):
-    """The ticker clears over: only once ntfy has taken the clear, and
-    ntfy is down as often as anything: the rules and /health honour the
-    tap the moment it lands, as /resume does for the latch, and the
-    ticker still says "was refilled" when it can (spec D6, thrice)."""
+def test_the_tap_needs_no_ntfy_to_clear_over(db, sent):
+    """The tap clears over: in its own transaction and sends nothing, so
+    ntfy being down — as often as anything — keeps no tank somebody just
+    filled from being watered from: the rules, /health and the phone's
+    strip honour the tap the moment it lands, as /resume does for the
+    latch, and the tick after it has nothing to send (spec D14 b)."""
     accepted = [True]
     app = create_app(
         db_path=str(db),
@@ -1031,16 +1136,11 @@ def test_the_tap_frees_the_rules_before_ntfy_hears_of_it(db, sent):
     accepted[0] = False  # ntfy goes down
     age(db, 60)
     tap(client, db)
-    assert alerts(client) == ["over:0"] and health(client)["over"] == 0
+    assert alerts(client) == [] and health(client)["over"] == 0
     assert "cmd=" in dry_reports(client, n=1)
     assert len(rules_water(db)) == 1
-    assert tick(app) is False  # the clear could not be sent...
-    assert alerts(client) == ["over:0"]  # ...so the page stands, unanswered by ntfy...
-    assert health(client)["over"] == 0  # ...and answered all the same
-    accepted[0] = True
-    assert tick(app) is True
-    assert sent[-1].message == "the tank on board 0 was refilled"
-    assert alerts(client) == []
+    assert tick(app) is True  # nothing to send: a clean pass
+    assert keys(sent) == ["over:0"] and alerts(client) == []
 
 
 def test_over_holds_the_rules_through_a_float_bounce_until_the_tap(
@@ -1076,38 +1176,33 @@ def test_over_holds_the_rules_through_a_float_bounce_until_the_tap(
     assert len(rules_water(db)) == 1
 
 
-def test_a_tap_in_the_raises_own_second_is_no_answer_to_it(app, client, db, sent):
-    """The tap that answers over: is later than the raise, strictly. The
-    page was raised on the counter as it stood that second, which starts
-    at the latest tap, and a dose handed in a tap's second is on its
-    counter (D3's `>=`): a tap from the raise's second may be the very
-    one the page was counted from, and letting it answer would raise and
-    clear the page on one tap, "was refilled" sent for the run's own
-    start. So it stands, for the rules and /health alike, and a tap one
-    second later answers it (spec D6, thrice)."""
+def test_a_tap_answers_the_row_standing_when_it_lands_whatever_the_clocks(
+    app, client, db, sent
+):
+    """What a tap answers is the row standing when it lands — cleared in
+    the tap's own transaction — and the clocks decide nothing: a raise
+    stamped with a clock ahead of the tap's is cleared all the same, for
+    the rules and /health alike, where a clear that compared the tap's
+    second to the raise's left it standing. The page a tap was counted
+    from cannot outlive it: raised after the tap, its counter started at
+    that tap and is not over (spec D14 b)."""
     make_pot(client, cooldown_h=0, daily_cap_ml=100_000)
     learn_the_tank(app, client, db, sent, 200)
     tap(client, db)
     dose(client, 250)
-    tick(app)
+    tick(app, int(time.time()) + 100)  # raised, with a clock ahead of the tap's
     assert keys(sent) == ["over:0"]
-    age(db, 60)
-    ts = refill(client)  # a tap that saw the float, in the raise's second
-    run_sql(db, "UPDATE alerts SET raised_ts = ? WHERE key = 'over:0'", ts)
-    entry = health(client)
-    assert entry["pumped_ml"] == 0  # the live predicate let go...
-    assert entry["over"] == 1  # ...the page did not
     dry_reports(client)
     assert rules_water(db) == []
-    tick(app)
-    assert keys(sent) == ["over:0"] and alerts(client) == ["over:0"]
-    run_sql(db, "UPDATE alerts SET raised_ts = raised_ts - 1 WHERE key = 'over:0'")
-    assert health(client)["over"] == 0
+    age(db, 60)  # the run's water is before the tap's second
+    ts = refill(client)
+    ((raised_ts, cleared_ts),) = run_sql(
+        db, "SELECT raised_ts, cleared_ts FROM alerts WHERE key = 'over:0'"
+    )
+    assert raised_ts > ts and cleared_ts == ts
+    assert alerts(client) == [] and health(client)["over"] == 0
     assert "cmd=" in dry_reports(client, n=1)
     assert len(rules_water(db)) == 1
-    tick(app)
-    assert sent[-1].message == "the tank on board 0 was refilled"
-    assert alerts(client) == []
 
 
 def test_a_report_that_omits_float_neither_hides_nor_makes_a_rise(
@@ -1136,12 +1231,12 @@ def test_over_pages_once_per_floor(app, client, db, sent):
     dose(client, 250)
     tick(app)
     age(db, 60)
-    tap(client, db)
+    tap(client, db)  # the clear, silent, and the floor counts from it
     tick(app)
-    assert keys(sent) == ["over:0", "over:0"]
+    assert keys(sent) == ["over:0"]
     dose(client, 250)  # over again inside the hour: the page waits its floor
     tick(app)
-    assert keys(sent) == ["over:0", "over:0"]
+    assert keys(sent) == ["over:0"]
     assert health(client)["over"] == 1  # the state is a fact all the same
     run_sql(
         db,
@@ -1149,7 +1244,7 @@ def test_over_pages_once_per_floor(app, client, db, sent):
         REALERT_FLOOR_S,
     )
     tick(app)
-    assert keys(sent) == ["over:0", "over:0", "over:0"]
+    assert keys(sent) == ["over:0", "over:0"]
 
 
 def test_a_top_up_tapped_daily_never_fires(app, client, db, sent):
@@ -1390,8 +1485,8 @@ def test_the_helpers_read_the_origin_the_size_the_tap_and_the_float(app, db):
         )
         con.execute(
             "INSERT INTO status (controller, ts, float_ok, float_word, "
-            "float_word_since, float_rise, float_seen) "
-            "VALUES (0, 1000, 1, 1, 900, 900, 1000)"
+            "float_word_since, float_rise, float_seen, float_firm) "
+            "VALUES (0, 1000, 1, 1, 900, 900, 1000, 1)"
         )
         assert origin() == (1000, "tap") and state() == "ok"  # nothing pumped
         pumped(220, 1001)
@@ -1410,11 +1505,16 @@ def test_the_helpers_read_the_origin_the_size_the_tap_and_the_float(app, db):
         assert state() == ("over", 221, 200, 1002)
         con.execute("UPDATE status SET float_ok = NULL")  # a report that said nothing
         assert origin() == (1002, "rise")  # the rise stands: the word did not move
-        assert state() == "ok"  # and a float that says nothing refuses already
-        con.execute("UPDATE status SET float_ok = 0, float_word = 0")  # drained again
+        assert state() == ("over", 221, 200, 1002)  # and neither did the firm word
+        con.execute("UPDATE status SET float_ok = 0, float_word = 0")  # drained: once
         assert origin() == (1002, "rise")  # sticky: the rise is where it was
-        assert state() == "ok"  # a float that reads empty works
-        con.execute("UPDATE status SET float_ok = 1, float_word = 1, float_rise = 900")
+        assert state() == ("over", 221, 200, 1002)  # the firm word still says full
+        con.execute("UPDATE status SET float_firm = 0")  # ...and the next agrees
+        assert state() == "ok"  # a float that firmly reads empty works
+        con.execute(
+            "UPDATE status SET float_ok = 1, float_word = 1, float_firm = 1, "
+            "float_rise = 900"
+        )
         con.execute("INSERT INTO refills (ts, controller, float_ok) VALUES (2000, 0, 1)")
         assert origin() == (2000, "tap") and state() == "ok"  # restarts at the tap
         con.execute("UPDATE status SET float_rise = 2001")  # rose, with no drop since

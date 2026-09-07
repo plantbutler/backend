@@ -260,14 +260,15 @@ change counts) — which latches the butler too: no rule waters it and `POST /co
 dose until `POST /resume`, and that one pages high every time, floor or no floor, naming the
 board's own word to type first (`clear contra`, or `dry off` after a reset mid-dose, which the
 board latches dry and `clear contra` does not touch — the newest fault's word, when a second
-lands on a board still stopped); a float
+lands on a board still stopped, and the page comes again with it); a float
 presumed stuck — still saying full after more than the tank holds (plus a tenth) has been pumped
 since the refill you recorded, or since the float last rose if it had gone empty since that tap (a
 tank run down and refilled by someone who forgot to tap restarts the count: the float demonstrably
 moved; a rise with no drop since the tap is your own refill reaching the float, and the tap
-stands; and the float has to say a thing twice running to have moved at all — one sighting is a
-slosh), so the rules will not water that board, and only your next tap "refilled" clears the
-page — the rules and the app take the tap the moment it lands, the page follows when ntfy answers —
+stands; and the float has to say a thing twice running to have said it at all — one sighting is a
+slosh, and "still saying full" is that twice-said word), so the rules will not water that board,
+and only your next tap "refilled" clears the page — the moment it lands, and without a word from
+the butler: you did the thing —
 not the float dropping, which is a flap or a contra as often as an empty tank (a dose typed
 at the phone still goes: the board's own float check runs); or still saying empty in a report
 three minutes or more after a tap made with it empty — a stuck float, or the board's own float
