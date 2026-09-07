@@ -159,7 +159,7 @@ def test_a_rebuild_killed_half_way_leaves_the_old_table_intact(tmp_path, monkeyp
     which the idempotence guard reads as "already migrated" — the next
     start would do nothing and the loss would be silent."""
     path, con = old_db(tmp_path)
-    real = butler.new_pot_id
+    real = butler.schema.new_pot_id
     minted = []
 
     def killed_on_the_second_pot():
@@ -168,7 +168,9 @@ def test_a_rebuild_killed_half_way_leaves_the_old_table_intact(tmp_path, monkeyp
             raise RuntimeError("the container was killed mid-rebuild")
         return real()
 
-    monkeypatch.setattr(butler, "new_pot_id", killed_on_the_second_pot)
+    # On the module that owns it: migrate() calls it from schema's own
+    # globals, so patching the name butler re-exports would not reach it.
+    monkeypatch.setattr(butler.schema, "new_pot_id", killed_on_the_second_pot)
     with pytest.raises(RuntimeError):
         migrate(con, path)
 
@@ -181,7 +183,7 @@ def test_a_rebuild_killed_half_way_leaves_the_old_table_intact(tmp_path, monkeyp
     assert con.execute("SELECT COUNT(*) FROM pot_mappings").fetchone() == (0,)
 
     # the next start simply retries, as if nothing had happened
-    monkeypatch.setattr(butler, "new_pot_id", real)
+    monkeypatch.setattr(butler.schema, "new_pot_id", real)
     assert migrate(con, path) is True
     assert sorted(n for (n,) in con.execute("SELECT name FROM pots")) == [
         "basil",
