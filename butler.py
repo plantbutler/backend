@@ -97,7 +97,7 @@ from starlette.requests import ClientDisconnect
 # metadata because the container installs no package — it copies butler.py
 # beside fastapi and runs it. A test asserts this and pyproject.toml agree,
 # which is the only thing that keeps the two honest.
-VERSION = "0.19.0"
+VERSION = "0.20.0"
 
 BODY_CAP = 4096  # a full 15-channel report is ~200 bytes; 4 KB is generous
 # Photographs are the first thing here that is not small. The phone caps the
@@ -130,23 +130,38 @@ MAX_CHANNEL = 255
 # opened its own controller row, its own heartbeat and its own alerts, and
 # nothing anywhere said the two were the same board.
 MAX_CONTROLLER = 255
-# The board's diagnostic channels this file reads. ch207 is its contradiction
-# latch (float said full, meter saw nothing), 0 or 1 in every report while it
-# stands; it lives in .noinit on the board and a power cycle erases it, which
-# is why the durable half is here.
+# The board's diagnostic channels this file reads: its three latches, 0 or 1
+# in every report while each stands, absent meaning 0 (an older board: never
+# latched, never tripped). ch207 is the contradiction latch (float said full,
+# meter saw nothing); it lives in .noinit on the board and a power cycle
+# erases it, which is why the durable half is here. ch210 is the flap: three
+# consecutive float refusals, which force the board's float= to 0 until a
+# dose is granted — the channel says WHY the word is 0, and a tap answers it
+# for one dose. ch211 is the dry latch: the board held dry by whoever did it
+# — a reset with a dose in flight, or `dry on` at the console — cleared only
+# by `dry off`, the level the backend latches on with reason `dry`.
 CONTRA_CHANNEL = 207
+FLAP_CHANNEL = 210
+DRY_CHANNEL = 211
+# The three reasons a latch can carry: the two levels, and the reset's edge
+# (`err=` turning to resetmid), which is consulted beside the dry level and
+# keeps its own words — a `dry off` typed before the first post-reset report
+# leaves the edge as the only trace of the reset.
 LATCH_TEXT = {
     "contra": "the float said full and the meter saw nothing",
+    "dry": "the board is held dry: a reset with the pump running, or dry on at the console",
     "resetmid": "it reset with the pump running",
 }
 # The board's own word for each, typed on its console. `clear contra` lifts
-# the contradiction latch and nothing else; a board that reset with the pump
-# running is latched dry on the firmware (noinit.cpp:43), and only `dry off`
-# clears that (cli.cpp:478). The 409, the latch page and the README spell the
-# step from this one map, so nobody is sent to type the wrong thing; a
-# reason it does not know gets the contra words, as the app's map does.
+# the contradiction latch and nothing else; a board held dry — a reset with
+# the pump running latches it so on the firmware (noinit.cpp:43) — is let go
+# only by `dry off` (cli.cpp:478). The 409, the latch page and the README
+# spell the step from this one map, so nobody is sent to type the wrong
+# thing; a reason it does not know gets the contra words, as the app's map
+# does.
 LATCH_STEP = {
     "contra": "type clear contra on the board",
+    "dry": "type dry off on the board",
     "resetmid": "type dry off on the board",
 }
 MAX_RAW = 2**31  # 14-bit ADC today; headroom without letting 2**63 near sqlite
@@ -379,6 +394,14 @@ ADDED_COLUMNS = (
     Added("status", "contra", "INTEGER NOT NULL DEFAULT 0"),
     Added("status", "float_firm", "INTEGER"),
     Added("status", "float_forced", "INTEGER NOT NULL DEFAULT 0"),
+    # Latches on the wire (0.20.0): the board's other two latches beside
+    # ch207's, from its report's channels — absent being 0, so a board
+    # that has not reported since the upgrade reads as never tripped,
+    # never latched — and when the flap last tripped, which nothing has
+    # started yet.
+    Added("status", "flap", "INTEGER NOT NULL DEFAULT 0"),
+    Added("status", "flap_since", "INTEGER"),
+    Added("status", "dry", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -876,37 +899,44 @@ def latch_steps(reason: str) -> str:
     return f"check the tank, {LATCH_STEP.get(reason, LATCH_STEP['contra'])}, then resume"
 
 
-def latch_reason(
-    r: Report, prev_err: str | None, standing: str | None
-) -> str | None:
+def latch_reason(r: Report, prev_err: str | None) -> str | None:
     """What in this report latches the backend, if anything, and under
-    what name; `prev_err` is the stored status.err before this report,
-    `standing` the reason of the latch already standing, None when none
-    does. ch207 is a level: the board sends it on every report while its
-    latch stands, and `clear contra` on the console drops it. err= is the
-    board's sticky last error, repeated on every report until a later
-    dose ends with something else and never touched by the console, so
-    `err=contra` is not a trigger — it would re-latch a resumed board
-    forever — and resetmid is an edge: the value turning into it in this
-    report. An edge is a new fault and names the latch, standing or not;
-    a level re-asserts a standing latch under the name it has and names
-    contra only when it starts one — a repeat is not a new fault. Both
-    on one report — the contra lives in .noinit through a reset, so a
-    board that resets mid-dose under it says so — name the edge: it is
-    seen this once (the upsert makes status.err resetmid whatever is
-    named here), while the level repeats on every report until `clear
-    contra` is typed, so after `dry off` and the resume the contra
-    re-latches with its own words. Named the other way round, the contra
-    hid the reset for ever, and `clear contra` was the only step a person
-    was ever told; and a level that renamed the latch it stood under hid
-    it again one report later, before anyone had looked (spec D12). The
-    float going empty is deliberately not here either: the rules already
-    refuse on float=0, and a refill is the human event for that (spec
-    D2)."""
+    what name; `prev_err` is the stored status.err before this report.
+    The board's two durable latches are levels on the wire, sent on
+    every report while they stand: ch207, the contradiction latch, which
+    `clear contra` on the console drops, and ch211, the dry latch — the
+    board held dry by a reset with a dose in flight or by `dry on`,
+    cleared only by `dry off` — reason `dry`. A level names its latch on
+    every report it stands on: a repeat is not a new fault (the caller
+    keeps the stamp), and a standing latch is renamed only when the
+    level named goes while the other stays — `clear contra` typed with
+    the dry level up renames it `dry`, and pages again with `dry off`
+    (spec D14 d).
+
+    Beside them the reset's edge: err= is the board's sticky last error,
+    repeated on every report until a later dose ends with something else
+    and never touched by the console, so `err=contra` is not a trigger —
+    it would re-latch a resumed board forever — and resetmid latches when
+    the value turns into it in this report. Consulted on every report,
+    level or no level: an older board carries no ch211 and says a reset
+    with nothing else, and on a board with it `dry off` typed at the
+    console before the first post-reset report (bring-up 7c) leaves that
+    report saying ch211=0 err=resetmid — read as "not dry", the reset
+    hid for good. The edge is seen this once (the upsert makes
+    status.err resetmid whatever is named here). When more than one
+    applies: contra, then dry, then resetmid — the contra's step comes
+    first, and the reset that raised the dry level is told through it
+    once `clear contra` is typed (spec A2).
+
+    The float going empty is deliberately not here either: the rules
+    already refuse on float=0, and a refill is the human event for that
+    (spec D2)."""
+    if r.channels.get(CONTRA_CHANNEL) == 1:
+        return "contra"
+    if r.channels.get(DRY_CHANNEL) == 1:
+        return "dry"
     if r.err == "resetmid" and prev_err != "resetmid":
         return "resetmid"
-    if r.channels.get(CONTRA_CHANNEL) == 1:
-        return standing or "contra"
     return None
 
 
@@ -973,8 +1003,8 @@ def counter_origin(
     moved, so the counter restarts at the rise instead of calling it
     stuck twenty millilitres later. A 0 -> 1 with no drop since the tap
     is the tap's own refill arriving on the wire after a tap made at
-    empty, a `clear contra` after a tap, the manual dose lifting the flap
-    after a tap: the tap stays, or the ordinary "tank empty, fill, tap"
+    empty, a `clear contra` after a tap, the dose lifting the flap after
+    a tap: the tap stays, or the ordinary "tank empty, fill, tap"
     run would lose its sample. Sticky: a second drain after an untapped
     refill keeps the rise (float_rise stays where it was) rather than
     falling back to the tap and resurrecting water already sampled. The
@@ -1164,6 +1194,104 @@ def tank_state(
     return "ok"
 
 
+def flap_tap(
+    con: sqlite3.Connection, controller: int, float_ok: int | None, flap: int | None
+) -> int | None:
+    """The tap made after the board's flap tripped, or None: the flap
+    stands (`flap`, ch210 in the report at hand — three consecutive
+    float refusals, after which the firmware forces float=0 until a dose
+    is granted, and the rules never grant on 0: the way out), the
+    board's word is the 0 the flap forces (`float_ok`; a report that
+    omits float= says nothing a tap can answer, and is dry here as
+    everywhere), and the latest tap that saw the float is later than the
+    flap tripped (status.flap_since). The tie goes dry: the tap and the
+    report that tripped the flap are transactions stamped with one
+    clock, so in one second which came first is unknowable, and a tap
+    made before the flap was on the wire answers nothing — which costs
+    the human one more tap a minute on. A NULL-snapshot tap answers
+    nothing, here as everywhere (spec D3, A1)."""
+    if flap != 1 or float_ok != 0:
+        return None
+    row = con.execute(
+        "SELECT flap_since FROM status WHERE controller = ?", (controller,)
+    ).fetchone()
+    if not row or row[0] is None:
+        return None
+    tap = base_tap(con, controller)
+    if tap is None or tap[0] <= row[0]:
+        return None
+    return tap[0]
+
+
+def tap_answers_flap(
+    con: sqlite3.Connection, controller: int, float_ok: int | None, flap: int | None
+) -> int | None:
+    """The tap the rules may water on, over the board's word of 0, or
+    None: flap_tap's, with no water handed to the board at or after it.
+    The tap is the human saying full; the rules queue their next dose as
+    they would, and the board's own float check runs at dose time —
+    granted, the flap resets and float=1 returns; refused (ack= flow_ml=0
+    err=float), the flap stands and the tap is spent, so the rules are
+    dry again until the next one. One try per tap, whoever asked for it:
+    the flap does not move on the wire for a refusal — the board's
+    counter only grows — so without the last clause a refused try was
+    queued again at cooldown pace, the loop the flap exists to stop. The
+    tie goes dry here too: a dose handed in the tap's second was its try
+    (spec D3)."""
+    tap = flap_tap(con, controller, float_ok, flap)
+    if tap is None:
+        return None
+    handed = con.execute(
+        "SELECT 1 FROM commands WHERE controller = ? AND kind = 'water' "
+        "AND sent_ts >= ? LIMIT 1",
+        (controller, tap),
+    ).fetchone()
+    return None if handed else tap
+
+
+def flap_try_pending(
+    con: sqlite3.Connection, controller: int, float_ok: int | None, flap: int | None
+) -> bool:
+    """Whether the try a tap bought is still to come: the tap answers the
+    flap, and the try is queued or with the board — handed since the tap,
+    and neither acked nor expired (the next report does one or the
+    other) — or nothing has been handed since the tap and the rules can
+    still make it: a live auto pot on the board with what the ladder
+    needs (RULES_POT_SQL), watered when it next dries. The stale page
+    waits on this: it would tell the person to refill and tap, which
+    they just did, and promise a dose that is on its way. Not on a try
+    nobody will make: "no water handed since the tap" is also what a
+    board with no such pot looks like — none mapped, every pot manual or
+    learning, an auto pot not yet calibrated — and there the try is a
+    human's (a /command, an approved proposal; a proposal standing is not
+    a try coming), so the page does not wait for one it cannot promise
+    and comes at PERSIST_S as for a float presumed stuck. Refused, the
+    ack spends the tap and the page comes on the next tick (spec A1,
+    A5)."""
+    tap = flap_tap(con, controller, float_ok, flap)
+    if tap is None:
+        return False
+    ended = con.execute(
+        "SELECT 1 FROM commands WHERE controller = ? AND kind = 'water' "
+        "AND sent_ts >= ? AND state != 'sent' LIMIT 1",
+        (controller, tap),
+    ).fetchone()
+    if ended:
+        return False
+    coming = con.execute(
+        "SELECT 1 FROM commands WHERE controller = ? AND kind = 'water' "
+        "AND (state = 'queued' OR (state = 'sent' AND sent_ts >= ?)) LIMIT 1",
+        (controller, tap),
+    ).fetchone()
+    if coming:
+        return True
+    can_try = con.execute(
+        f"SELECT 1 FROM pots_now WHERE {RULES_POT_SQL} AND mode = 'auto' LIMIT 1",
+        (controller,),
+    ).fetchone()
+    return can_try is not None
+
+
 def float_dead(
     con: sqlite3.Connection,
     controller: int,
@@ -1311,6 +1439,17 @@ def live_sql(col: str = "status") -> str:
     """The same allow-list as a SQL predicate. One source, so a fourth
     status cannot be admitted by one reader and refused by another."""
     return f"{col} IN (" + ", ".join(f"'{s}'" for s in LIVE_STATUSES) + ")"
+
+
+# A pot the rules can water on a board (the one `?`): live, on a channel
+# and an outlet, calibrated, with a target and a dose. The ladder's own
+# candidate shape, and the stale page's "a try can still come" — one
+# predicate, so the page cannot wait on a pot the ladder would skip.
+RULES_POT_SQL = (
+    f"{live_sql()} AND controller = ? AND channel IS NOT NULL "
+    "AND outlet IS NOT NULL AND dry_raw IS NOT NULL AND wet_raw IS NOT NULL "
+    "AND target_low_pct IS NOT NULL AND dose_ml IS NOT NULL"
+)
 
 
 # The key families that are recorded and never cleared: a dose judgement,
@@ -2796,8 +2935,21 @@ def create_app(
             con, r.controller
         ):
             return  # over: past the tank with the float at full, or paged so until a tap
-        if r.float_ok != 1 or r.pos != "ok":
-            return  # no reservoir, no known position, no report field: dry
+        if r.pos != "ok":
+            return  # no known position, no report field: dry
+        answering = tap_answers_flap(
+            con, r.controller, r.float_ok, r.channels.get(FLAP_CHANNEL)
+        )
+        if r.float_ok != 1 and answering is None:
+            return  # no reservoir, no report field: dry — unless a tap answers the flap
+        # While the tap answers the flap, a refusal acked before it — the
+        # board's float check failing with the word still up, the very
+        # thing the flap counts — is not water to the cooldown below: the
+        # try the tap bought must not wait out the refusal's six hours, a
+        # person told "refill and tap" having just done both. Any other
+        # time a refusal cools the pot as a dose does: a pot the board
+        # refuses for ever must not be asked at report pace (spec A1).
+        refusals_before = 0 if answering is None else answering
         # This board's own beat, so "recent" below means the same number of
         # reports whether it speaks every minute or every hour.
         beat = con.execute(
@@ -2809,10 +2961,7 @@ def create_app(
         candidates = con.execute(
             "SELECT id, channel, outlet, dry_raw, wet_raw, target_low_pct, "
             "dose_ml, mode, cooldown_h, daily_cap_ml FROM pots_now "
-            f"WHERE {live_sql()} AND mode IN ('learning', 'auto') "
-            "AND controller = ? AND channel IS NOT NULL AND outlet IS NOT NULL "
-            "AND dry_raw IS NOT NULL AND wet_raw IS NOT NULL "
-            "AND target_low_pct IS NOT NULL AND dose_ml IS NOT NULL "
+            f"WHERE {RULES_POT_SQL} AND mode IN ('learning', 'auto') "
             "ORDER BY name",
             (r.controller,),
         ).fetchall()
@@ -2878,8 +3027,9 @@ def create_app(
             cooldown_s = (cool_h if cool_h is not None else DEFAULT_COOLDOWN_H) * 3600
             watered = con.execute(
                 "SELECT 1 FROM commands WHERE pot_id = ? AND sent_ts IS NOT NULL "
-                "AND COALESCE(acked_ts, sent_ts) > ? LIMIT 1",
-                (pot_id, now - cooldown_s),
+                "AND COALESCE(acked_ts, sent_ts) > ? "
+                "AND (flow_ml IS NOT 0 OR acked_ts >= ?) LIMIT 1",
+                (pot_id, now - cooldown_s, refusals_before),
             ).fetchone() or con.execute(
                 # ...and the hose underneath it. Attribution is a lookup and
                 # a lookup can come back empty for reasons that say nothing
@@ -2890,8 +3040,8 @@ def create_app(
                 # state waters LESS, never more.
                 "SELECT 1 FROM commands WHERE controller = ? AND outlet = ? "
                 "AND sent_ts IS NOT NULL AND COALESCE(acked_ts, sent_ts) > ? "
-                "LIMIT 1",
-                (r.controller, outlet, now - cooldown_s),
+                "AND (flow_ml IS NOT 0 OR acked_ts >= ?) LIMIT 1",
+                (r.controller, outlet, now - cooldown_s, refusals_before),
             ).fetchone()
             if watered:
                 continue
@@ -2981,19 +3131,15 @@ def create_app(
                 # the other, and the upsert below overwrites both. The
                 # float is its last word, not float_ok: a report that
                 # omits float= blanks that column (its vanishing is its
-                # own alarm) and must not hide the edge. And the latch
-                # already standing, by its reason: set with latched_ts
-                # and cleared with it by /resume, never by the upsert, so
-                # a reason is a latch. A first report has none of these:
-                # there is no row yet, and it closes nothing.
+                # own alarm) and must not hide the edge. A first report
+                # has none of these: there is no row yet, and it closes
+                # nothing.
                 prev = con.execute(
-                    "SELECT err, float_word, float_firm, float_word_since, "
-                    "latch_reason FROM status WHERE controller = ?",
+                    "SELECT err, float_word, float_firm, float_word_since "
+                    "FROM status WHERE controller = ?",
                     (r.controller,),
                 ).fetchone()
-                prev_err, prev_word, prev_firm, prev_fell, standing = (
-                    prev or (None,) * 5
-                )
+                prev_err, prev_word, prev_firm, prev_fell = prev or (None,) * 4
                 # The firm word going 1 -> 0: the word was firmly full, the
                 # last report that carried float= said empty, and so does
                 # this one. One sighting is a glitch by the board's own
@@ -3016,6 +3162,7 @@ def create_app(
                 # it is a drop like any other (spec D3, D4).
                 edge = prev_firm == 1 and prev_word == 0 and r.float_ok == 0
                 forced = r.channels.get(CONTRA_CHANNEL) == 1
+                flap = int(r.channels.get(FLAP_CHANNEL) == 1)
                 tap = None
                 if edge and not forced:
                     tap = base_tap(con, r.controller, prev_fell)
@@ -3038,9 +3185,10 @@ def create_app(
                     "INSERT INTO status (controller, ts, float_ok, float_since, "
                     "pos, pos_since, float_seen, pos_seen, float_bad, "
                     "float_bad_prev, pos_bad, pos_bad_prev, err, err_ts, pos_ok_seen, "
-                    "float_word, float_word_since, float_rise, contra, float_firm) "
+                    "float_word, float_word_since, float_rise, contra, float_firm, "
+                    "flap, flap_since, dry) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?, ?, ?, "
-                    "NULL, ?, NULL) "
+                    "NULL, ?, NULL, ?, ?, ?) "
                     "ON CONFLICT(controller) DO UPDATE SET ts = excluded.ts, "
                     "float_ok = excluded.float_ok, pos = excluded.pos, "
                     "float_since = CASE WHEN status.float_ok IS excluded.float_ok "
@@ -3097,9 +3245,12 @@ def create_app(
                     # that drop, so a clearing on the rise had no effect and
                     # there is none. Every SET reads the row before this
                     # update, so float_word_since here is the move the
-                    # agreement confirms. ch207 is this report's, absent
-                    # being 0: the board's own latch, which it repeats until
-                    # `clear contra` is typed.
+                    # agreement confirms. ch207, ch210 and ch211 are this
+                    # report's, absent being 0: the board's own latches,
+                    # which it repeats while each stands; flap_since is
+                    # when the flap last tripped, 0 -> 1, the clock a tap
+                    # must be later than to answer it, kept through the
+                    # level and left where it was when the flap lets go.
                     "float_word_since = CASE WHEN excluded.float_word IS NULL "
                     "OR status.float_word IS excluded.float_word "
                     "THEN status.float_word_since ELSE excluded.ts END, "
@@ -3112,7 +3263,11 @@ def create_app(
                     "float_forced = CASE WHEN excluded.float_word = 0 "
                     "AND status.float_word = 0 AND status.float_firm = 1 "
                     "THEN excluded.contra ELSE status.float_forced END, "
-                    "contra = excluded.contra",
+                    "contra = excluded.contra, "
+                    "flap = excluded.flap, "
+                    "flap_since = CASE WHEN excluded.flap = 1 AND status.flap = 0 "
+                    "THEN excluded.ts ELSE status.flap_since END, "
+                    "dry = excluded.dry",
                     (
                         r.controller,
                         now,
@@ -3130,9 +3285,12 @@ def create_app(
                         r.float_ok,
                         now if r.float_ok is not None else None,
                         int(forced),
+                        flap,
+                        now if flap else None,
+                        int(r.channels.get(DRY_CHANNEL) == 1),
                     ),
                 )
-                reason = latch_reason(r, prev_err, standing)
+                reason = latch_reason(r, prev_err)
                 if reason is not None:
                     # `since` is set once, never refreshed while the latch
                     # stands: when the trouble began. The reason is the
@@ -4148,19 +4306,29 @@ def create_app(
         # as an empty tank. This is where the page is raised, once ntfy
         # takes the message; it is never cleared here. Stuck at empty is
         # harmless: the rules are dry on empty already, so it is a page and
-        # nothing else, cleared when the float says full. Its `stale:` key
-        # is the clock rule's, kept so a page standing from 0.18.0 clears
-        # through the same path. Neither is raised while the board's latch
-        # stands, nor while its latest report carried ch207=1 — a /resume
-        # before `clear contra` is typed lifts the one and not the other: a
-        # contra forces the word to 0, "float OK, zero pulses" is a fault
-        # and not a float, and the latch page already says what to do.
-        for controller, float_ok, latched_ts, contra in con.execute(
-            "SELECT controller, float_ok, latched_ts, contra FROM status"
+        # nothing else, cleared when the float says full — and the page
+        # says which of the two it is: the board's own float check tripped
+        # (status.flap, ch210 in its latest report: a tap answers that,
+        # for one dose — and while the try that tap bought is still to
+        # come, queued or with the board or the rules' to make once an
+        # auto pot on the board dries, the page would tell the person to
+        # do what they just did, so it waits for the refusal; on a board
+        # with no such pot nobody will make the try, and it does not wait)
+        # or, with no flap on the wire, a float presumed stuck at empty.
+        # Its `stale:` key is the clock rule's, kept so a page standing
+        # from 0.18.0 clears through the same path. Neither is raised
+        # while the board's latch stands, nor while its latest report
+        # carried ch207=1 or ch211=1 — a /resume before `clear contra` or
+        # `dry off` is typed lifts the one and not the other: a contra
+        # forces the word to 0, "float OK, zero pulses" is a fault and not
+        # a float, a board held dry is the latch page's business, and that
+        # page already says what to do (spec A1, A2).
+        for controller, float_ok, latched_ts, contra, flap, dry in con.execute(
+            "SELECT controller, float_ok, latched_ts, contra, flap, dry FROM status"
         ):
             if controller in retired:
                 continue
-            quiet = latched_ts is not None or contra
+            quiet = latched_ts is not None or contra or dry
             origin = counter_origin(con, controller)
             tapped = latest_refill(con, controller)
             key = f"over:{controller}"
@@ -4183,8 +4351,16 @@ def create_app(
                     )
             key = f"stale:{controller}"
             dead = float_dead(con, controller, tapped)
+            if dead is not None and flap_try_pending(con, controller, float_ok, flap):
+                dead = None  # the tap's try is pending: nothing to ask of anyone yet
             if dead is not None:
                 if not quiet and not raised(key) and floor_ok(key):
+                    why = (
+                        "the board's own float check tripped — refill to the "
+                        "top and tap refilled, and the butler will try one dose"
+                        if flap
+                        else "presumed stuck at empty, look at the magnet"
+                    )
                     found.append(
                         Alert(
                             key,
@@ -4192,10 +4368,7 @@ def create_app(
                             "warning",
                             f"the float on board {controller} still says empty "
                             f"{(now - dead) // 60} min after the refill at "
-                            f"{hhmm(dead)}: a stuck float, or the board's own "
-                            "float check tripped — look at the magnet, or water "
-                            "once from the phone (a granted dose resets the "
-                            "board's check)",
+                            f"{hhmm(dead)}: {why}",
                             mark(key),
                         )
                     )
@@ -5260,6 +5433,7 @@ def create_app(
                         "pos_ok_seen": None,
                         "retired": 0,
                         "latched": None,
+                        "flap": 0,
                         "last_refill": None,
                         "tank_ml": None,
                         "tank_samples": 0,
@@ -5282,13 +5456,14 @@ def create_app(
                 firm_word: dict[int, int | None] = {}
                 for (
                     controller, float_ok, pos, err, err_ts, pos_ok_seen, latched_ts, reason,
-                    float_firm,
+                    float_firm, flap,
                 ) in con.execute(
                     "SELECT controller, float_ok, pos, err, err_ts, pos_ok_seen, "
-                    "latched_ts, latch_reason, float_firm FROM status"
+                    "latched_ts, latch_reason, float_firm, flap FROM status"
                 ):
                     e = known.setdefault(controller, entry(controller))
                     e["float"] = float_ok
+                    e["flap"] = flap  # why it is 0, when it is: the app says so
                     firm_word[controller] = float_firm
                     e["pos"] = pos
                     e["err"] = err

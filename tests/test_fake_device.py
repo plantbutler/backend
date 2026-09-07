@@ -33,3 +33,11 @@ def test_it_reports_the_tank_s_own_fields():
     # since the float last moved on ch204.
     body = build_report("fake1", 5, [7], err="contra", contra=True, float_age=42)
     assert body == "c=fake1 t=5 ch0=7 ch204=42 ch207=1 err=contra\n"
+
+
+def test_it_reports_the_boards_other_two_latches():
+    # --flap and --dry: the flap on ch210 and the dry latch on ch211, in
+    # channel order after ch207, as the firmware writes them.
+    body = build_report("fake1", 5, [7], contra=True, flap=True, dry=True)
+    assert body == "c=fake1 t=5 ch0=7 ch207=1 ch210=1 ch211=1\n"
+    assert build_report("fake1", 5, [7], flap=True) == "c=fake1 t=5 ch0=7 ch210=1\n"

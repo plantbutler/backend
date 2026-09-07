@@ -91,8 +91,8 @@ def age(db, seconds):
             "UPDATE status SET float_since = float_since - ?, "
             "float_word_since = float_word_since - ?, float_rise = float_rise - ?, "
             "float_seen = float_seen - ?, float_bad = float_bad - ?, "
-            "float_bad_prev = float_bad_prev - ?",
-            (seconds,) * 6,
+            "float_bad_prev = float_bad_prev - ?, flap_since = flap_since - ?",
+            (seconds,) * 7,
         )
         con.execute(
             "UPDATE commands SET created_ts = created_ts - ?, "

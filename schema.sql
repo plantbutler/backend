@@ -207,7 +207,9 @@ CREATE TABLE IF NOT EXISTS status (
   err            TEXT,              -- err= in the latest report that carried one:
   err_ts         INTEGER,           -- the board's last safety error, and when
   latched_ts     INTEGER,           -- the durable half of the board's contradiction
-  latch_reason   TEXT,              -- latch: 'contra' | 'resetmid', NULL when not
+  latch_reason   TEXT,              -- latch: 'contra' | 'resetmid' (the dry latch,
+                                    -- ch211, or err= turning to resetmid on a
+                                    -- board that sends no ch211), NULL when not
   pos_ok_seen    INTEGER,           -- last pos=ok ever seen; pos: pages only after one
   float_word     INTEGER,           -- the board's last word on the float, kept
                                     -- across a report that omits float= (which
@@ -245,12 +247,26 @@ CREATE TABLE IF NOT EXISTS status (
                                     -- sets nothing firm, the upgrade carries
                                     -- none), and NULL is never an edge. The
                                     -- stuck-at-full rule reads this word
-  float_forced   INTEGER NOT NULL DEFAULT 0  -- the firm word's last drop came
+  float_forced   INTEGER NOT NULL DEFAULT 0, -- the firm word's last drop came
                                     -- with ch207=1: the contra latch forcing
                                     -- the word, not the tank. The firm word
                                     -- coming back out of it is `clear contra`
                                     -- typed, no rise (float_rise stays); only
                                     -- the next firm drop writes this again
+  flap           INTEGER NOT NULL DEFAULT 0,  -- ch210 in the latest report, absent
+                                    -- being 0: the board's float check tripped
+                                    -- (three float refusals in a row force its
+                                    -- word to 0 until a dose is granted). Why
+                                    -- float= is 0, when it is: the stale: page
+                                    -- says so, and a tap answers it for one dose
+  flap_since     INTEGER,           -- when flap last went 0 -> 1: the tap that
+                                    -- answers it is later than this
+  dry            INTEGER NOT NULL DEFAULT 0   -- ch211 in the latest report, absent
+                                    -- being 0: the board's dry latch, set by a
+                                    -- reset with a dose in flight and cleared
+                                    -- only by `dry off` — the level that latches
+                                    -- the backend under the resetmid words, as
+                                    -- ch207 does under contra's
 );
 
 -- A refill is a human event (pitch "Trust the tank"): the app says so, the
