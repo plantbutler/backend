@@ -1002,6 +1002,40 @@ def test_over_holds_the_rules_through_a_float_bounce_until_the_tap(
     assert len(rules_water(db)) == 1
 
 
+def test_a_tap_in_the_raises_own_second_is_no_answer_to_it(app, client, db, sent):
+    """The tap that answers over: is later than the raise, strictly. The
+    page was raised on the counter as it stood that second, which starts
+    at the latest tap, and a dose handed in a tap's second is on its
+    counter (D3's `>=`): a tap from the raise's second may be the very
+    one the page was counted from, and letting it answer would raise and
+    clear the page on one tap, "was refilled" sent for the run's own
+    start. So it stands, for the rules and /health alike, and a tap one
+    second later answers it (spec D6, thrice)."""
+    make_pot(client, cooldown_h=0, daily_cap_ml=100_000)
+    learn_the_tank(app, client, db, sent, 200)
+    tap(client, db)
+    dose(client, 250)
+    tick(app)
+    assert keys(sent) == ["over:0"]
+    age(db, 60)
+    ts = refill(client)  # a tap that saw the float, in the raise's second
+    run_sql(db, "UPDATE alerts SET raised_ts = ? WHERE key = 'over:0'", ts)
+    entry = health(client)
+    assert entry["pumped_ml"] == 0  # the live predicate let go...
+    assert entry["over"] == 1  # ...the page did not
+    dry_reports(client)
+    assert rules_water(db) == []
+    tick(app)
+    assert keys(sent) == ["over:0"] and alerts(client) == ["over:0"]
+    run_sql(db, "UPDATE alerts SET raised_ts = raised_ts - 1 WHERE key = 'over:0'")
+    assert health(client)["over"] == 0
+    assert "cmd=" in dry_reports(client, n=1)
+    assert len(rules_water(db)) == 1
+    tick(app)
+    assert sent[-1].message == "the tank on board 0 was refilled"
+    assert alerts(client) == []
+
+
 def test_a_report_that_omits_float_neither_hides_nor_makes_a_rise(
     app, client, db, sent
 ):

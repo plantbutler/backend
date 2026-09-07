@@ -211,9 +211,10 @@ CREATE TABLE IF NOT EXISTS status (
   pos_ok_seen    INTEGER,           -- last pos=ok ever seen; pos: pages only after one
   float_word     INTEGER,           -- the board's last word on the float, kept
                                     -- across a report that omits float= (which
-                                    -- blanks float_ok): the tank sample closes on
-                                    -- it going 1 -> 0, and a report that said
-                                    -- nothing must not hide that edge
+                                    -- blanks float_ok): the tap snapshots it,
+                                    -- and the firm word below is two of these
+                                    -- in a row agreeing, so a report that said
+                                    -- nothing must not hide a sighting
   float_word_since INTEGER,         -- when the word last changed, 1 -> 0 or
                                     -- 0 -> 1 and on nothing else: the
                                     -- stuck-at-empty rule's clock (a word that

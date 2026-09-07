@@ -438,6 +438,29 @@ def test_one_sighting_of_empty_between_two_of_full_moves_nothing(client, db):
     assert samples(db) == [(since, 90 + 50 + 35)]
 
 
+def test_the_firm_words_clock_is_where_the_word_moved(client, db):
+    """The firm word's clock is the word's own: where it moved, not where
+    the next report confirmed it. On a board the two agreeing reports are
+    a beat apart, and the report that raises the word hands its queued
+    dose with the move's clock — a clock set at the confirmation would
+    put that dose before the rise and off the counter. The tests around
+    this one confirm inside a second, where the two are one number; here
+    a beat sits between, on the drop and on the rise (spec D3, D4,
+    thrice)."""
+    full(client)
+    report(client, "c=0 ch0=1 float=0")  # the word fell here...
+    age(db, 30)
+    fell = word_since(db)
+    report(client, "c=0 ch0=1 float=0")  # ...and is confirmed a beat later
+    assert firm(db) == (0, fell)
+    report(client, "c=0 ch0=1 float=1")  # rose here...
+    assert firm(db) == (0, fell)  # one sighting moves nothing
+    age(db, 30)
+    rose = word_since(db)
+    report(client, "c=0 ch0=1 float=1")  # ...and is confirmed a beat later
+    assert firm(db) == (1, rose) and rise(db) == rose
+
+
 def test_a_forced_zero_is_not_a_drop(client, db):
     """A contra forces the board's word to 0 on every report until
     `clear contra` is typed: "float OK, zero pulses", a fault and not the
@@ -648,6 +671,52 @@ def test_the_float_going_empty_closes_one_sample_per_tap(client, db):
     empty(client)
     first, _second, third = taps(db)
     assert samples(db) == [(first, 170), (third, 210)]
+
+
+def test_a_bounce_while_the_firm_word_is_empty_is_no_drop(client, db):
+    """Once the firm word is at 0, the raw word bouncing 0 -> 1 -> 0 moves
+    the word's clock and nothing else: the report that agrees with the
+    bounce's fall is not the firm word going 1 -> 0 — it never left 0 —
+    so it stamps no tap and closes nothing. The gate is the firm word,
+    not the last report having said 0 as well: the bounce's fall is later
+    than a tap made at empty, and that gate alone hands the tap a drop it
+    never had and closes its run, still open, on the noise — the true
+    drain then stores nothing, being a second drain (spec D4, thrice)."""
+    full(client)
+    tap(client, db)
+    dose(client, 100, flow=100)
+    empty(client)  # ran down: the firm word's drop, and the tap's sample
+    assert firm(db)[0] == 0 and drops(db) == [word_since(db)]
+    assert samples(db) == [(taps(db)[0], 100)]
+    report(client, "c=0 ch0=1 float=0")  # still empty: nothing moves
+    assert drops(db) == [word_since(db)] and samples(db) == [(taps(db)[0], 100)]
+    age(db, 60)
+    tap(client, db)  # filled and tapped, the float still saying empty
+    first, second = taps(db)
+    dropped = drops(db)[0]
+    assert refills(db) == [(1,), (0,)] and origin(db) == (second, "tap")
+    answer = post(client, "/command", "c=0 water=3 ml=77")
+    assert answer.status_code == 200, answer.text
+    cmd_id = int(answer.text.strip().removeprefix("cmd="))
+    handed = report(client, "c=0 ch0=1 float=0 pos=ok").text  # the pour not up yet
+    assert f"cmd={cmd_id} water=3 ml=77" in handed
+    report(client, f"c=0 ch0=1 float=0 pos=ok ack={cmd_id} flow_ml=77")
+    assert health(client)["pumped_ml"] == 77
+    report(client, "c=0 ch0=1 float=1")  # a slosh...
+    report(client, "c=0 ch0=1 float=0")  # ...and back: the word's clock passes the tap
+    assert word_since(db) > second and firm(db)[0] == 0
+    report(client, "c=0 ch0=1 float=0")  # the next agrees with the bounce's fall
+    assert drops(db) == [dropped, None] and samples(db) == [(first, 100)]
+    assert origin(db) == (second, "tap") and health(client)["pumped_ml"] == 77
+    # The pour reaches the float, more water goes, and the tank runs down:
+    # the tap's first drop, and its run is all the water since the tap.
+    age(db, 60)
+    full(client)
+    dose(client, 50, flow=50)
+    empty(client)
+    first, second = taps(db)
+    assert drops(db)[1] == word_since(db)
+    assert samples(db) == [(first, 100), (second, 127)]
 
 
 def test_a_contra_report_or_a_standing_latch_closes_no_sample(client, db):
