@@ -78,11 +78,13 @@ curl -s -X POST http://localhost:8000/controller \
 # -> controller=0 retired=1   (reports still land; nothing pages or waters it; retired=0 undoes)
 curl -s -X POST http://localhost:8000/refill \
   -H 'X-Token: dev' --data-binary 'c=0'
-# -> refill=1757000000        (you filled the tank to the top: the count restarts here, and a
-#                              float still saying empty in a report three minutes on is paged)
+# -> refill=1757000000        (you filled the tank to the top: the count restarts here, a
+#                              "presumed stuck" hold on the rules lifts at once, and a float
+#                              still saying empty in a report three minutes on is paged)
 curl -s -X POST http://localhost:8000/resume \
   -H 'X-Token: dev' --data-binary 'c=0'
-# -> resumed=0                (lifts the backend's latch; type `clear contra` on the board too)
+# -> resumed=0                (lifts the backend's latch; the board's own word is `clear contra`,
+#                              or `dry off` after a reset mid-dose — the refusal and the page say which)
 ```
 
 Tell it what hangs where. A bare `name=` creates a pot and mints its id; the answer carries
@@ -255,21 +257,26 @@ later; a learning proposal waiting for approval (one nudge per hose per day); a 
 stopped itself — `ch207=1`, the float said full and the meter saw nothing, or `err=` turning to
 `resetmid`, it reset with the pump running (`err=` is the board's sticky last error, so only the
 change counts) — which latches the butler too: no rule waters it and `POST /command` refuses a
-dose until `POST /resume`, and that one pages high every time, floor or no floor; a float
+dose until `POST /resume`, and that one pages high every time, floor or no floor, naming the
+board's own word to type first (`clear contra`, or `dry off` after a reset mid-dose, which the
+board latches dry and `clear contra` does not touch); a float
 presumed stuck — still saying full after more than the tank holds (plus a tenth) has been pumped
 since the refill you recorded, or since the float last rose if it had gone empty since that tap (a
 tank run down and refilled by someone who forgot to tap restarts the count: the float demonstrably
 moved; a rise with no drop since the tap is your own refill reaching the float, and the tap
-stands), so the rules will not water that board, and only your next tap "refilled" clears the
-page — not the float dropping, which is a flap or a contra as often as an empty tank (a dose typed
+stands; and the float has to say a thing twice running to have moved at all — one sighting is a
+slosh), so the rules will not water that board, and only your next tap "refilled" clears the
+page — the rules and the app take the tap the moment it lands, the page follows when ntfy answers —
+not the float dropping, which is a flap or a contra as often as an empty tank (a dose typed
 at the phone still goes: the board's own float check runs); or still saying empty in a report
 three minutes or more after a tap made with it empty — a stuck float, or the board's own float
 check tripped, which a dose from the phone resets — a page and nothing more, since the rules are
 dry on empty already; neither while the board's latch stands, nor while its last report still
 carried `ch207=1` (a resume before `clear contra` is typed lifts the one and not the other); and
 each time the float closes a measurement of the tank — what the meter counted between your tap
-and the first time the float went empty after it, on a board neither latched nor sending
-`ch207=1` nor retired (a second run after a refill nobody said was full measures nothing), the
+and the first time the float said empty, twice running, after it, on a board neither latched nor
+sending `ch207=1` nor retired (the empty a contra forces is a fault, not a run's end, and a second
+run after a refill nobody said was full measures nothing), the
 tank's size being the median of the last five such runs (known after two), and a
 run more than a quarter off what it knew is a warning: a different tank, a clogging meter, or a
 tap that was not a fill. A
