@@ -153,8 +153,9 @@ watering.
   250, the board's own ceiling, at `/command` and at pot save. The daily cap charges acked water
   only (a lost response is likelier than a lost ack; the cooldown still counts the handed dose).
   `pos:<c>` pages only once a board has ever said `pos=ok`.
-- **The tank has a size (0.19.0).** `pumped_since()` is the acked water handed out after the
-  origin, the daily cap's own expression; without an origin it is 0 and nothing arms. The report
+- **The tank has a size (0.19.0).** `pumped_since()` is the acked water handed out at or after
+  the origin's second (the rise's own report hands a dose with the same clock), the daily cap's
+  own expression; without an origin it is 0 and nothing arms. The report
   path closes a `tank_samples` row when the board's word on the float (`status.float_word`, kept
   across a report that omits `float=`) goes 1 → 0 with water on the counter and the origin, as it
   stood before the report, is a tap — one per tap, `INSERT OR IGNORE`, nothing on zero pumped,

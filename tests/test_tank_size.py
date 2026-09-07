@@ -79,8 +79,8 @@ def run_sql(db, sql, *params):
 
 def age(db, seconds):
     """Everything so far happened `seconds` earlier, so what comes next is
-    later than all of it: the tests run inside one second, the counter is
-    strict about which side of the tap a dose was sent on, and two float=0
+    later than all of it: the tests run inside one second, a dose handed
+    in an origin's own second is counted as after it, and two float=0
     sightings inside the flap window are one float flapping, not two runs
     of the tank."""
     with sqlite3.connect(db) as con:
@@ -253,7 +253,8 @@ def test_the_counter_starts_at_the_latest_tap_that_saw_the_float_or_the_rise(
     age(db, 60)
     dose(client, 100, flow=100)
     assert health(client)["pumped_ml"] == 100  # counted from the rise, tap or no tap
-    since = tap(client, db)  # later than the rise, and it saw the float
+    age(db, 60)
+    since = tap(client, db)  # later than the rise and the dose, and it saw the float
     assert origin(db) == (since, "tap")
     assert health(client)["pumped_ml"] == 0
     run_sql(db, "UPDATE refills SET float_ok = NULL WHERE ts = ?", since)
@@ -265,6 +266,7 @@ def test_the_counter_starts_at_the_latest_tap_that_saw_the_float_or_the_rise(
     report(client, "c=0 ch0=1 float=0")
     assert origin(db) == (since, "tap")  # empty: its last rise is behind the tap
     assert health(client)["pumped_ml"] == 100
+    age(db, 60)
     report(client, "c=0 ch0=1 float=1")
     rise = word_since(db)
     assert rise > since and origin(db) == (rise, "rise")
@@ -324,6 +326,41 @@ def test_a_dose_typed_before_the_tap_and_handed_after_it_counts(client, db):
     assert health(client)["pumped_ml"] == 70
 
 
+def test_a_dose_handed_on_the_report_that_raises_the_float_counts(client, db):
+    """The report that first says full after empty is the rise, and it
+    hands whatever was queued with the same clock: that dose pumps after
+    it was handed, from the refilled tank, and a counter strict about the
+    origin's second lost it for ever (spec D3, amended)."""
+    report(client, "c=0 ch0=1 float=1")
+    tap(client, db)
+    report(client, "c=0 ch0=1 float=0")  # ran down
+    age(db, 60)
+    answer = post(client, "/command", "c=0 water=3 ml=80")  # typed while empty
+    assert answer.status_code == 200, answer.text
+    cmd_id = int(answer.text.strip().removeprefix("cmd="))
+    # Refilled untapped: this one report is the rise and hands the dose.
+    handed = report(client, "c=0 ch0=1 float=1 pos=ok").text
+    assert f"cmd={cmd_id} water=3 ml=80" in handed
+    rise = word_since(db)
+    assert origin(db) == (rise, "rise")
+    assert run_sql(db, "SELECT sent_ts FROM commands WHERE id = ?", cmd_id) == [(rise,)]
+    ack(client, cmd_id, flow=80)
+    assert health(client)["pumped_ml"] == 80
+
+
+def test_a_dose_handed_in_the_taps_own_second_counts(client, db):
+    """The tank was filled before the human tapped, and the dose pumps
+    after it was handed: a hand-off in the tap's second left the full
+    tank (spec D3, amended)."""
+    report(client, "c=0 ch0=1 float=1")
+    age(db, 60)
+    cmd_id = hand(client, 60)
+    since = tap(client, db)
+    assert run_sql(db, "SELECT sent_ts FROM commands WHERE id = ?", cmd_id) == [(since,)]
+    ack(client, cmd_id, flow=60)
+    assert health(client)["pumped_ml"] == 60
+
+
 def test_a_stop_acked_with_a_count_is_not_water(client, db):
     """A stop's ack may carry flow_ml=: what flowed before the board
     stopped, which the dose's own ack already counted. The ack step stamps
@@ -363,6 +400,7 @@ def test_the_float_going_empty_closes_one_sample_per_tap(client, db):
     report(client, "c=0 ch0=1 float=0")  # the first crossing stands, not 270
     assert samples(db) == [(taps(db)[0], 170)]
     # A tap, nothing pumped, and the float goes empty: not a measurement.
+    age(db, 60)
     report(client, "c=0 ch0=1 float=1")
     tap(client, db)
     report(client, "c=0 ch0=1 float=0")
@@ -376,6 +414,7 @@ def test_the_float_going_empty_closes_one_sample_per_tap(client, db):
     report(client, "c=0 ch0=1 float=0")
     assert samples(db) == [(taps(db)[0], 170)]
     # Said so: the next tap's run is a sample.
+    age(db, 60)
     report(client, "c=0 ch0=1 float=1")
     tap(client, db)
     dose(client, 200, flow=210)
@@ -407,6 +446,7 @@ def test_a_contra_report_or_a_standing_latch_closes_no_sample(client, db):
     assert samples(db) == []
     # Resumed, a tap and a run: learning again.
     assert post(client, "/resume", "c=0").status_code == 200
+    age(db, 60)
     report(client, "c=0 ch0=1 float=1")
     tap(client, db)
     dose(client, 100, flow=90)
@@ -467,6 +507,7 @@ def test_a_retired_board_learns_nothing(client, db):
     # Back in service, the float has risen since that tap; a new tap and a
     # new run are what it learns from.
     assert post(client, "/controller", "c=0 retired=0").status_code == 200
+    age(db, 60)
     report(client, "c=0 ch0=1 float=1")
     tap(client, db)
     dose(client, 100, flow=90)
@@ -507,6 +548,14 @@ def test_tank_ml_is_the_median_of_the_last_five_and_none_under_two(db, app):
         sample(8, 1, controller=1)
         sample(9, 2, controller=1)
         assert size() == 4400 and size(1) == 1
+
+
+def test_the_median_is_of_the_newest_five_not_the_five_largest():
+    """tank_ml is handed five at most (tank_history's LIMIT); the ticker
+    hands tank_median a sample and the five before it, and there the
+    window is the last five by time — the oldest leaves, however large
+    (spec D5)."""
+    assert butler.tank_median([5000, 100, 100, 100, 3000, 3000]) == 100
 
 
 def test_tank_history_is_the_last_few_up_to_a_sample(db, app):
@@ -617,6 +666,7 @@ def test_health_carries_the_size_the_count_and_the_counter(client, db):
     report(client, "c=0 ch0=1 float=1")
     entry = health(client)
     assert (entry["tank_ml"], entry["tank_samples"]) == (None, 1)
+    age(db, 60)
     tap(client, db)
     dose(client, 200, flow=200)
     dose(client, 50, flow=40)
@@ -624,6 +674,7 @@ def test_health_carries_the_size_the_count_and_the_counter(client, db):
     entry = health(client)
     assert (entry["tank_ml"], entry["tank_samples"]) == (210, 2)
     assert entry["pumped_ml"] == 240
+    age(db, 60)
     tap(client, db)
     assert health(client)["pumped_ml"] == 0
 
@@ -796,17 +847,20 @@ def test_a_sample_off_the_size_it_knew_is_a_warning(app, client, db, sent):
 def test_the_count_is_the_samples_the_size_rests_on(app, client, db, sent):
     """The size is the median of the last five, so the count beside it
     stops at five: past that, the oldest run has left the number, however
-    many the board has closed in its life (spec D5, D8)."""
+    many the board has closed in its life (spec D5, D8). Left by age, not
+    by size: the sixth run's page is handed six samples where /health's
+    tank_ml is handed five, and the two must name the same tank."""
     report(client, "c=0 ch0=1 float=1")
-    for ml in (1000, 200, 200, 200, 200):
+    for ml in (1000, 200, 200, 300, 300):
         run_the_tank_down(app, client, db, ml)
-    assert sent[-1].message.endswith("(tank 200 ml over 5 samples)")
-    since = run_the_tank_down(app, client, db, 200)  # the first is out
+    assert sent[-1].message.endswith("(tank 300 ml over 5 samples)")
+    since = run_the_tank_down(app, client, db, 250)  # the first, the largest, is out
     assert health(client)["tank_samples"] == 6
     assert sent[-1].message == (
-        f"board 0 ran its tank down: 200 ml since the refill at "
-        f"{butler.hhmm(since)} (tank 200 ml over 5 samples)"
+        f"board 0 ran its tank down: 250 ml since the refill at "
+        f"{butler.hhmm(since)} (tank 250 ml over 5 samples)"
     )
+    assert health(client)["tank_ml"] == 250  # the app's number is the page's
 
 
 def test_a_sample_is_judged_against_the_five_before_it(app, client, db, sent):

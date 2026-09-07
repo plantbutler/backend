@@ -62,7 +62,10 @@ top-ups behind it would have become a 12 L sample and a threshold no stuck float
 it is no origin for anything. And a float that went 1 → 0 → 1 since the tap is a tank that ran down
 and was refilled by someone who forgot to tap: the float demonstrably moved, so the counter restarts
 at the rise instead of calling it stuck twenty millilitres later. With no origin the counter is 0
-and nothing below arms. `/health`'s `pumped_ml` is this counter.
+and nothing below arms. `/health`'s `pumped_ml` is this counter. And `sent_ts >= since_ts`, not
+`>`: a dose pumps after it is handed and a tank is filled before its tap, so one handed in the
+origin's own second left the full tank — and the report that raises the word hands its queued
+command with the same `now`, so the strict comparison lost the resuming dose for ever.
 
 **D4 — Learning a sample.** In the report transaction, before the status upsert, read the
 previous float word (`status.float_word`, the board's last real `float=`, so a report that omits

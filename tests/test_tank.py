@@ -554,8 +554,8 @@ def refill(client):
 
 def age(db, seconds):
     """Everything so far happened `seconds` earlier, relations kept: the
-    tests run inside one second, the counter is strict about which side of
-    the tap a dose was sent on, and two float=0 sightings inside the flap
+    tests run inside one second, a dose handed in an origin's own second
+    is counted as after it, and two float=0 sightings inside the flap
     window are one float flapping, not two runs of the tank."""
     with sqlite3.connect(db) as con:
         con.execute("UPDATE refills SET ts = ts - ?", (seconds,))
@@ -885,6 +885,7 @@ def test_over_pages_once_per_floor(app, client, db, sent):
 def test_a_top_up_tapped_daily_never_fires(app, client, db, sent):
     learn_the_tank(app, client, db, sent, 200)
     for _ in range(4):
+        age(db, 60)
         tap(client, db)
         dose(client, 150)  # the day's water, under the size...
         tick(app)
@@ -1127,12 +1128,13 @@ def test_the_helpers_read_the_origin_the_size_the_tap_and_the_float(app, db):
         assert state() == ("over", 221, 200, 1000)
         con.execute("UPDATE status SET float_word_since = 1000")  # a rise in the tap's second
         assert origin() == (1000, "tap")  # is the tap's: the human's word wins
-        con.execute("UPDATE status SET float_word_since = 1001")  # rose after the tap
-        assert origin() == (1001, "rise") and state() == "ok"  # 1 ml since
+        con.execute("UPDATE status SET float_word_since = 1002")  # rose after the tap
+        # 1 ml since: the dose handed in the rise's own second is after it.
+        assert origin() == (1002, "rise") and state() == "ok"
         pumped(220, 1003)
-        assert state() == ("over", 221, 200, 1001)
+        assert state() == ("over", 221, 200, 1002)
         con.execute("UPDATE status SET float_ok = NULL")  # a report that said nothing
-        assert origin() == (1001, "rise")  # the rise stands: the word did not move
+        assert origin() == (1002, "rise")  # the rise stands: the word did not move
         assert state() == "ok"  # and a float that says nothing refuses already
         con.execute("UPDATE status SET float_ok = 0, float_word = 0")
         assert origin() == (1000, "tap")  # empty: its last rise is behind it

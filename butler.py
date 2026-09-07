@@ -907,16 +907,20 @@ def over_stands(con: sqlite3.Connection, controller: int) -> bool:
 
 
 def pumped_since(con: sqlite3.Connection, controller: int, since_ts: int) -> int:
-    """Millilitres of acked water handed to this board after `since_ts`
-    (the origin, counter_origin's ts): the meter's count, or the dose
-    when the ack carried none — the daily cap's own expression, so the
-    counter and the cap agree. A dose lost without an ack pumped
-    something uncounted, and whatever reads this fires late for it; the
-    contra latch stands behind it (spec D3)."""
+    """Millilitres of acked water handed to this board at or after
+    `since_ts` (the origin, counter_origin's ts): the meter's count, or
+    the dose when the ack carried none — the daily cap's own expression,
+    so the counter and the cap agree. At, not after: a dose pumps after
+    it is handed and a tank is filled before its tap, so one handed in
+    the origin's own second left the full tank — and the report that
+    raises the word hands its queued command with the same `now`, so a
+    strict comparison lost the resuming dose for ever. A dose lost
+    without an ack pumped something uncounted, and whatever reads this
+    fires late for it; the contra latch stands behind it (spec D3)."""
     (total,) = con.execute(
         "SELECT COALESCE(SUM(COALESCE(flow_ml, ml)), 0) FROM commands "
         "WHERE controller = ? AND kind = 'water' AND acked_ts IS NOT NULL "
-        "AND sent_ts > ?",
+        "AND sent_ts >= ?",
         (controller, since_ts),
     ).fetchone()
     return total
