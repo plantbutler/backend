@@ -1112,19 +1112,26 @@ def unannounced_samples(
     ).fetchall()
 
 
-def is_over(tank: int | None, pumped: int, firm: int | None) -> bool:
-    """D6's judgement on its three numbers: more than the tank holds, plus
+def is_over(
+    tank: int | None, pumped: int, word: int | None, firm: int | None
+) -> bool:
+    """D6's judgement on its numbers: more than the tank holds, plus
     TANK_TOLERANCE_PCT, pumped since the origin while the float still
-    says full — its firm word, status.float_firm, the word the origin
-    waits for: in the beat between a 0 -> 1 sighting and its
-    confirmation the raw word says full while the origin is still the
-    tap whose run just closed, and judged on the raw word any run a
-    tenth over the median was "presumed stuck" there until a tap. Never
-    while the size is unknown. The one expression of it, so the ticker,
-    the rules and /health cannot disagree (spec D6, D14)."""
+    says full — in BOTH its words. The firm word, status.float_firm, is
+    the one the origin waits for: in the beat between a 0 -> 1 sighting
+    and its confirmation the raw word says full while the origin is still
+    the tap whose run just closed. The raw word, status.float_ok, is the
+    one the tank's end arrives in: at the first sighting of empty the firm
+    word still says full over the run that just drained. Judged on either
+    alone, any run a tenth over the median was "presumed stuck" for one
+    beat, and with the page standing until a tap, one beat is enough. A
+    float stuck at full says full in both, always. Never while the size
+    is unknown. The one expression of it, so the ticker, the rules and
+    /health cannot disagree (spec D6, D14)."""
     return (
         tank is not None
         and pumped > tank * (100 + TANK_TOLERANCE_PCT) // 100
+        and word == 1
         and firm == 1
     )
 
@@ -1149,9 +1156,10 @@ def tank_state(
         return "unknown"
     pumped = pumped_since(con, controller, origin[0])
     row = con.execute(
-        "SELECT float_firm FROM status WHERE controller = ?", (controller,)
+        "SELECT float_ok, float_firm FROM status WHERE controller = ?",
+        (controller,),
     ).fetchone()
-    if is_over(tank, pumped, row[0] if row else None):
+    if is_over(tank, pumped, row[0] if row else None, row[1] if row else None):
         return ("over", pumped, tank, origin[0])
     return "ok"
 
@@ -5323,7 +5331,12 @@ def create_app(
                     e["over"] = int(
                         not e["retired"]
                         and (
-                            is_over(e["tank_ml"], e["pumped_ml"], firm_word.get(controller))
+                            is_over(
+                                e["tank_ml"],
+                                e["pumped_ml"],
+                                e["float"],
+                                firm_word.get(controller),
+                            )
                             or over_stands(con, controller)
                         )
                     )

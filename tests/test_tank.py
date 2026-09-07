@@ -1023,15 +1023,18 @@ def test_over_clears_on_a_tap_and_on_nothing_else(app, client, db, sent):
 def test_a_float_that_goes_empty_past_the_size_is_a_float_that_works(
     app, client, db, sent
 ):
-    """Judged on the firm word: one sighting of empty is not yet the float
-    saying so, and for that beat the firm word still says full over a run
-    a tenth past the median; the next report agrees, and a float that
-    reads empty is a float that works (spec D6, D14 a)."""
+    """Judged on both words: at the first sighting of empty the firm word
+    still says full over a run a tenth past the median, and the raw word
+    already says empty — no over, not for one beat, since the page would
+    stand until a tap; the next report agrees, and a float that reads
+    empty is a float that works (spec D6, D14 a)."""
     learn_the_tank(app, client, db, sent, 200)
     tap(client, db)
     dose(client, 150)
     dose(client, 71, float_ok=0)  # 221, and the float said so — once
-    assert health(client)["over"] == 1  # the firm word still says full
+    assert health(client)["over"] == 0  # the raw word already says empty
+    tick(app)
+    assert not [k for k in keys(sent) if k.startswith("over:")]
     still_empty(client, db)  # ...and again: the float works
     assert health(client)["over"] == 0
     tick(app)
@@ -1542,10 +1545,12 @@ def test_the_helpers_read_the_origin_the_size_the_tap_and_the_float(app, db):
         assert state() == ("over", 221, 200, 1002)
         con.execute("UPDATE status SET float_ok = NULL")  # a report that said nothing
         assert origin() == (1002, "rise")  # the rise stands: the word did not move
-        assert state() == ("over", 221, 200, 1002)  # and neither did the firm word
+        assert state() == "ok"  # over needs the raw word full too, and NULL is not it
+        con.execute("UPDATE status SET float_ok = 1")
+        assert state() == ("over", 221, 200, 1002)
         con.execute("UPDATE status SET float_ok = 0, float_word = 0")  # drained: once
         assert origin() == (1002, "rise")  # sticky: the rise is where it was
-        assert state() == ("over", 221, 200, 1002)  # the firm word still says full
+        assert state() == "ok"  # the raw word says empty: no over, not for a beat
         con.execute("UPDATE status SET float_firm = 0")  # ...and the next agrees
         assert state() == "ok"  # a float that firmly reads empty works
         con.execute(
