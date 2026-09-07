@@ -39,8 +39,10 @@ already, and D4's insert skips it too: its reports still land, and a dose that w
 board when it was retired still acks.
 
 **D2 — The tap means "full to the top".** `POST /refill` is unchanged on the wire
-(`refill=<ts>`). The row gains `float_ok INTEGER`: `status.float_ok` at the tap, NULL when the
-board has never sent `float=`. Schema: column in the `CREATE` **and** in `ADDED_COLUMNS`; the
+(`refill=<ts>`). The row gains `float_ok INTEGER`: the board's last real word at the tap —
+`status.float_word`, *amended 2026-09-07, thrice*, not `status.float_ok`, which one report that
+omits `float=` blanks, so that a tap made under a row reading "float ?" is not silently a tap
+that counts for nothing — NULL only when the board has never sent `float=`. Schema: column in the `CREATE` **and** in `ADDED_COLUMNS`; the
 rows already on the NAS get NULL, which D7 judges as nothing. Likewise `refills.drop_ts INTEGER`
 (D3/D4), `status.float_rise INTEGER` and `status.contra INTEGER NOT NULL DEFAULT 0`. *Amended
 2026-09-07:* `drop_ts` is carried on a tank already empty at the upgrade: the latest tap that saw
@@ -70,7 +72,8 @@ only; `ADDED_COLUMNS` carries it from `float_since` under the same `float_ok IS 
 word. *Amended 2026-09-07, twice:* the rise is the origin **only after a drop that followed the
 tap** — the tap's `refills` row carries `drop_ts`, the first time the word went 1 → 0 after it (D4
 sets it, sample or not), and the origin is the rise iff `drop_ts` is set and `float_rise >
-drop_ts`. A 0 → 1 with no drop after the tap is the tap's own refill arriving on the wire after a
+drop_ts` — `float_rise` and `drop_ts` both from the firm word's edges (D4), so a one-report
+glitch moves neither. A 0 → 1 with no drop after the tap is the tap's own refill arriving on the wire after a
 tap made at empty, a `clear contra` after a tap, the manual dose lifting the flap after a tap: all
 leave the tap as the origin (the second review found the first wording lost the ordinary "tank
 empty, fill, tap" run's sample to exactly this). Sticky: a second drain after an untapped refill
@@ -92,9 +95,14 @@ the field hides no edge). When it was 1 and this report says 0, and the origin (
 ml)`. `UNIQUE(controller, refill_ts)`: one sample per tap, so a float bouncing at the line adds
 nothing after the first crossing (`INSERT OR IGNORE`). Zero pumped stores nothing: a tank
 drained by something the meter never saw (evaporation, a tap that was not a fill) is not a
-measurement. *Amended 2026-09-07, twice:* on a 1 → 0 of the word, the latest non-NULL-snapshot tap's
-`drop_ts` is set if it was NULL, whatever else is true; a sample is inserted only when that
-`drop_ts` **was** NULL (the first drop after this tap — a second drain after an untapped refill
+measurement. *Amended 2026-09-07, twice, then thrice:* on a 1 → 0 of the **firm** word — `status.float_firm`,
+the word once two consecutive reports that carry `float=` agree, with `float_firm_since`; the
+wire's word is one glitch to 0 by design (`safety.cpp:35-41` fails any of three samples), and a
+slosh at report time must not close a sample early and hand the origin to the glitch's recovery
+— the latest non-NULL-snapshot tap's `drop_ts` is set if it was NULL, **unless the report carries
+`ch207=1` or the board's latch stands**: a forced 0 is a fault, not a drop, and stamping it let
+`clear contra` read as a rise that laundered the counter and lost the run's sample. A sample is
+inserted only when that `drop_ts` **was** NULL (the first drop after this tap — a second drain after an untapped refill
 stores nothing, which is the rise-origin case: nobody said that refill was full), `pumped_since(tap)
 > 0`, the report does not carry `ch207=1`, no latch stands, and the board is not retired (§1, D1). Trap: `status`
 rows exist only once a controller has reported; a first report has no previous word and closes
@@ -113,7 +121,12 @@ already refuses). `origin` is `counter_origin`'s answer, read once by the caller
 and D7 alike (D7 needs the latest tap too); the comparison itself is one predicate, `is_over(tank,
 pumped, float_ok)`, which `/health` applies to the numbers it already carries. `water_rules` skips
 the controller on `"over"` (dry, decision #5), after the retired and latch checks — and, *amended
-2026-09-07*, while `over:<c>` stands (`over_stands`, raised and not cleared): the live predicate
+2026-09-07*, while `over:<c>` stands (`over_stands`: raised, not cleared, **and no non-NULL-snapshot tap
+later than its `raised_ts`** — *amended 2026-09-07, thrice*: the ticker clears the row only
+after ntfy accepts the clear message, and the rules and `/health` must honour the tap the
+moment it lands, as `/resume` does for the latch; the ticker still sends "was refilled" when it
+can. Trap, accepted: the ticker exists only with `BUTLER_NTFY_TOPIC` set, so without ntfy the
+page is never raised and the live predicate is all there is): the live predicate
 lets go on a float bouncing 0 → 1 with nobody tapping (a rise, a fresh origin, a counter at 0), and
 the page was raised on a pump presumed stuck at full; the page is the fact until a tap answers it,
 for the rules as for `/health`. The ticker raises `over:<c>` (high, with `floor_ok`; skipped while
@@ -167,8 +180,8 @@ retired board). App (`ControllerHealth`: `tankMl`, `tankSamples`, `pumpedMl`, `o
 *Amended 2026-09-07:* `tankSamples` is `Int?`, null when the key is absent — a 0.18.0 backend
 must not read as "learning 0/2" and nag; the tank part of the line, the hint and `OVER` render
 only when `tankSamples` is not null. A retired row shows none of the tank part, the hint or
-`OVER`: retired is the last word and a quiet one. `learningGaps` names an over board ("the board
-not having pumped more than its tank holds"), so a mode flip on one explains itself.
+`OVER`: retired is the last word and a quiet one. `learningGaps` names an over board ("the board's tank
+not being over: refill to the top and tap refilled"), so a mode flip on one explains itself.
 
 - `controllerLine`, after `pos`: `tank ≈4.2 L, 1.1 L pumped` when `tankMl` is known, else
   `tank learning 1/2`; and, after `STOPPED`'s slot, `OVER` when `over == 1`. Volumes through one
@@ -176,10 +189,13 @@ not having pumped more than its tank holds"), so a mode flip on one explains its
 - Under a row that is not retired and whose `tankSamples` is not null: while `tankSamples < 2`, a plain `bodySmall` line "Let the
   tank run empty twice without topping up, and tap refilled when you fill it to the top, so the
   butler learns its size."; when `over == 1`, an error-coloured line "board N pumped more than
-  its tank holds and the float still says full: check the float, refill, then tap refilled."
+  its tank holds while the float said full: check the float, refill to the top, then tap
+  refilled." (*thrice*: past tense — `over` outlives the float word) and, when `over == 1` and
+  `float` is null, "board N is not sending its float; a tap counts once it does." instead.
 - `problems()`: `"board N pumped more than its tank holds, float still says full"` when `over ==
   1` and `over:<c>` is not raised. `describeAlert`: `over` → "board N pumped more than its tank
-  holds$since"; `stale` → "the float on board N still says empty after the refill$since"; `tank`
+  holds$since"; `stale` → "the float on board N still says empty after the refill$since: look at the magnet, or
+  water once from the phone" (*thrice*: the flap latch's only way out must reach the phone); `tank`
   → "board N measured its tank$since" (should never arrive; renders instead of echoing a key).
 - `cannotWater` is not gated on `over`, mirroring the backend.
 - The refilled chip keeps its label; the hint line is where the meaning lives.
@@ -195,6 +211,14 @@ pumped since the last refill is presumed stuck: refuse and page. A float still s
 minutes after a refill is presumed dead: page (the rules are dry on empty already). The tank's
 size is what the meter counted between a refill and the float going empty, the median of the
 last five runs, armed after two." — in `nets.py`, README regenerated.
+
+**D12 — The latch step names the board's word for the reason.** *2026-09-07, from the review:*
+a `resetmid` board latched **dry** on the firmware (`noinit.cpp:43`), and only `dry off` clears
+that (`cli.cpp:478`); `clear contra` clears the contradiction latch only. The 409 text, the
+`latch:<c>` page, `LATCH_TEXT` and the app's `LATCH_STEPS` (the card, the Resume dialog, the water
+refusal) say "type clear contra on the board" for `contra` and "type dry off on the board" for
+`resetmid`; one map in each repo, keyed by the reason. Pre-existing in 0.18.0, fixed here because
+D6/D7's pages send a person down the same steps.
 
 ## 4. Global constraints (unchanged from the 0.18.0 spec)
 
