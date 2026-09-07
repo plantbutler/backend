@@ -4261,12 +4261,11 @@ def create_app(
             if acked_ts is not None and now < judge_at:
                 continue  # still soaking in; an expiry needs no wait
             key = f"dose:{cmd_id}"
-            # Two questions that used to be one join, and they have
-            # different answers. WHOSE dose it was is the stamp on the row,
-            # decided when the command was written. WHICH SENSOR it should
-            # be judged on is still a window question — the pot may have
-            # been rewired between the dose and the soak, and the rise
-            # belongs to the probe that was in that soil at the time.
+            # Two questions with different answers. WHOSE dose it was is the
+            # stamp on the row, decided when the command was written. WHICH
+            # SENSOR to judge it on is a window question: the pot may have
+            # been rewired between the dose and the soak, and the rise belongs
+            # to the probe that was in that soil at the time.
             #
             # No status filter: a dose that happened is a dose worth
             # judging and naming, even if the plant has since been buried.
@@ -4331,9 +4330,10 @@ def create_app(
                         symptoms.append(f"moisture went {before}% to {after}%")
             if symptoms:
                 # Failures correlate: a dead pump takes every pot down at
-                # once, and one high page per dose per pot is the muted
-                # topic the docstring warns about. One page per controller
-                # per floor; the rest are judged and recorded silently.
+                # once, and a high page per dose per pot is how a phone ends
+                # up muted — which is worse than an alert three minutes late.
+                # One page per controller per floor; the rest are judged and
+                # recorded silently.
                 hose = f"dosefail:{controller}"
                 floored = standing.get(hose)
                 if hose in paged_hoses or (
@@ -4821,15 +4821,12 @@ def create_app(
                             entry["proposal"] = dict(
                                 zip(("id", "ml", "cap_s", "created_ts"), prop)
                             )
-                    # The newest dose this pot was ever handed, with its
-                    # human verdict: the id POST /verdict needs was
-                    # otherwise visible only in the log. By the stamp, so
+                    # The newest dose this pot was ever handed, with its human
+                    # verdict: the id POST /verdict needs. By the stamp, so
                     # moving a hose takes the history with it instead of
                     # filing it under the next pot along — which would judge
-                    # one pot's soil against another pot's dose, in the
-                    # table the learning log is made of. `sent_ts IS NOT
-                    # NULL` was implicit in the old join (NULL >= from_ts is
-                    # never true) and has to be said now.
+                    # one pot's soil against another pot's dose, in the very
+                    # table the learning log is made of.
                     dose = con.execute(
                         "SELECT c.id, c.ml, c.cap_s, c.flow_ml, c.state, "
                         "c.source, c.sent_ts, c.acked_ts, v.verdict "
@@ -4891,8 +4888,7 @@ def create_app(
 
         The one GET here that asks for the token, because it is the one that
         spends something not ours: an unauthenticated caller could burn the
-        Trefle quota for the whole household. Reads of our own data stay open
-        on the tailnet as they always were.
+        care source's quota for the whole household.
         """
         if bad_token(request):
             return PlainTextResponse("bad token\n", status_code=401)
@@ -4981,9 +4977,8 @@ def create_app(
             f"AND c.kind = 'water' AND c.state != 'proposed' {page}"
             "ORDER BY COALESCE(c.sent_ts, c.created_ts) DESC, c.id DESC LIMIT ?"
         )
-        # No GROUP BY any more. It was there because two overlapping windows
-        # on one hose would list one dose twice; a stamped row has exactly
-        # one owner and cannot.
+        # No GROUP BY: a stamped row has exactly one owner, so no dose here
+        # can be listed twice.
         if pot_id is None:
             sql = (
                 f"SELECT {columns} FROM commands c "
@@ -5014,15 +5009,14 @@ def create_app(
         recalibration re-reads the whole curve; `to` is the server's clock
         so the axis never trusts the phone's.
 
-        By pot rather than by channel, which is what stops a plant wired
-        into a dead one's socket opening its chart onto somebody else's
-        moisture curve. Two consequences, both accepted rather than
-        overlooked. This route takes no token — it never has — so it now
-        confirms to an unauthenticated caller which pot ids exist; it
-        answers 200 with no points for one that does not, so the confirmation
-        is of the id, not of anything about the plant. And readings stamped
-        with no pot (an environment channel, a socket nobody claimed) are no
-        longer reachable through any route.
+        By pot rather than by channel, which is what stops a plant wired into
+        a dead one's socket opening its chart onto somebody else's moisture
+        curve. Two consequences, both accepted. This route takes no token, so
+        an unauthenticated caller can confirm a pot id exists — it answers 200
+        with no points for one that does not, so the confirmation is of the id
+        and of nothing about the plant. And readings stamped with no pot (an
+        environment channel, a socket nobody claimed) are reachable through no
+        route at all.
         """
         try:
             pot_id, hours, bucket_s = parse_history(request.query_params)
@@ -5180,15 +5174,14 @@ def create_app(
         """Is this a butler, and is that the token?
 
         The one call a phone can make to tell a wrong address from a wrong
-        token, which are different mistakes and only one of them is the
-        user's to fix. Nothing else here can answer it. Most of the reads
-        are ungated and answer a wrong token exactly as they answer a right
-        one; the photo routes do check it, but they read the database and
-        the disk, so their refusals are not only about the token; and every
-        other gated route writes something.
+        token, which are different mistakes and only one of them is the user's
+        to fix. Nothing else here can answer it: the ungated reads answer a
+        wrong token as they answer a right one, the photo routes touch the
+        database and the disk so their refusals are not only about the token,
+        and every other gated route writes something.
 
-        Touches no database, so it stays an answer about the address and
-        the token and never about the disk.
+        Touches no database, so it stays an answer about the address and the
+        token and never about the disk.
         """
         if bad_token(request):
             return PlainTextResponse("bad token\n", status_code=401)
@@ -5278,13 +5271,10 @@ def create_app(
                     e["pumped_ml"] = (
                         pumped_since(con, controller, origin[0]) if origin else 0
                     )
-                    # Judged on the size and the counter the entry carries
-                    # and the float's firm word — the three numbers
-                    # tank_state reads, through the same predicate, read
-                    # once; `float` stays the raw word for the app — or on
-                    # the page standing, which only a tap clears and the
-                    # rules read the same way. Retired is the last word,
-                    # and a quiet one (spec D6, D9, D14).
+                    # The same predicate the rules and the ticker use, on the
+                    # three numbers the entry already carries; `float` stays
+                    # the raw word for the app. Or on the page standing, which
+                    # only a tap clears. Retired is the last word, and quiet.
                     e["over"] = int(
                         not e["retired"]
                         and (
