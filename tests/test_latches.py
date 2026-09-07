@@ -399,6 +399,72 @@ def test_a_stop_handed_after_the_tap_does_not_spend_it(client, db):
     assert rules_water(db) == [(2,)]
 
 
+def test_a_tap_in_the_flaps_own_second_answers_nothing(client, db):
+    """Later than the flap tripped, not at. The tap and the report that
+    tripped the flap are two transactions stamped with one clock, so in
+    one second which came first is unknowable, and a tap made before the
+    flap was on the wire answers nothing: the tie goes dry, which costs
+    the human one more tap a minute on. Pinned by hand — whether the two
+    land in one second is the wall clock's business (spec D3)."""
+    make_pot(client, cooldown_h=0, daily_cap_ml=100_000)
+    dry_reports(client, n=4)
+    assert "cmd=" not in flapped(client)
+    age(db, FLAP_WINDOW_S + 1)
+    tap(client, db)
+    tripped = flap_since(db)
+    run_sql(db, "UPDATE refills SET ts = ?", tripped)
+    assert "cmd=" not in flapped(client)
+    assert rules_water(db) == []
+    run_sql(db, "UPDATE refills SET ts = ?", tripped + 1)
+    assert "cmd=1 water=3 ml=100" in flapped(client)
+    assert rules_water(db) == [(1,)]
+
+
+def test_a_tap_that_never_saw_the_float_answers_nothing(client, db):
+    """A tap whose snapshot is NULL — made while the board had never said
+    float= (the rows 0.18.0 left behind are the same) — never meant "full
+    to the top", and is no base for anything: not the counter's, and not
+    the flap's, however much later than flap_since it came. The board's
+    first word makes the next tap one that saw the float, and that one
+    buys the try (spec D3)."""
+    make_pot(client, cooldown_h=0, daily_cap_ml=100_000)
+    for _ in range(5):
+        report(client, f"c=0 ch0={DRY} pos=ok ch210=1")  # tripped; float= never said
+    assert flap_since(db) > 0
+    age(db, FLAP_WINDOW_S + 1)
+    tap(client, db)
+    assert run_sql(db, "SELECT float_ok FROM refills") == [(None,)]
+    assert "cmd=" not in report(client, f"c=0 ch0={DRY} pos=ok ch210=1").text
+    assert "cmd=" not in flapped(client)  # the board's first word; the tap saw none
+    assert rules_water(db) == []
+    age(db, 60)
+    tap(client, db)
+    assert run_sql(db, "SELECT float_ok FROM refills ORDER BY ts") == [(None,), (0,)]
+    assert "cmd=1 water=3 ml=100" in flapped(client)
+
+
+def test_water_handed_in_the_taps_own_second_spends_it(client, db):
+    """Spent by water handed at or after the tap, not only after. The
+    hand-off and the tap are two transactions stamped with one clock, and
+    a dose handed in the tap's second was the try it bought: the tie goes
+    dry, as the tap's own does — a strict comparison let a second report
+    in that second hand a second try against the standing flap, the loop
+    the flap exists to stop. Pinned by hand (spec D3)."""
+    make_pot(client, cooldown_h=0, daily_cap_ml=100_000)
+    dry_reports(client, n=4)
+    assert "cmd=" not in flapped(client)
+    age(db, FLAP_WINDOW_S + 1)
+    tapped = tap(client, db)
+    assert "cmd=1 water=3 ml=100" in flapped(client)
+    report(client, f"c=0 ch0={DRY} float=0 pos=ok ch210=1 ack=1 flow_ml=0 err=float")
+    assert "cmd=" not in flapped(client)
+    run_sql(db, "UPDATE commands SET sent_ts = ? WHERE id = 1", tapped)
+    assert "cmd=" not in flapped(client)
+    assert rules_water(db) == [(1,)]
+    run_sql(db, "UPDATE commands SET sent_ts = ? WHERE id = 1", tapped - 1)
+    assert "cmd=2 water=3 ml=100" in flapped(client)  # handed before the tap: not its try
+
+
 # --------------------------------------------------------------------------- #
 # The migration
 # --------------------------------------------------------------------------- #

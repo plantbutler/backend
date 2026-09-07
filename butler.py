@@ -1205,16 +1205,22 @@ def tap_answers_flap(con: sqlite3.Connection, r: Report) -> bool:
     after which the firmware forces float=0 until a dose is granted, and
     the rules never grant on 0: the way out), the latest tap that saw the
     float is later than the flap tripped (status.flap_since), and no
-    water has been handed to the board since that tap. The tap is the
-    human saying full; the rules queue their next dose as they would, and
-    the board's own float check runs at dose time — granted, the flap
+    water has been handed to the board at or after that tap. The tap is
+    the human saying full; the rules queue their next dose as they would,
+    and the board's own float check runs at dose time — granted, the flap
     resets and float=1 returns; refused (ack= flow_ml=0 err=float), the
     flap stands and the tap is spent, so the rules are dry again until
     the next one. One try per tap, whoever asked for it: the flap does
     not move on the wire for a refusal — the board's counter only grows
     — so without the last clause a refused try was queued again at
-    cooldown pace, the loop the flap exists to stop. A NULL-snapshot tap
-    answers nothing, here as everywhere (spec D3)."""
+    cooldown pace, the loop the flap exists to stop. Both ties go dry:
+    the tap, the report that tripped the flap and the one that hands the
+    dose are transactions stamped with one clock, so in one second their
+    order is unknowable — a tap made before the flap was on the wire
+    answers nothing, and a dose handed in the tap's second was its try.
+    Dry costs the human one more tap a minute on; the other way is the
+    loop. A NULL-snapshot tap answers nothing, here as everywhere (spec
+    D3)."""
     if r.channels.get(FLAP_CHANNEL) != 1:
         return False
     row = con.execute(
