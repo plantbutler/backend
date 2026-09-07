@@ -6,6 +6,8 @@ deploy.env
 .venv/
 __pycache__/
 .pytest_cache/
+# coverage.py's run file: this checkout's absolute paths, rewritten every run.
+.coverage
 
 # A local run stores its photographs beside its database (BUTLER_PHOTOS).
 photos/

@@ -71,7 +71,8 @@ watering.
   `POST /approve` (proposed -> queued, slot permitting), `POST /verdict` (ok | too_much |
   too_little per executed dose), `GET /health` (count, last ts, the default interval, per-controller
   heartbeat/knob/open command/safety fields — since 0.18.0 also `err`, `err_ts`, `pos_ok_seen`,
-  `retired`, `latched` (`{since, reason}` or null) and `last_refill` — raised alerts), `GET /hello` (`butler=<VERSION>`, or
+  `retired`, `latched` (`{since, reason}` or null) and `last_refill`, since 0.19.0 `tank_ml`,
+  `tank_samples`, `pumped_ml` and `over` — raised alerts), `GET /hello` (`butler=<VERSION>`, or
   401 — the one gated route that neither writes nor reads the database, so a phone being set up can
   tell a wrong address from a wrong token, and a butler whose volume came unmounted can still say
   the token was wrong. `VERSION` lives in butler.py because the container installs no package; a
@@ -130,25 +131,103 @@ watering.
   next report's `ack=<id> flow_ml=`; a no-ack report or the TTL expires it. Expired is gone —
   ask again. The commands table is never pruned: it doubles as the watering history.
 - **The tank (0.18.0, pitch "Trust the tank").** The board's `err=` is stored on `status` (last
-  value, and `err_ts` = when it last *changed*: the board repeats its last error on every report).
+  value — a short token, digits included, since the I2C refusal's is `i2c` — and `err_ts` = when
+  it last *changed*: the board repeats its last error on every report).
   `ch207=1` latches the backend, and so does `err=` *turning to* `resetmid` — an edge, never a
   level, and `err=contra` never latches: `err=` is sticky and `clear contra` on the console never
   touches it, so a level would re-latch a resumed board forever. A latch: `water_rules` goes dry,
   `POST /command water=` answers 409, the queued dose expires, and `latch:<c>` pages high without
   the re-alert floor — until `POST /resume`, the human's half, which the app offers beside the
-  words "type `clear contra` on the board". The float going empty does not latch: the rules
-  already refuse on it. `POST /refill` records a human refill; `float_state()` — one reader for
-  the ticker and the rules — answers none, moved, waiting or frozen from the latest `ch204` and
-  the latest refill: moved at or after the refill, or within `REFILL_SLACK_S` (ten minutes)
-  before the tap, is *moved* (you pour first and tap second); not moved and inside `PERSIST_S` of
-  the tap is *waiting*; after that, *frozen*. `stale:<c>` pages on frozen and clears on moved
-  only (a second tap is waiting, not moved), the rules stay dry on frozen, manual water is not
-  gated. `POST /controller c= retired=1` retires a board: reports land (the latch row included —
+  board's own word for the reason — `LATCH_STEP`, the one map the 409 and the `latch:<c>` page
+  spell the steps from: `clear contra` for a contra, `dry off` for a board that reset with the
+  pump running, which the firmware latches dry and `clear contra` does not touch, the contra
+  words for a reason neither knows. A second fault landing while the latch stands overwrites
+  the reason and keeps the stamp: the newest fault is the one to fix, and a fault the board
+  merely repeats is not a second one; both on one report name `resetmid`, the edge seen this
+  once — the contra level re-asserts the latch under that name until the resume, then
+  re-latches with its own words. The `latch:<c>` row's `detail` is the reason its page named,
+  and a standing latch whose reason changed pages again with the new words, floor or no floor:
+  a person told `clear contra` must also be told `dry off`. The float
+  going empty does not latch: the rules already refuse on it. `POST /refill` records a human
+  refill, and the tap means "full to the top": the row snapshots `status.float_word`, the
+  board's last real word (a report that omits `float=` blanks `float_ok`, and a tap made under
+  it counts all the same). The tank's counter starts at `counter_origin()` —
+  the latest tap that saw the float (`base_tap()`; a NULL snapshot, the rows 0.18.0 left, is no
+  base for anything), or the float's latest rise (`status.float_rise` — the word's own clock,
+  which a report that omits `float=` leaves alone, where `float_since` is `float_ok`'s and the
+  `fields:` rule's) once the word has gone 1 → 0 since that tap (the tap's `drop_ts`, stamped
+  by the report path on the firm word's first drop after it — not on a `ch207=1` report, the
+  contra latch being what forces the word: a forced 0 is not a drop; a drain under any other
+  latch is) and risen strictly later: a float that went
+  1 → 0 → 1 since the tap is a tank refilled by someone who forgot to tap; a rise with no drop
+  since the tap is the tap's own refill reaching the float, a `clear contra` after a tap, the
+  manual dose lifting the flap, and the tap stands; one that said nothing once has not moved;
+  and a second drain keeps the rise rather than falling back to the tap — and the stuck-at-empty
+  rule reads `latest_refill()`, snapshot and all; the ticker reads both once per board.
+  `POST /controller c= retired=1` retires a board: reports land (the latch row included —
   it comes back with the board), nothing pages or waters — the dose judgement included — and
   whatever page stood for it is cleared, since no rule would ever clear it now. `MAX_DOSE_ML` is
   250, the board's own ceiling, at `/command` and at pot save. The daily cap charges acked water
   only (a lost response is likelier than a lost ack; the cooldown still counts the handed dose).
   `pos:<c>` pages only once a board has ever said `pos=ok`.
+- **The tank has a size (0.19.0).** `pumped_since()` is the acked water handed out at or after
+  the origin's second (the rise's own report hands a dose with the same clock), the daily cap's
+  own expression; without an origin it is 0 and nothing arms. The float is read on its **firm**
+  word — `status.float_firm`, the word once two consecutive reports carrying `float=` agree;
+  `float_word` stays the last real word, kept across a report that omits `float=` — because
+  one sighting is a glitch by the board's own design, and a slosh at report time must not
+  close a sample early and hand the origin to its recovery. It starts NULL — the first report
+  sets nothing firm, and the upgrade carries none: one report is not two, and the first
+  post-upgrade report that agrees with the carried word makes it firm — and NULL is never an
+  edge: the firm word becoming 1 out of it is no rise, becoming 0 no drop, and nothing is
+  forced. On the firm
+  word's first 1 → 0 after the tap that saw it full, the report path stamps that tap's
+  `drop_ts` where the word fell (`base_tap(fell)`: the latest tap before the fall, so a person
+  who filled and tapped between the two sightings keeps a clean tap and the earlier one gets the
+  run) and closes a `tank_samples` row with the water on the counter since the tap as of the
+  confirming report — on that drop and no later one: one per tap, `INSERT OR IGNORE`, nothing
+  on zero pumped, nothing on a second drain after an untapped refill (nobody said that refill
+  was full), no stamp on a `ch207=1` report — the contra latch is what forces the word: "float
+  OK, zero pulses" is a fault, not a drop, and stamped it let `clear contra` read as a rise that
+  laundered the counter — while under any other latch the drop is stamped and only the sample
+  waits, and no sample for a retired board. A firm drop that came with `ch207=1` is remembered
+  (`status.float_forced`), and the firm word coming back out of it stamps no rise, so `clear
+  contra` is never the origin — not even when the tap's `drop_ts` was already set, an untapped
+  refill's run being exactly that; the flag is the last firm drop's, written again only by the
+  next one (nothing reads it between a rise and that drop, so a clearing on the rise had no
+  effect and there is none). The duplicate check on
+  `(controller, t)` runs before the status upsert and the edge, not only before the readings:
+  the firmware retries with the body kept, and a retried glitch must not confirm itself. The
+  rise (`float_rise`) is the firm word's too, stamped where the word rose rather than where
+  the next report confirmed it, so the dose handed as the float rose stays on the counter. No
+  carry at the upgrade: a 0.18.0 tap has a NULL snapshot and is no origin, so the first tap
+  after the upgrade starts everything. `tank_ml()` is the
+  median of the last `TANK_MEDIAN_OF` (5) samples, `None` under `TANK_SAMPLES_TO_ARM` (2). The
+  float is judged against that volume, never a clock: `tank_state()` answers "over" when more
+  than the size plus `TANK_TOLERANCE_PCT` (10) has been pumped since the origin and the float's
+  **firm** word still says 1 (`is_over()`, on `float_firm`: the origin waits for the firm word,
+  and judged on the raw one the beat between a 0 → 1 sighting and its confirmation called every
+  run a tenth over the median stuck) — `water_rules` goes dry, `over:<c>` pages high ("since
+  HH:MM", the origin; not while latched, not while the latest report carried `ch207=1` —
+  `status.contra`, kept by the upsert, since a `/resume` before `clear contra` is typed lifts
+  the latch and not the board's own — and not while retired), and the tap is the only clear —
+  made in `record_refill`, in the tap's own transaction and with no page, as `/resume` clears
+  `latch:<c>`: the person did the thing — not the float word dropping to 0, which is a contra,
+  a flap or an omitted `float=` as often as an empty tank; the rules stay dry while the page
+  stands (`over_stands()`: raised and not cleared), not on the live predicate alone, which a
+  float bouncing 0 → 1 untapped lets go of; `/health`'s `over` is 1 while the predicate holds
+  or the page stands, 0 for a retired board; `POST /command water=` is not gated. `float_dead()` — a tap made with
+  the float at 0, a `float=` reading `PERSIST_S`
+  or more after it (`status.float_seen`, not the wall clock: a board behind a WiFi drop has said
+  nothing and is judged on nothing), and still 0 (`float_ok`: a report that said nothing said
+  nothing) since before the tap (`float_word_since`) — pages `stale:<c>` (not while latched, on
+  `ch207=1`, or retired) and nothing else, cleared when the float reads 1 (the key is the 0.18.0 clock rule's,
+  so a page standing from it clears through the same path). Every sample is announced once as
+  `tank:<c>:<refill_ts>`, marked like `dose:<id>` and left out of `/health` and the up-probe count
+  like it, as a warning when it is more than `TANK_DRIFT_PCT` (25) off the median of the samples
+  before it; the pending ones are found board by board from the latest announced one back
+  (`unannounced_samples()`), never by scanning a board's life of samples every tick. `ch204`
+  still lands and nothing reads it.
 - The controller is an INTEGER on the wire and in every column, 0..255 (`MAX_CONTROLLER`), since
   0.17.0. It was free text, which made `c=` the one field a typo could turn into a second garden:
   a report from `bench1 ` opened its own controller row, heartbeat and alerts and nothing said the
@@ -285,9 +364,10 @@ pot_id)` — the command log is the watering history, never pruned EXCEPT by `PO
 stored. `schema.sql` stays additive, but `CREATE TABLE IF NOT EXISTS` is additive about tables
 only — a column appended to a CREATE that already ran never reaches an existing database — so a new
 column goes in the CREATE *and* in `butler.ADDED_COLUMNS`, which ALTERs it in at startup and can
-carry a value over from an old column. `pots_now` is dropped and recreated on every start for the
-same reason; it holds no data, and a view over a column the table has not got yet parses fine and
-then fails on every read. Air temperature and light ride the same readings table as extra channels (the sensor kit
+carry a value over from an old column (`source`, row by row). `pots_now` is
+dropped and recreated on every start for the same reason; it holds no data, and a view over a
+column the table has not got yet parses fine and then fails on every read. Air temperature and
+light ride the same readings table as extra channels (the sensor kit
 has both modules); season is derived from the date. Adaptive dosing from range, temperature,
 light and season is a later pitch — see the plan's Planta note — v1 rules stay thresholds.
 

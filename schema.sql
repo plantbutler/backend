@@ -190,11 +190,14 @@ CREATE TABLE IF NOT EXISTS status (
   controller     INTEGER PRIMARY KEY,
   ts             INTEGER NOT NULL,  -- when the latest report landed
   float_ok       INTEGER,           -- float= in that report, NULL if not sent
-  float_since    INTEGER,           -- when float_ok last changed value
+  float_since    INTEGER,           -- when float_ok last changed value, NULL
+                                    -- included: the fields: rule's clock
   pos            TEXT,              -- pos= in that report, NULL if not sent
   pos_since      INTEGER,           -- when pos last changed value
   float_seen     INTEGER,           -- last time float= arrived at all: its
-                                    -- vanishing afterwards is its own alarm
+                                    -- vanishing afterwards is its own alarm,
+                                    -- and the stuck-at-empty rule waits for
+                                    -- one PERSIST_S after the tap
   pos_seen       INTEGER,
   float_bad      INTEGER,           -- the last two float=0 sightings: two
   float_bad_prev INTEGER,           -- inside FLAP_WINDOW_S raise, so a float
@@ -205,29 +208,116 @@ CREATE TABLE IF NOT EXISTS status (
   err_ts         INTEGER,           -- the board's last safety error, and when
   latched_ts     INTEGER,           -- the durable half of the board's contradiction
   latch_reason   TEXT,              -- latch: 'contra' | 'resetmid', NULL when not
-  pos_ok_seen    INTEGER            -- last pos=ok ever seen; pos: pages only after one
+  pos_ok_seen    INTEGER,           -- last pos=ok ever seen; pos: pages only after one
+  float_word     INTEGER,           -- the board's last word on the float, kept
+                                    -- across a report that omits float= (which
+                                    -- blanks float_ok): the tap snapshots it,
+                                    -- and the firm word below is two of these
+                                    -- in a row agreeing, so a report that said
+                                    -- nothing must not hide a sighting
+  float_word_since INTEGER,         -- when the word last changed, 1 -> 0 or
+                                    -- 0 -> 1 and on nothing else: the
+                                    -- stuck-at-empty rule's clock (a word that
+                                    -- changed after the tap is a float that
+                                    -- moved); a report that said nothing moves
+                                    -- float_since, never this
+  float_rise     INTEGER,           -- when the firm word last went 0 -> 1: the
+                                    -- tank's counter restarts here once the word
+                                    -- has gone 1 -> 0 since the tap
+                                    -- (refills.drop_ts) and risen later — a tank
+                                    -- run down and refilled by someone who
+                                    -- forgot to tap
+  contra         INTEGER NOT NULL DEFAULT 0,  -- ch207 in the latest report, absent
+                                    -- being 0: the board's own contradiction
+                                    -- latch stands until `clear contra` is typed,
+                                    -- and over: and stale: keep quiet while it does
+  float_firm     INTEGER,           -- the word once two consecutive reports that
+                                    -- carry float= agree: one sighting is a
+                                    -- glitch by the board's own design, and the
+                                    -- edges the tank is measured on — the drop
+                                    -- that closes a sample (refills.drop_ts),
+                                    -- the rise that restarts the counter
+                                    -- (float_rise) — are this word's, each
+                                    -- stamped where the word moved, not where
+                                    -- the next report confirmed it, so a dose
+                                    -- handed as the float rose is on the counter.
+                                    -- NULL until two agree (the first report
+                                    -- sets nothing firm, the upgrade carries
+                                    -- none), and NULL is never an edge. The
+                                    -- stuck-at-full rule reads this word
+  float_forced   INTEGER NOT NULL DEFAULT 0  -- the firm word's last drop came
+                                    -- with ch207=1: the contra latch forcing
+                                    -- the word, not the tank. The firm word
+                                    -- coming back out of it is `clear contra`
+                                    -- typed, no rise (float_rise stays); only
+                                    -- the next firm drop writes this again
 );
 
 -- A refill is a human event (pitch "Trust the tank"): the app says so, the
--- board cannot. The stuck-float rule reads the latest one per controller
--- against ch204, every tick, hence the index.
+-- board cannot, and the tap means "full to the top". The tank's counter
+-- starts at the latest one per controller that saw the float, or at the
+-- float's latest rise once the word has gone 1 -> 0 since that tap and
+-- risen later (a tank run down and refilled by someone who forgot to
+-- tap); the stuck-at-empty rule reads the latest one, snapshot and all.
+-- Read on every report and every tick, hence the index.
 CREATE TABLE IF NOT EXISTS refills (
   ts         INTEGER NOT NULL,  -- server time when the human said so
-  controller INTEGER NOT NULL
+  controller INTEGER NOT NULL,
+  float_ok   INTEGER,           -- the board's last real word on the float at
+                                -- the tap (status.float_word, which a report
+                                -- that omits float= leaves alone); NULL when
+                                -- the board had never sent float= (and on the
+                                -- rows from before this column), and then
+                                -- the tap judges nothing and starts no
+                                -- counter
+  drop_ts    INTEGER            -- the first time the firm word went 1 -> 0
+                                -- after this tap, sample or not — unless the
+                                -- report carried ch207=1 (the contra latch
+                                -- forcing the word: a fault, not a drop);
+                                -- NULL until then, and NULL on the rows from
+                                -- before this column, which no origin starts
+                                -- from. The run a tap starts closes on this
+                                -- drop and no later one, and a rise counts
+                                -- only past it
 );
 
 CREATE INDEX IF NOT EXISTS refills_by_controller ON refills (controller, ts);
+
+-- The tank has a size, and it is measured: one row the first time the
+-- float's firm word went empty after the tap that saw it full, with water
+-- on the counter since, `ml` being the acked water handed out between the
+-- two as of the report that confirmed the drop — on a board neither
+-- latched nor sending ch207=1 nor retired (the drop is stamped under any
+-- latch but the contra's own report; the sample waits). A second drain after an
+-- untapped refill stores nothing: nobody said that refill was full. One
+-- per tap — a float bouncing at the waterline adds nothing after its
+-- first crossing — hence the UNIQUE; the size is the median of the last
+-- few by ts, hence the index.
+CREATE TABLE IF NOT EXISTS tank_samples (
+  ts         INTEGER NOT NULL,  -- the report that confirmed the float empty
+  controller INTEGER NOT NULL,
+  refill_ts  INTEGER NOT NULL,  -- the tap this run started from
+  ml         INTEGER NOT NULL,
+  UNIQUE (controller, refill_ts)
+);
+
+CREATE INDEX IF NOT EXISTS tank_samples_by_controller ON tank_samples (controller, ts);
 
 CREATE TABLE IF NOT EXISTS alerts (
   key        TEXT PRIMARY KEY,  -- silent:<c> | sensor:<c>:<ch> | float:<c> |
                                 -- pos:<c> | fields:<kind>:<c> | dose:<id> |
                                 -- dosefail:<c> | proposal:<c>:<outlet> |
                                 -- latch:<c> (the board stopped itself) |
-                                -- stale:<c> (float never moved across a refill), plus
+                                -- over:<c> (pumped past the tank, the firm float
+                                --   still full; the tap clears it inline) |
+                                -- stale:<c> (float still empty after a refill) |
+                                -- tank:<c>:<refill_ts> (a sample announced, once), plus
                                 -- meta:tick / meta:up bookkeeping rows
   raised_ts  INTEGER NOT NULL,
   cleared_ts INTEGER,           -- NULL while the condition stands
-  detail     TEXT               -- dose judgements: 'ok'|'failed'|'unverified'
+  detail     TEXT               -- dose judgements: 'ok'|'failed'|'unverified';
+                                -- latch:<c>: the reason its page named, so a
+                                -- latch renamed while standing pages again
 );
 
 -- What does this plant want? (cycle 2). Two caches, because the two hops
