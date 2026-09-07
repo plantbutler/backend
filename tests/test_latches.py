@@ -38,6 +38,11 @@ def flap_since(db):
     return run_sql(db, "SELECT flap_since FROM status WHERE controller = 0")[0][0]
 
 
+def float_since(db):
+    """When the board's word last changed: not the flap's clock."""
+    return run_sql(db, "SELECT float_since FROM status WHERE controller = 0")[0][0]
+
+
 def origin(db):
     with sqlite3.connect(db) as con:
         return butler.counter_origin(con, 0)
@@ -307,12 +312,20 @@ def test_a_tap_later_than_the_flap_buys_the_rules_one_dose(client, db):
 
 
 def test_a_tap_before_the_flap_tripped_answers_nothing(client, db):
+    """On the board the word drops first and the flap trips reports
+    later, after three refusals at dose time. A tap between the two was
+    made before the flap tripped: it answers nothing, however much later
+    than the word's own drop it came. The clock the tap is judged against
+    is the flap's, status.flap_since, not the word's, status.float_since —
+    the one report where the two differ (spec D3)."""
     make_pot(client, cooldown_h=0, daily_cap_ml=100_000)
     dry_reports(client, n=2)
-    tap(client, db)  # full to the top, said before...
-    dry_reports(client, n=2)
-    assert "cmd=" not in flapped(client, n=2)  # ...the flap tripped: dry until the next tap
+    report(client, f"c=0 ch0={DRY} float=0 pos=ok")  # the word drops; no flap yet
+    age(db, FLAP_WINDOW_S + 1)
+    tapped = tap(client, db)  # full to the top, said after the word fell...
+    assert "cmd=" not in flapped(client, n=2)  # ...and before the flap tripped: dry
     assert rules_water(db) == []
+    assert float_since(db) < tapped < flap_since(db)
     age(db, FLAP_WINDOW_S + 1)
     tap(client, db)
     assert "cmd=1 water=3 ml=100" in flapped(client)
@@ -366,6 +379,24 @@ def test_a_manual_dose_under_the_flap_goes_and_spends_the_tap(client, db):
     report(client, f"c=0 ch0={DRY} float=0 pos=ok ch210=1 ack=2 flow_ml=0 err=float")
     assert "cmd=" not in flapped(client, n=2)
     assert rules_water(db) == []
+
+
+def test_a_stop_handed_after_the_tap_does_not_spend_it(client, db):
+    """Only water spends the tap. A stop sent between the tap and the
+    flap's next report is the safe direction, not the try the tap bought:
+    it holds the slot for one report, and once the board has acked it the
+    rules queue their dose as they would (spec D3)."""
+    make_pot(client, cooldown_h=0, daily_cap_ml=100_000)
+    dry_reports(client, n=4)
+    assert "cmd=" not in flapped(client)
+    age(db, FLAP_WINDOW_S + 1)
+    tap(client, db)
+    assert post(client, "/command", "c=0 stop=1").status_code == 200
+    assert "cmd=1 stop=1" in flapped(client)  # the slot is the stop's: dry for a beat
+    assert rules_water(db) == []
+    acked = report(client, f"c=0 ch0={DRY} float=0 pos=ok ch210=1 ack=1").text
+    assert "cmd=2 water=3 ml=100" in acked
+    assert rules_water(db) == [(2,)]
 
 
 # --------------------------------------------------------------------------- #
