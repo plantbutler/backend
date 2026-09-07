@@ -389,13 +389,15 @@ def test_the_stale_page_names_the_flap_when_the_board_says_it_tripped(
     app, client, db, sent
 ):
     """The tap made after the flap tripped answers it, and while its try
-    is to come — not yet handed, or with the board — the page would tell
+    is to come — queued for the board, or with it — the page would tell
     the person to do what they just did: nothing. Refused, the tap is
-    spent, and the page says what tripped and what to do (spec D2, A1)."""
+    spent, and the page says what tripped and what to do. No pot on this
+    board: the try is a human's, and queued is what keeps the page
+    waiting (spec D2, A1, A5)."""
     tapped = stuck_at_empty_after_a_tap(client, db, "ch210=1")
-    tick(app)
-    assert pages(sent, "stale:0") == []  # the tap answers the flap: its try is pending
     assert post(client, "/command", "c=0 water=3 ml=50").status_code == 200
+    tick(app)
+    assert pages(sent, "stale:0") == []  # the try is queued: a report away
     assert "cmd=1 water=3 ml=50" in flapped(client)
     tick(app)
     assert pages(sent, "stale:0") == []  # with the board
@@ -692,6 +694,8 @@ def test_no_stale_page_while_the_taps_try_is_pending(app, client, db, sent):
     assert rules_water(db) == []
     with sqlite3.connect(db) as con:
         assert butler.float_dead(con, 0, butler.latest_refill(con, 0)) is not None
+        # An auto pot on the board: the try is the rules' to make, once it dries.
+        assert butler.flap_try_pending(con, 0, 0, 1) is True
     tick(app)
     assert pages(sent, "stale:0") == []
     flapped(client, n=2)
@@ -717,6 +721,72 @@ def test_the_flap_path_wants_the_boards_word_of_zero(client, db):
     assert "cmd=" not in report(client, f"c=0 ch0={DRY} pos=ok ch210=1").text
     assert rules_water(db) == []
     assert "cmd=1 water=3 ml=100" in flapped(client)
+
+
+# --------------------------------------------------------------------------- #
+# The page waits for a try that can come, not for one nobody will make
+# (spec A5)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_stale_page_waits_for_no_try_nobody_will_make(app, client, db, sent):
+    """A pending try and a board nobody will try look alike: no water
+    handed since the tap. No pot is mapped here, so the rules have
+    nothing to water and no command ever gets a sent_ts; read as
+    pending, that silenced the page for good — the one thing meant to
+    tell the person the flap still stands. The try is a human's on this
+    board, and the page does not wait for one it cannot promise: it
+    comes at PERSIST_S, naming the flap (spec A5)."""
+    tapped = stuck_at_empty_after_a_tap(client, db, "ch210=1")
+    with sqlite3.connect(db) as con:
+        assert butler.float_dead(con, 0, butler.latest_refill(con, 0)) is not None
+        assert butler.tap_answers_flap(con, 0, 0, 1) is not None
+        assert butler.flap_try_pending(con, 0, 0, 1) is False
+    tick(app)
+    assert pages(sent, "stale:0") == [
+        f"the float on board 0 still says empty 3 min after the refill at "
+        f"{butler.hhmm(tapped)}: the board's own float check tripped — refill to "
+        "the top and tap refilled, and the butler will try one dose"
+    ]
+    tick(app)
+    assert len(pages(sent, "stale:0")) == 1  # raised once, as every page
+
+
+def test_a_learning_pots_proposal_is_not_a_try_the_page_waits_for(
+    app, client, db, sent
+):
+    """The rules hand water for an auto pot; a learning pot's dose is a
+    proposal, handed only once a human approves it, and one nobody
+    approves expires and is proposed again on the next dry report, never
+    with a sent_ts. Read as "the try is still to come", that silenced the
+    page for good and left the person the daily proposal nudge, which
+    names no float. A proposal standing is not a try coming: the page
+    comes at PERSIST_S, and the approval — the human's try — spends the
+    tap as any dose does and adds no page (spec A5)."""
+    make_pot(client, mode="learning", cooldown_h=0, daily_cap_ml=100_000)
+    dry_reports(client, n=4)
+    assert "cmd=" not in flapped(client)  # the fifth, under the flap, before any tap
+    age(db, FLAP_WINDOW_S + 1)
+    tap(client, db)
+    assert "cmd=" not in flapped(client)  # proposed, not handed: a human's to hand
+    assert run_sql(db, "SELECT id, state, sent_ts FROM commands") == [
+        (1, "proposed", None)
+    ]
+    age(db, PERSIST_S)
+    flapped(client)  # a word, its minutes on
+    with sqlite3.connect(db) as con:
+        assert butler.float_dead(con, 0, butler.latest_refill(con, 0)) is not None
+        assert butler.tap_answers_flap(con, 0, 0, 1) is not None
+        assert butler.flap_try_pending(con, 0, 0, 1) is False
+    tick(app)
+    assert len(pages(sent, "stale:0")) == 1
+    assert "the board's own float check tripped" in pages(sent, "stale:0")[0]
+    assert post(client, "/approve", "cmd=1").status_code == 200
+    assert "cmd=1 water=3 ml=100" in flapped(client)  # the human's try spends the tap
+    report(client, f"c=0 ch0={DRY} float=0 pos=ok ch210=1 ack=1 flow_ml=0 err=float")
+    assert "cmd=" not in flapped(client)  # refused: dry until the next tap
+    tick(app)
+    assert len(pages(sent, "stale:0")) == 1  # the refusal adds nothing to a raised page
 
 
 # --------------------------------------------------------------------------- #

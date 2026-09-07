@@ -1253,20 +1253,43 @@ def flap_try_pending(
     con: sqlite3.Connection, controller: int, float_ok: int | None, flap: int | None
 ) -> bool:
     """Whether the try a tap bought is still to come: the tap answers the
-    flap, or its try is with the board — handed, and neither acked nor
-    expired (the next report does one or the other). The stale page
+    flap, and the try is queued or with the board — handed since the tap,
+    and neither acked nor expired (the next report does one or the
+    other) — or nothing has been handed since the tap and the rules can
+    still make it: a live auto pot on the board with what the ladder
+    needs (RULES_POT_SQL), watered when it next dries. The stale page
     waits on this: it would tell the person to refill and tap, which
-    they just did, and promise a dose that is on its way. Refused, the
-    ack spends the tap and the page comes on the next tick (spec A1)."""
+    they just did, and promise a dose that is on its way. Not on a try
+    nobody will make: "no water handed since the tap" is also what a
+    board with no such pot looks like — none mapped, every pot manual or
+    learning, an auto pot not yet calibrated — and there the try is a
+    human's (a /command, an approved proposal; a proposal standing is not
+    a try coming), so the page does not wait for one it cannot promise
+    and comes at PERSIST_S as for a float presumed stuck. Refused, the
+    ack spends the tap and the page comes on the next tick (spec A1,
+    A5)."""
     tap = flap_tap(con, controller, float_ok, flap)
     if tap is None:
         return False
-    answered = con.execute(
+    ended = con.execute(
         "SELECT 1 FROM commands WHERE controller = ? AND kind = 'water' "
         "AND sent_ts >= ? AND state != 'sent' LIMIT 1",
         (controller, tap),
     ).fetchone()
-    return answered is None
+    if ended:
+        return False
+    coming = con.execute(
+        "SELECT 1 FROM commands WHERE controller = ? AND kind = 'water' "
+        "AND (state = 'queued' OR (state = 'sent' AND sent_ts >= ?)) LIMIT 1",
+        (controller, tap),
+    ).fetchone()
+    if coming:
+        return True
+    can_try = con.execute(
+        f"SELECT 1 FROM pots_now WHERE {RULES_POT_SQL} AND mode = 'auto' LIMIT 1",
+        (controller,),
+    ).fetchone()
+    return can_try is not None
 
 
 def float_dead(
@@ -1416,6 +1439,17 @@ def live_sql(col: str = "status") -> str:
     """The same allow-list as a SQL predicate. One source, so a fourth
     status cannot be admitted by one reader and refused by another."""
     return f"{col} IN (" + ", ".join(f"'{s}'" for s in LIVE_STATUSES) + ")"
+
+
+# A pot the rules can water on a board (the one `?`): live, on a channel
+# and an outlet, calibrated, with a target and a dose. The ladder's own
+# candidate shape, and the stale page's "a try can still come" — one
+# predicate, so the page cannot wait on a pot the ladder would skip.
+RULES_POT_SQL = (
+    f"{live_sql()} AND controller = ? AND channel IS NOT NULL "
+    "AND outlet IS NOT NULL AND dry_raw IS NOT NULL AND wet_raw IS NOT NULL "
+    "AND target_low_pct IS NOT NULL AND dose_ml IS NOT NULL"
+)
 
 
 # The key families that are recorded and never cleared: a dose judgement,
@@ -2927,10 +2961,7 @@ def create_app(
         candidates = con.execute(
             "SELECT id, channel, outlet, dry_raw, wet_raw, target_low_pct, "
             "dose_ml, mode, cooldown_h, daily_cap_ml FROM pots_now "
-            f"WHERE {live_sql()} AND mode IN ('learning', 'auto') "
-            "AND controller = ? AND channel IS NOT NULL AND outlet IS NOT NULL "
-            "AND dry_raw IS NOT NULL AND wet_raw IS NOT NULL "
-            "AND target_low_pct IS NOT NULL AND dose_ml IS NOT NULL "
+            f"WHERE {RULES_POT_SQL} AND mode IN ('learning', 'auto') "
             "ORDER BY name",
             (r.controller,),
         ).fetchall()
@@ -4279,8 +4310,10 @@ def create_app(
         # says which of the two it is: the board's own float check tripped
         # (status.flap, ch210 in its latest report: a tap answers that,
         # for one dose — and while the try that tap bought is still to
-        # come, not yet handed or with the board, the page would tell the
-        # person to do what they just did, so it waits for the refusal)
+        # come, queued or with the board or the rules' to make once an
+        # auto pot on the board dries, the page would tell the person to
+        # do what they just did, so it waits for the refusal; on a board
+        # with no such pot nobody will make the try, and it does not wait)
         # or, with no flap on the wire, a float presumed stuck at empty.
         # Its `stale:` key is the clock rule's, kept so a page standing
         # from 0.18.0 clears through the same path. Neither is raised

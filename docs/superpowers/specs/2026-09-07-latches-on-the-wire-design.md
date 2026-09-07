@@ -117,3 +117,17 @@ says "the board reporting float=1 and pos=ok, or a tap after its float check tri
 
 **A4 — Firmware tests assert the sibling.** Each latch test asserts the other channel is 0, and
 one test latches both and reads both 1: a merged or masking encoding must fail.
+
+**A5 — The page waits for a try that can come, not for one nobody will make.** A1 skipped D7
+while `tap_answers_flap` held, and `flap_try_pending` read "no water handed since the tap" as
+"the try is still to come". That is also what a board nobody will try looks like: no pot mapped,
+every pot manual or learning, an auto pot not yet calibrated. The rules hand water only for a
+live auto pot with what the ladder needs; a learning pot's proposal never gets a `sent_ts`
+unless a human approves it, and one nobody approves expires and is proposed again, so there the
+page was silenced for good. Now the try is pending while it is queued or with the board (handed
+since the tap, neither acked nor expired), or while nothing has been handed since the tap and
+the rules can still make it: a live auto pot on the board with the ladder's own fields
+(`RULES_POT_SQL`, one predicate for both). A proposal standing is not a try coming — approving it
+is the human's, as a `/command` is — and on a board with no such pot the page comes at
+`PERSIST_S` as for a float presumed stuck, with D7's flap text: its refill-and-tap step is stale
+advice to someone who just tapped, but the silence was worse.

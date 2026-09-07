@@ -271,10 +271,15 @@ watering.
   with `flow_ml = 0` before the tap: the flap trips on refusals, a refusal is water to the
   cooldown (a pot the board refuses for ever must not be asked at report pace), and the try
   waited six hours while the page said to refill and tap. And no `stale:` page while the try
-  is still to come — the tap answering, or the try handed and with the board, neither acked
-  nor expired (`flap_try_pending()`; the page reads "with the board" a beat wider than the
-  rules' "handed", so a granted try is not paged as dead in the beat before its ack) —
-  refused, the ack spends the tap and the page comes on the next tick. The sample, counter and
+  is still to come — queued or with the board (handed since the tap, neither acked nor
+  expired), or nothing handed since the tap and the rules still able to make it: a live auto
+  pot on the board with the ladder's own fields (`flap_try_pending()`, on `RULES_POT_SQL`, the
+  candidates' predicate; the page reads "with the board" a beat wider than the rules'
+  "handed", so a granted try is not paged as dead in the beat before its ack) — refused, the
+  ack spends the tap and the page comes on the next tick. Not while a try nobody will make is
+  "still to come": on a board with no such pot — none mapped, every pot manual or learning, an
+  auto pot uncalibrated — the try is a human's (a `/command`, an approved proposal; a proposal
+  standing is not a try coming) and the page comes at `PERSIST_S` (spec A5). The sample, counter and
   origin logic are untouched: a flap-forced 0 is a firm drop, and the rise a granted dose
   brings leaves the tap as the origin. `POST /command` stays ungated. `fake_device.py --flap`
   / `--dry` put `ch210=1` / `ch211=1` on every report.
