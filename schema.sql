@@ -214,39 +214,55 @@ CREATE TABLE IF NOT EXISTS status (
                                     -- blanks float_ok): the tank sample closes on
                                     -- it going 1 -> 0, and a report that said
                                     -- nothing must not hide that edge
-  float_word_since INTEGER          -- when the word last changed, 1 -> 0 or
-                                    -- 0 -> 1 and on nothing else: while it is 1,
-                                    -- the float's latest rise, which the tank's
-                                    -- counter restarts at when it is later than
-                                    -- the tap; a report that said nothing moves
+  float_word_since INTEGER,         -- when the word last changed, 1 -> 0 or
+                                    -- 0 -> 1 and on nothing else: the
+                                    -- stuck-at-empty rule's clock (a word that
+                                    -- changed after the tap is a float that
+                                    -- moved); a report that said nothing moves
                                     -- float_since, never this
+  float_rise     INTEGER,           -- when the word last went 0 -> 1: the tank's
+                                    -- counter restarts here once the word has
+                                    -- gone 1 -> 0 since the tap (refills.drop_ts)
+                                    -- and risen later — a tank run down and
+                                    -- refilled by someone who forgot to tap
+  contra         INTEGER NOT NULL DEFAULT 0  -- ch207 in the latest report, absent
+                                    -- being 0: the board's own contradiction
+                                    -- latch stands until `clear contra` is typed,
+                                    -- and over: and stale: keep quiet while it does
 );
 
 -- A refill is a human event (pitch "Trust the tank"): the app says so, the
 -- board cannot, and the tap means "full to the top". The tank's counter
 -- starts at the latest one per controller that saw the float, or at the
--- float's latest rise when that is later (a tank refilled by someone who
--- forgot to tap); the stuck-at-empty rule reads the latest one, snapshot
--- and all. Read on every report and every tick, hence the index.
+-- float's latest rise once the word has gone 1 -> 0 since that tap and
+-- risen later (a tank run down and refilled by someone who forgot to
+-- tap); the stuck-at-empty rule reads the latest one, snapshot and all.
+-- Read on every report and every tick, hence the index.
 CREATE TABLE IF NOT EXISTS refills (
   ts         INTEGER NOT NULL,  -- server time when the human said so
   controller INTEGER NOT NULL,
-  float_ok   INTEGER            -- status.float_ok at the tap; NULL when the
+  float_ok   INTEGER,           -- status.float_ok at the tap; NULL when the
                                 -- board had never sent float= (and on the
                                 -- rows from before this column), and then
                                 -- the tap judges nothing and starts no
                                 -- counter
+  drop_ts    INTEGER            -- the first time the word went 1 -> 0 after
+                                -- this tap, sample or not, whatever else was
+                                -- true of that report; NULL until then. The
+                                -- run a tap starts closes on this drop and no
+                                -- later one, and a rise counts only past it
 );
 
 CREATE INDEX IF NOT EXISTS refills_by_controller ON refills (controller, ts);
 
--- The tank has a size, and it is measured: one row each time the float
--- went empty with water on the counter since the latest tap, `ml` being
--- the acked water handed out between the two — on a board neither
--- latched nor retired, whose float has not risen since the tap (a refill
--- nobody said was full measures nothing). One per tap — a float bouncing
--- at the waterline adds nothing after its first crossing — hence the
--- UNIQUE; the size is the median of the last few by ts, hence the index.
+-- The tank has a size, and it is measured: one row the first time the
+-- float went empty after the latest tap that saw it, with water on the
+-- counter since, `ml` being the acked water handed out between the two —
+-- on a board neither latched nor sending ch207=1 nor retired. A second
+-- drain after an untapped refill stores nothing: nobody said that refill
+-- was full. One per tap — a float bouncing at the waterline adds nothing
+-- after its first crossing — hence the UNIQUE; the size is the median of
+-- the last few by ts, hence the index.
 CREATE TABLE IF NOT EXISTS tank_samples (
   ts         INTEGER NOT NULL,  -- when the float went empty
   controller INTEGER NOT NULL,

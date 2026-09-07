@@ -140,13 +140,16 @@ watering.
   words "type `clear contra` on the board". The float going empty does not latch: the rules
   already refuse on it. `POST /refill` records a human refill, and the tap means "full to the
   top": the row snapshots `status.float_ok`. The tank's counter starts at `counter_origin()` —
-  the later of the latest tap that saw the float (a NULL snapshot, the rows 0.18.0 left, is no
-  origin for anything) and the float's latest rise (`status.float_word_since` while the word is
-  1 — the word's own clock, which a report that omits `float=` leaves alone, where `float_since`
-  is `float_ok`'s and the `fields:` rule's: a float that went 1 → 0 → 1 since the tap is a tank
-  refilled by someone who forgot to tap, and one that said nothing once has not moved) — and
-  the stuck-at-empty rule reads `latest_refill()`, snapshot and all; the ticker reads both once
-  per board.
+  the latest tap that saw the float (`base_tap()`; a NULL snapshot, the rows 0.18.0 left, is no
+  base for anything), or the float's latest rise (`status.float_rise` — the word's own clock,
+  which a report that omits `float=` leaves alone, where `float_since` is `float_ok`'s and the
+  `fields:` rule's) once the word has gone 1 → 0 since that tap (the tap's `drop_ts`, stamped
+  by the report path on the first drop after it) and risen strictly later: a float that went
+  1 → 0 → 1 since the tap is a tank refilled by someone who forgot to tap; a rise with no drop
+  since the tap is the tap's own refill reaching the float, a `clear contra` after a tap, the
+  manual dose lifting the flap, and the tap stands; one that said nothing once has not moved;
+  and a second drain keeps the rise rather than falling back to the tap — and the stuck-at-empty
+  rule reads `latest_refill()`, snapshot and all; the ticker reads both once per board.
   `POST /controller c= retired=1` retires a board: reports land (the latch row included —
   it comes back with the board), nothing pages or waters — the dose judgement included — and
   whatever page stood for it is cleared, since no rule would ever clear it now. `MAX_DOSE_ML` is
@@ -155,18 +158,21 @@ watering.
   `pos:<c>` pages only once a board has ever said `pos=ok`.
 - **The tank has a size (0.19.0).** `pumped_since()` is the acked water handed out at or after
   the origin's second (the rise's own report hands a dose with the same clock), the daily cap's
-  own expression; without an origin it is 0 and nothing arms. The report
-  path closes a `tank_samples` row when the board's word on the float (`status.float_word`, kept
-  across a report that omits `float=`) goes 1 → 0 with water on the counter and the origin, as it
-  stood before the report, is a tap — one per tap, `INSERT OR IGNORE`, nothing on zero pumped,
-  nothing when the origin is a rise (refilled untapped: how full is anybody's guess), nothing on
-  a `ch207=1` report or while the latch stands ("float OK, zero pulses" is a dead meter or 12 V
+  own expression; without an origin it is 0 and nothing arms. On the first 1 → 0 of the board's
+  word on the float (`status.float_word`, kept across a report that omits `float=`) after the
+  latest tap that saw it, the report path stamps that tap's `drop_ts`, whatever else is true of
+  the report, and closes a `tank_samples` row with the water on the counter since the tap — on
+  that drop and no later one: one per tap, `INSERT OR IGNORE`, nothing on zero pumped, nothing
+  on a second drain after an untapped refill (nobody said that refill was full), nothing on a
+  `ch207=1` report or while the latch stands ("float OK, zero pulses" is a dead meter or 12 V
   absent as often as anything about the tank), nothing for a retired board. `tank_ml()` is the
   median of the last `TANK_MEDIAN_OF` (5) samples, `None` under `TANK_SAMPLES_TO_ARM` (2). The
   float is judged against that volume, never a clock: `tank_state()` answers "over" when more
   than the size plus `TANK_TOLERANCE_PCT` (10) has been pumped since the origin and the float
   still says 1 — `water_rules` goes dry, `over:<c>` pages high ("since HH:MM", the origin; not
-  while latched or retired), and a tap that saw the float, later than the page, is the only
+  while latched, not while the latest report carried `ch207=1` — `status.contra`, kept by the
+  upsert, since a `/resume` before `clear contra` is typed lifts the latch and not the board's
+  own — and not while retired), and a tap that saw the float, later than the page, is the only
   clear — not the float word dropping to 0, which is a contra, a flap or an omitted `float=` as
   often as an empty tank; the rules stay dry while the page stands (`over_stands()`), not on the
   live predicate alone, which a float bouncing 0 → 1 untapped lets go of; `/health`'s `over` is
@@ -174,8 +180,8 @@ watering.
   is not gated. `float_dead()` — a tap made with the float at 0, a `float=` reading `PERSIST_S`
   or more after it (`status.float_seen`, not the wall clock: a board behind a WiFi drop has said
   nothing and is judged on nothing), and still 0 (`float_ok`: a report that said nothing said
-  nothing) since before the tap (`float_word_since`) — pages `stale:<c>` (not while latched or
-  retired) and nothing else, cleared when the float reads 1 (the key is the 0.18.0 clock rule's,
+  nothing) since before the tap (`float_word_since`) — pages `stale:<c>` (not while latched, on
+  `ch207=1`, or retired) and nothing else, cleared when the float reads 1 (the key is the 0.18.0 clock rule's,
   so a page standing from it clears through the same path). Every sample is announced once as
   `tank:<c>:<refill_ts>`, marked like `dose:<id>` and left out of `/health` and the up-probe count
   like it, as a warning when it is more than `TANK_DRIFT_PCT` (25) off the median of the samples

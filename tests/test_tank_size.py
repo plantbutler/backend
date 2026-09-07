@@ -84,13 +84,15 @@ def age(db, seconds):
     sightings inside the flap window are one float flapping, not two runs
     of the tank."""
     with sqlite3.connect(db) as con:
-        con.execute("UPDATE refills SET ts = ts - ?", (seconds,))
+        con.execute(
+            "UPDATE refills SET ts = ts - ?, drop_ts = drop_ts - ?", (seconds, seconds)
+        )
         con.execute(
             "UPDATE status SET float_since = float_since - ?, "
-            "float_word_since = float_word_since - ?, "
+            "float_word_since = float_word_since - ?, float_rise = float_rise - ?, "
             "float_seen = float_seen - ?, "
             "float_bad = float_bad - ?, float_bad_prev = float_bad_prev - ?",
-            (seconds, seconds, seconds, seconds, seconds),
+            (seconds, seconds, seconds, seconds, seconds, seconds),
         )
         con.execute(
             "UPDATE commands SET created_ts = created_ts - ?, "
@@ -169,8 +171,18 @@ def origin(db):
 
 
 def word_since(db):
-    """When the float's word last changed: its latest rise while it is 1."""
+    """When the float's word last changed, 1 -> 0 or 0 -> 1."""
     return run_sql(db, "SELECT float_word_since FROM status WHERE controller = 0")[0][0]
+
+
+def rise(db):
+    """When the float's word last went 0 -> 1."""
+    return run_sql(db, "SELECT float_rise FROM status WHERE controller = 0")[0][0]
+
+
+def drops(db):
+    """Each tap's drop_ts, the first time the word went 1 -> 0 after it."""
+    return [ts for (ts,) in run_sql(db, "SELECT drop_ts FROM refills ORDER BY ts, rowid")]
 
 
 def vm_steps(con, fetch):
@@ -238,47 +250,106 @@ def test_the_counter_is_acked_water_sent_after_the_tap(client, db):
 def test_the_counter_starts_at_the_latest_tap_that_saw_the_float_or_the_rise(
     client, db
 ):
-    """The origin is the later of the latest tap whose snapshot is not NULL
-    and the float's latest rise; the tap on a tie. A tap the board never
-    saw is no origin — a month of untapped top-ups behind it is not a
-    measurement — and a float that went 1 -> 0 -> 1 since the tap is a
-    tank refilled by someone who forgot to tap: the counter restarts at
-    the rise instead of calling the float stuck (spec D3, amended)."""
+    """The base is the latest tap whose snapshot is not NULL; the float's
+    latest rise is the origin only once the word has gone 1 -> 0 after that
+    tap (its drop_ts) and rose later. A tap the board never saw is no
+    origin — a month of untapped top-ups behind it is not a measurement —
+    and without one the float's rises count for nothing. A float that
+    went 1 -> 0 -> 1 since the tap is a tank refilled by someone who
+    forgot to tap: the counter restarts at the rise instead of calling the
+    float stuck; the same second is the tap's (spec D3, amended twice)."""
     assert origin(db) is None  # nothing said, nothing tapped
     assert post(client, "/refill", "c=0").status_code == 200  # never sent float=
     age(db, 60)
     assert origin(db) is None  # a tap that saw nothing is no origin
-    report(client, "c=0 ch0=1 float=1")  # the float's first word is a rise
-    assert origin(db) == (word_since(db), "rise")
+    report(client, "c=0 ch0=1 float=1")  # the float's first word
+    assert rise(db) is not None and origin(db) is None  # a rise with no tap is none
     age(db, 60)
     dose(client, 100, flow=100)
-    assert health(client)["pumped_ml"] == 100  # counted from the rise, tap or no tap
+    assert health(client)["pumped_ml"] == 0  # nothing to count from
     age(db, 60)
     since = tap(client, db)  # later than the rise and the dose, and it saw the float
     assert origin(db) == (since, "tap")
     assert health(client)["pumped_ml"] == 0
     run_sql(db, "UPDATE refills SET float_ok = NULL WHERE ts = ?", since)
-    assert origin(db) == (word_since(db), "rise")  # blind after all: no origin
-    assert health(client)["pumped_ml"] == 100
+    assert origin(db) is None  # blind after all: no origin
     run_sql(db, "UPDATE refills SET float_ok = 1 WHERE ts = ?", since)
     # The float goes empty and full again with nobody tapping.
     dose(client, 100, flow=100)
     report(client, "c=0 ch0=1 float=0")
+    assert drops(db) == [None, word_since(db)]  # the tap's first drop
     assert origin(db) == (since, "tap")  # empty: its last rise is behind the tap
     assert health(client)["pumped_ml"] == 100
     age(db, 60)
     report(client, "c=0 ch0=1 float=1")
-    rise = word_since(db)
-    assert rise > since and origin(db) == (rise, "rise")
+    assert rise(db) > since and origin(db) == (rise(db), "rise")
     assert health(client)["pumped_ml"] == 0  # that water went before the rise
     age(db, 60)
     dose(client, 50, flow=50)
     assert health(client)["pumped_ml"] == 50
+    # Sticky: a second drain keeps the rise, and does not move the drop.
+    risen, dropped = rise(db), drops(db)[-1]
+    report(client, "c=0 ch0=1 float=0")
+    assert origin(db) == (risen, "rise") and health(client)["pumped_ml"] == 50
+    assert drops(db) == [None, dropped]
+    age(db, 60)
+    report(client, "c=0 ch0=1 float=1")  # and a second untapped refill restarts it
+    assert rise(db) > risen - 60 and origin(db) == (rise(db), "rise")
+    assert health(client)["pumped_ml"] == 0
     # A rise in the tap's own second is the tap's: the human's word wins.
     report(client, "c=0 ch0=1 float=0")
     report(client, "c=0 ch0=1 float=1")
     since = tap(client, db)
-    assert word_since(db) == since and origin(db) == (since, "tap")
+    assert rise(db) == since and origin(db) == (since, "tap")
+    # A drop and a rise in one second are a float bouncing, not a refill:
+    # the tap stays.
+    age(db, 60)
+    report(client, "c=0 ch0=1 float=0")
+    report(client, "c=0 ch0=1 float=1")
+    assert rise(db) == drops(db)[-1] and origin(db) == (since - 60, "tap")
+
+
+def test_a_rise_before_any_drop_after_the_tap_leaves_the_tap(client, db):
+    """A 0 -> 1 with no drop after the tap is the tap's own refill arriving
+    on the wire after a tap made at empty: the tap stays the origin, and
+    the run it starts closes on the tap — the ordinary "tank empty, fill,
+    tap" run, which the first wording lost (spec D3, D4, amended twice)."""
+    report(client, "c=0 ch0=1 float=1")
+    report(client, "c=0 ch0=1 float=0")  # ran dry
+    age(db, FLAP_WINDOW_S + 1)
+    since = tap(client, db)  # the tap, with the float still saying empty
+    assert refills(db) == [(0,)]
+    report(client, "c=0 ch0=1 float=1")  # the pour reaches the float
+    assert rise(db) > since and drops(db) == [None]
+    assert origin(db) == (since, "tap") and health(client)["pumped_ml"] == 0
+    dose(client, 150, flow=140)
+    assert health(client)["pumped_ml"] == 140
+    ack(client, hand(client, 100), flow=90, float_ok=0)
+    assert samples(db) == [(since, 230)]
+    assert drops(db) == [word_since(db)]
+
+
+def test_clear_contra_after_a_tap_at_the_forced_zero_leaves_the_tap(client, db):
+    """A contra forces the board's word to 0; the human taps, resumes and
+    types `clear contra`, and the word comes back to 1. That rise had no
+    drop after the tap before it, so the tap stays the origin and the run
+    it starts is a sample (spec §1, D3 amended twice)."""
+    report(client, "c=0 ch0=1 float=1")
+    tap(client, db)
+    dose(client, 100, flow=100)
+    report(client, "c=0 ch0=1 float=0 pos=ok ch207=1")  # the forced 0
+    assert health(client)["latched"]["reason"] == "contra"
+    assert samples(db) == [] and drops(db) == [word_since(db)]
+    age(db, 60)
+    since = tap(client, db)  # a look at the tank, at the forced 0
+    assert refills(db)[-1] == (0,)
+    assert post(client, "/resume", "c=0").status_code == 200
+    report(client, "c=0 ch0=1 float=1 pos=ok")  # clear contra on the board
+    assert rise(db) > since and drops(db)[-1] is None
+    assert origin(db) == (since, "tap")
+    dose(client, 120, flow=110)
+    report(client, "c=0 ch0=1 float=0")
+    assert samples(db) == [(since, 110)]
 
 
 def test_a_report_without_float_moves_no_rise(client, db):
@@ -399,15 +470,20 @@ def test_the_float_going_empty_closes_one_sample_per_tap(client, db):
     dose(client, 100, flow=100)  # and watered while it says full
     report(client, "c=0 ch0=1 float=0")  # the first crossing stands, not 270
     assert samples(db) == [(taps(db)[0], 170)]
-    # A tap, nothing pumped, and the float goes empty: not a measurement.
+    # A tap, nothing pumped, and the float goes empty: not a measurement,
+    # but the tap's first drop all the same.
     age(db, 60)
     report(client, "c=0 ch0=1 float=1")
     tap(client, db)
+    assert drops(db)[-1] is None
     report(client, "c=0 ch0=1 float=0")
     assert samples(db) == [(taps(db)[0], 170)]
+    assert drops(db)[-1] == word_since(db)
     # Water flows and the float goes empty again on the same tap — but it
-    # rose since the tap, so the tank was refilled by someone who did not
-    # say so, and how full it was is anybody's guess (spec D4, amended).
+    # rose after that tap's drop, so the tank was refilled by someone who
+    # did not say so, and how full it was is anybody's guess: a second
+    # drain stores nothing (spec D4, amended twice).
+    age(db, 60)
     report(client, "c=0 ch0=1 float=1")
     assert origin(db)[1] == "rise"
     dose(client, 200, flow=210)
@@ -517,6 +593,7 @@ def test_a_retired_board_learns_nothing(client, db):
     ack(client, cmd_id, flow=90, float_ok=0)  # the ack lands, the float drops
     assert health(client)["pumped_ml"] == 90  # acked water is a fact
     assert samples(db) == []  # a measurement is learning
+    assert drops(db) == [word_since(db)]  # the drop is a fact too
     # Back in service, the float has risen since that tap; a new tap and a
     # new run are what it learns from.
     assert post(client, "/controller", "c=0 retired=0").status_code == 200
@@ -707,6 +784,17 @@ def test_an_existing_database_gains_the_snapshot_column_at_startup(db):
     report(client, "c=0 ch0=1 float=1")
     assert post(client, "/refill", "c=0").status_code == 200
     assert refills(db) == [(None,), (1,)]  # the old row judges nothing
+    assert drops(db) == [None, None]  # and has had no drop
+
+
+OLD_STATUS = """
+CREATE TABLE status (
+  controller INTEGER PRIMARY KEY, ts INTEGER NOT NULL, float_ok INTEGER,
+  float_since INTEGER, pos TEXT, pos_since INTEGER, float_seen INTEGER,
+  pos_seen INTEGER, float_bad INTEGER, float_bad_prev INTEGER,
+  pos_bad INTEGER, pos_bad_prev INTEGER, err TEXT, err_ts INTEGER,
+  latched_ts INTEGER, latch_reason TEXT, pos_ok_seen INTEGER);
+"""
 
 
 def test_an_existing_database_carries_the_floats_last_word_at_startup(db):
@@ -716,13 +804,8 @@ def test_an_existing_database_carries_the_floats_last_word_at_startup(db):
     # NULL) and starts no counter (spec D3).
     with sqlite3.connect(db) as con:
         con.executescript(
-            """
-            CREATE TABLE status (
-              controller INTEGER PRIMARY KEY, ts INTEGER NOT NULL, float_ok INTEGER,
-              float_since INTEGER, pos TEXT, pos_since INTEGER, float_seen INTEGER,
-              pos_seen INTEGER, float_bad INTEGER, float_bad_prev INTEGER,
-              pos_bad INTEGER, pos_bad_prev INTEGER, err TEXT, err_ts INTEGER,
-              latched_ts INTEGER, latch_reason TEXT, pos_ok_seen INTEGER);
+            OLD_STATUS
+            + """
             INSERT INTO status (controller, ts, float_ok, float_since) VALUES (0, 5, 1, 5);
             CREATE TABLE refills (ts INTEGER NOT NULL, controller INTEGER NOT NULL);
             INSERT INTO refills VALUES (10, 0);
@@ -731,9 +814,12 @@ def test_an_existing_database_carries_the_floats_last_word_at_startup(db):
     client = TestClient(
         create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900)
     )
-    # The word and its clock, carried from float_ok and float_since: the
-    # rise the float had before the upgrade is where it was.
-    assert run_sql(db, "SELECT float_word, float_word_since FROM status") == [(1, 5)]
+    # The word, its clock and its rise, carried from float_ok and
+    # float_since: the rise the float had before the upgrade is where it
+    # was, and no report has carried ch207 yet.
+    assert run_sql(
+        db, "SELECT float_word, float_word_since, float_rise, contra FROM status"
+    ) == [(1, 5, 5, 0)]
     assert post(client, "/refill", "c=0").status_code == 200  # snapshots the carried 1
     run_sql(db, "UPDATE refills SET ts = ts - 60 WHERE float_ok IS NOT NULL")
     assert refills(db) == [(None,), (1,)]
@@ -747,6 +833,29 @@ def test_an_existing_database_carries_the_floats_last_word_at_startup(db):
     )
     report(client, "c=0 ch0=1 float=0")
     assert samples(db) == [(since, 100)]
+
+
+def test_the_carried_clocks_come_only_with_the_word(db):
+    """A last pre-upgrade report that omitted float= left float_ok NULL and
+    float_since restarted at the omission: the word is not carried, so
+    neither is a clock for it — a clock without a word would read as a
+    float that has not moved since before any tap. A word of empty brings
+    its clock and no rise (float_since is its fall); a word of full brings
+    both (spec D3, amended)."""
+    with sqlite3.connect(db) as con:
+        con.executescript(
+            OLD_STATUS
+            + """
+            INSERT INTO status (controller, ts, float_ok, float_since)
+            VALUES (0, 9, NULL, 7), (1, 9, 0, 6), (2, 9, 1, 5);
+            """
+        )
+    TestClient(create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900))
+    assert run_sql(
+        db,
+        "SELECT controller, float_word, float_word_since, float_rise FROM status "
+        "ORDER BY controller",
+    ) == [(0, None, None, None), (1, 0, 6, None), (2, 1, 5, 5)]
 
 
 # --------------------------------------------------------------------------- #

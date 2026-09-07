@@ -295,45 +295,69 @@ def _pots_ddl() -> list[str]:
     return ddl
 
 
-# Columns schema.sql grew after its CREATE had already run somewhere, with
-# the old column each one carries its value over from (None: nothing to
-# carry). Append-only, like the schema itself.
-# The converters are lambdas because cm_from_text is defined further down
-# and this tuple is built at import.
+class Added(NamedTuple):
+    """A column schema.sql grew after its CREATE had already run somewhere,
+    and how its value carries over from an old one: `source` is the old
+    column (None: nothing to carry), read through `convert` on the rows
+    where `gate` — SQL over the old row — holds."""
+
+    table: str
+    column: str
+    kind: str
+    source: str | None = None
+    convert: Callable = lambda v: v
+    gate: str = "1"
+
+
+# Append-only, like the schema itself. The converters that reach for
+# cm_from_text are lambdas because it is defined further down and this
+# tuple is built at import.
 ADDED_COLUMNS = (
-    ("pots", "plant_height_cm", "REAL", "plant_size", lambda v: cm_from_text(v)),
-    ("pots", "pot_diameter_cm", "REAL", "pot_size", lambda v: cm_from_text(v)),
-    ("species_names", "family", "TEXT", None, None),
+    Added("pots", "plant_height_cm", "REAL", "plant_size", lambda v: cm_from_text(v)),
+    Added("pots", "pot_diameter_cm", "REAL", "pot_size", lambda v: cm_from_text(v)),
+    Added("species_names", "family", "TEXT"),
     # The switch became a word. The carry sets the value and cannot repair
     # the wiring: a pot carried over as `graveyard` keeps its open mapping
     # window, where a graveyarding through POST /pot would have closed it.
     # Unreachable in production — the database this ships with is new — and
     # untrue of every pot in the test fixture, which are all enabled.
-    (
+    Added(
         "pots",
         "status",
         "TEXT NOT NULL DEFAULT 'alive'",
         "enabled",
         lambda flag: "alive" if flag else "graveyard",
     ),
-    ("readings", "pot_id", "TEXT", None, None),
-    ("commands", "pot_id", "TEXT", None, None),
+    Added("readings", "pot_id", "TEXT"),
+    Added("commands", "pot_id", "TEXT"),
     # Trust the tank (0.18.0): a board's own last error, its durable latch,
     # whether it ever knew its position, and whether it is retired.
-    ("controllers", "retired", "INTEGER NOT NULL DEFAULT 0", None, None),
-    ("status", "err", "TEXT", None, None),
-    ("status", "err_ts", "INTEGER", None, None),
-    ("status", "latched_ts", "INTEGER", None, None),
-    ("status", "latch_reason", "TEXT", None, None),
-    ("status", "pos_ok_seen", "INTEGER", None, None),
+    Added("controllers", "retired", "INTEGER NOT NULL DEFAULT 0"),
+    Added("status", "err", "TEXT"),
+    Added("status", "err_ts", "INTEGER"),
+    Added("status", "latched_ts", "INTEGER"),
+    Added("status", "latch_reason", "TEXT"),
+    Added("status", "pos_ok_seen", "INTEGER"),
     # The tank has a size (0.19.0): what the float said at the tap (the
-    # rows already on the NAS get NULL, which judges nothing) and the
-    # board's last word on the float with when it last changed, carried
-    # from float_ok and float_since so a tank sitting at full through the
-    # upgrade still closes its sample, and its rise is where it was.
-    ("refills", "float_ok", "INTEGER", None, None),
-    ("status", "float_word", "INTEGER", "float_ok", lambda v: v),
-    ("status", "float_word_since", "INTEGER", "float_since", lambda v: v),
+    # rows already on the NAS get NULL, which judges nothing), the first
+    # drop after it (none yet), the board's last word on the float with
+    # when it last changed and last rose, and the ch207 of its last report
+    # (none yet). The word and its clocks are carried from float_ok and
+    # float_since so a tank sitting at full through the upgrade still
+    # closes its sample and its rise is where it was — all three under one
+    # gate: a last pre-upgrade report that omitted float= blanked float_ok
+    # and restarted float_since, and a clock carried without its word would
+    # read as a float that has not moved since before any tap. The rise
+    # comes only with a word of full; float_since under a word of empty
+    # is its fall.
+    Added("refills", "float_ok", "INTEGER"),
+    Added("refills", "drop_ts", "INTEGER"),
+    Added("status", "float_word", "INTEGER", "float_ok"),
+    Added(
+        "status", "float_word_since", "INTEGER", "float_since", gate="float_ok IS NOT NULL"
+    ),
+    Added("status", "float_rise", "INTEGER", "float_since", gate="float_ok = 1"),
+    Added("status", "contra", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -358,7 +382,7 @@ def add_columns(con: sqlite3.Connection) -> list[str]:
     """
     added = []
     with con:
-        for table, column, kind, source, convert in ADDED_COLUMNS:
+        for table, column, kind, source, convert, gate in ADDED_COLUMNS:
             cols = [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
             if not cols or column in cols:
                 continue  # no such table here yet, or nothing to do
@@ -367,7 +391,8 @@ def add_columns(con: sqlite3.Connection) -> list[str]:
             if source is None or source not in cols:
                 continue
             for rowid, text in con.execute(
-                f"SELECT rowid, {source} FROM {table} WHERE {source} IS NOT NULL"
+                f"SELECT rowid, {source} FROM {table} "
+                f"WHERE {source} IS NOT NULL AND ({gate})"
             ).fetchall():
                 value = convert(text)
                 if value is not None:
@@ -841,39 +866,60 @@ def latest_refill(
     return (row[0], row[1]) if row else None
 
 
+def base_tap(
+    con: sqlite3.Connection, controller: int
+) -> tuple[int, int, int | None] | None:
+    """The latest tap that saw the float, (ts, rowid, drop_ts), or None:
+    the base the counter starts from, and the row whose `drop_ts` the
+    first 1 -> 0 of the word after it stamps. A tap whose snapshot is
+    NULL (the rows 0.18.0 left behind, a board that had never said
+    float=) never meant "full to the top": a month of untapped top-ups
+    behind it would become a 12 L sample and a threshold no stuck float
+    ever reaches, so it is no base for anything (spec D3, D4)."""
+    row = con.execute(
+        "SELECT ts, rowid, drop_ts FROM refills "
+        "WHERE controller = ? AND float_ok IS NOT NULL "
+        "ORDER BY ts DESC, rowid DESC LIMIT 1",
+        (controller,),
+    ).fetchone()
+    return (row[0], row[1], row[2]) if row else None
+
+
 def counter_origin(
     con: sqlite3.Connection, controller: int
 ) -> tuple[int, str] | None:
     """Where this board's counter starts, (ts, "tap" | "rise"), or None:
-    the later of the latest tap that saw the float and the float's latest
-    rise — status.float_word_since while the word is 1 — the tap on a
-    tie, being the human's word. A tap whose snapshot is NULL (the rows
-    0.18.0 left behind, a board that had never said float=) never meant
-    "full to the top": a month of untapped top-ups behind it would become
-    a 12 L sample and a threshold no stuck float ever reaches, so it is
-    no origin for anything. A float that went 1 -> 0 -> 1 since the tap
-    is a tank that ran down and was refilled by someone who forgot to
-    tap: it demonstrably moved, so the counter restarts at the rise
-    instead of calling it stuck twenty millilitres later. The word, not
-    float_ok: a report that omits float= blanks that column and its
-    clock (float_since, which the fields: rule wants blanked), and a
-    float that said nothing once neither rose nor fell — the rise it had
-    stands, and none is invented when it speaks again. With no origin the
-    counter is 0 and nothing arms (spec D3)."""
+    the latest tap that saw the float (base_tap), or the float's latest
+    rise — status.float_rise, when the word last went 0 -> 1 — once the
+    word has gone 1 -> 0 since that tap (its drop_ts) and risen strictly
+    later. A float that went 1 -> 0 -> 1 since the tap is a tank that ran
+    down and was refilled by someone who forgot to tap: it demonstrably
+    moved, so the counter restarts at the rise instead of calling it
+    stuck twenty millilitres later. A 0 -> 1 with no drop since the tap
+    is the tap's own refill arriving on the wire after a tap made at
+    empty, a `clear contra` after a tap, the manual dose lifting the flap
+    after a tap: the tap stays, or the ordinary "tank empty, fill, tap"
+    run would lose its sample. Sticky: a second drain after an untapped
+    refill keeps the rise (float_rise stays where it was) rather than
+    falling back to the tap and resurrecting water already sampled. The
+    same second is the tap's — a drop and a rise in one second are a
+    float bouncing. The word's own clocks, not float_ok's: a report that
+    omits float= blanks that column and float_since (which the fields:
+    rule wants blanked), and a float that said nothing once neither rose
+    nor fell — the rise it had stands, and none is invented when it
+    speaks again. With no tap the counter is 0 and nothing arms (spec
+    D3)."""
+    tap = base_tap(con, controller)
+    if tap is None:
+        return None
+    ts, _rowid, drop_ts = tap
     row = con.execute(
-        "SELECT ts FROM refills WHERE controller = ? AND float_ok IS NOT NULL "
-        "ORDER BY ts DESC, rowid DESC LIMIT 1",
-        (controller,),
-    ).fetchone()
-    tap = row[0] if row else None
-    row = con.execute(
-        "SELECT float_word_since FROM status WHERE controller = ? AND float_word = 1",
-        (controller,),
+        "SELECT float_rise FROM status WHERE controller = ?", (controller,)
     ).fetchone()
     rise = row[0] if row else None
-    if rise is not None and (tap is None or rise > tap):
+    if drop_ts is not None and rise is not None and rise > drop_ts:
         return (rise, "rise")
-    return (tap, "tap") if tap is not None else None
+    return (ts, "tap")
 
 
 def tapped_after(con: sqlite3.Connection, controller: int, ts: int) -> bool:
@@ -2837,12 +2883,13 @@ def create_app(
             ).fetchone()
             prev_err = prev[0] if prev else None
             prev_float = prev[1] if prev else None
-            # The counter's origin as it stood before this report, on the
-            # float's edge: a rise since the tap is a refill nobody said
-            # was full, which this report's float=0 would put behind the
-            # tap again the moment the upsert lands (spec D3, D4).
+            # The tap the float's edge belongs to: the latest one that saw
+            # the float, with whether the word has dropped since it. The
+            # first drop after a tap is stamped on it below and closes its
+            # run; a later one is a second drain after an untapped refill
+            # (spec D3, D4).
             edge = prev_float == 1 and r.float_ok == 0
-            origin = counter_origin(con, r.controller) if edge else None
+            tap = base_tap(con, r.controller) if edge else None
             # The latest safety fields, with enough history for the alert
             # rules: when each value last changed (`since`), when each was
             # last sent at all (`seen` — its vanishing is an alarm), and the
@@ -2860,8 +2907,8 @@ def create_app(
                 "INSERT INTO status (controller, ts, float_ok, float_since, "
                 "pos, pos_since, float_seen, pos_seen, float_bad, "
                 "float_bad_prev, pos_bad, pos_bad_prev, err, err_ts, pos_ok_seen, "
-                "float_word, float_word_since) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?, ?, ?) "
+                "float_word, float_word_since, float_rise, contra) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(controller) DO UPDATE SET ts = excluded.ts, "
                 "float_ok = excluded.float_ok, pos = excluded.pos, "
                 "float_since = CASE WHEN status.float_ok IS excluded.float_ok "
@@ -2887,14 +2934,22 @@ def create_app(
                 "pos_ok_seen = CASE WHEN excluded.pos = 'ok' "
                 "THEN excluded.ts ELSE status.pos_ok_seen END, "
                 "float_word = COALESCE(excluded.float_word, status.float_word), "
-                # The word's own clock, unlike float_since (float_ok's, which
-                # a report that omits float= moves, and the fields: rule
-                # counts from): it moves on 1 -> 0 and 0 -> 1 and on nothing
-                # else, so the float's latest rise and its last fall are
-                # where they were after a report that said nothing.
+                # The word's own clocks, unlike float_since (float_ok's,
+                # which a report that omits float= moves, and the fields:
+                # rule counts from): the one moves on 1 -> 0 and 0 -> 1
+                # and on nothing else, the other on 0 -> 1 alone (the
+                # first word of full included), so the float's latest rise
+                # and its last fall are where they were after a report
+                # that said nothing. ch207 is this report's, absent being
+                # 0: the board's own latch, which it repeats until `clear
+                # contra` is typed.
                 "float_word_since = CASE WHEN excluded.float_word IS NULL "
                 "OR status.float_word IS excluded.float_word "
-                "THEN status.float_word_since ELSE excluded.ts END",
+                "THEN status.float_word_since ELSE excluded.ts END, "
+                "float_rise = CASE WHEN excluded.float_word = 1 "
+                "AND status.float_word IS NOT 1 "
+                "THEN excluded.ts ELSE status.float_rise END, "
+                "contra = excluded.contra",
                 (
                     r.controller,
                     now,
@@ -2911,6 +2966,8 @@ def create_app(
                     now if r.pos == "ok" else None,
                     r.float_ok,
                     now if r.float_ok is not None else None,
+                    now if r.float_ok == 1 else None,
+                    int(r.channels.get(CONTRA_CHANNEL) == 1),
                 ),
             )
             reason = latch_reason(r, prev_err)
@@ -2935,32 +2992,37 @@ def create_app(
                     "WHERE id = ? AND controller = ? AND state = 'sent'",
                     (now, r.flow_ml, r.ack, r.controller),
                 )
-            if (
-                edge
-                and origin is not None
-                and origin[1] == "tap"
-                and latch_of(con, r.controller) is None
-                and not is_retired(con, r.controller)
-            ):
-                # The float went empty: the water the meter counted since
-                # the tap is one measurement of the tank. After the ack
-                # step, because the dose that drained it acks on this very
-                # report. One per tap — a float bouncing at the line adds
-                # nothing after its first crossing — and nothing on zero:
-                # a tank drained by something the meter never saw is not a
-                # measurement. Nothing either when the origin is a rise
-                # (refilled untapped: how full is anybody's guess), while
-                # the board's latch stands — ch207=1 on this very report
-                # set it just above, and "float OK, zero pulses" is a dead
-                # meter, a kinked tube or 12 V absent as often as anything
-                # about the tank — or for a retired board, whose reports
-                # still land but which learns nothing (spec D1, D4).
-                pumped = pumped_since(con, r.controller, origin[0])
-                if pumped > 0:
+            if tap is not None and tap[2] is None:
+                # The float went empty for the first time since the tap:
+                # stamped on it whatever else is true of this report, so a
+                # rise from here on is a refill nobody said was full and a
+                # later drop is a second drain of it. Then the water the
+                # meter counted since the tap is one measurement of the
+                # tank — after the ack step, because the dose that drained
+                # it acks on this very report. One per tap — a float
+                # bouncing at the line adds nothing after its first
+                # crossing — and nothing on zero: a tank drained by
+                # something the meter never saw is not a measurement.
+                # Nothing either while the board's latch stands — ch207=1
+                # on this very report set it just above, and "float OK,
+                # zero pulses" is a dead meter, a kinked tube or 12 V
+                # absent as often as anything about the tank — or for a
+                # retired board, whose reports still land but which learns
+                # nothing (spec D1, D4).
+                since, rowid, _ = tap
+                con.execute(
+                    "UPDATE refills SET drop_ts = ? WHERE rowid = ?", (now, rowid)
+                )
+                pumped = pumped_since(con, r.controller, since)
+                if (
+                    pumped > 0
+                    and latch_of(con, r.controller) is None
+                    and not is_retired(con, r.controller)
+                ):
                     con.execute(
                         "INSERT OR IGNORE INTO tank_samples "
                         "(ts, controller, refill_ts, ml) VALUES (?, ?, ?, ?)",
-                        (now, r.controller, origin[0], pumped),
+                        (now, r.controller, since, pumped),
                     )
             # A command still 'sent' after the ack step was handed on an
             # earlier response and this report did not ack it: the board
@@ -3903,22 +3965,26 @@ def create_app(
 
         # The float judged against the tank's size, never a clock. Stuck at
         # full is the dangerous one: more than the tank holds pumped since
-        # the origin (the tap, or the float's own rise if later) with the
-        # float still saying full is a float presumed stuck, the rules stay
-        # dry on it, and a tap later than the page is the only clear — a
-        # person who tapped looked at the tank, where the word dropping to
-        # 0 is a contra, a flap or an omitted float= as often as an empty
-        # tank. Stuck at empty is harmless: the rules are dry on empty
-        # already, so it is a page and nothing else, cleared when the float
-        # says full. Its `stale:` key is the clock rule's, kept so a page
-        # standing from 0.18.0 clears through the same path. Neither is
-        # raised while the board's latch stands: a contra forces the word
-        # to 0, and the latch page already says what to do.
-        for controller, float_ok, latched_ts in con.execute(
-            "SELECT controller, float_ok, latched_ts FROM status"
+        # the origin (the tap, or the float's own rise once it has dropped
+        # since the tap) with the float still saying full is a float
+        # presumed stuck, the rules stay dry on it, and a tap later than
+        # the page is the only clear — a person who tapped looked at the
+        # tank, where the word dropping to 0 is a contra, a flap or an
+        # omitted float= as often as an empty tank. Stuck at empty is
+        # harmless: the rules are dry on empty already, so it is a page and
+        # nothing else, cleared when the float says full. Its `stale:` key
+        # is the clock rule's, kept so a page standing from 0.18.0 clears
+        # through the same path. Neither is raised while the board's latch
+        # stands, nor while its latest report carried ch207=1 — a /resume
+        # before `clear contra` is typed lifts the one and not the other: a
+        # contra forces the word to 0, "float OK, zero pulses" is a fault
+        # and not a float, and the latch page already says what to do.
+        for controller, float_ok, latched_ts, contra in con.execute(
+            "SELECT controller, float_ok, latched_ts, contra FROM status"
         ):
             if controller in retired:
                 continue
+            quiet = latched_ts is not None or contra
             origin = counter_origin(con, controller)
             tapped = latest_refill(con, controller)
             key = f"over:{controller}"
@@ -3934,7 +4000,7 @@ def create_app(
                             clear(key),
                         )
                     )
-            elif latched_ts is None and floor_ok(key):
+            elif not quiet and floor_ok(key):
                 state = tank_state(con, controller, origin)
                 if isinstance(state, tuple):
                     _, pumped, tank, origin_ts = state
@@ -3954,7 +4020,7 @@ def create_app(
             key = f"stale:{controller}"
             dead = float_dead(con, controller, tapped)
             if dead is not None:
-                if latched_ts is None and not raised(key) and floor_ok(key):
+                if not quiet and not raised(key) and floor_ok(key):
                     found.append(
                         Alert(
                             key,
