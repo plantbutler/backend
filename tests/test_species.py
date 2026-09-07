@@ -365,7 +365,7 @@ def test_height_is_read_against_the_pot_not_on_its_own():
     assert (cramped.low, cramped.high) == (42, 55)
     # A height with no pot to measure against falls back to the reference
     # pot, which is the assumption the base band already makes.
-    assert size_shifts(None, 40)[0] == size_shifts(None, 40)[0]
+    assert size_shifts(None, 40)[0] == size_shifts(POT_REF_CM, 40)[0]
     assert target_band("herb", None, None, 21, 4)[:2] == (35, 55)
 
 
