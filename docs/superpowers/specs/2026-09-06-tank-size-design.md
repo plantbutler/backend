@@ -44,15 +44,10 @@ board when it was retired still acks.
 omits `float=` blanks, so that a tap made under a row reading "float ?" is not silently a tap
 that counts for nothing — NULL only when the board has never sent `float=`. Schema: column in the `CREATE` **and** in `ADDED_COLUMNS`; the
 rows already on the NAS get NULL, which D7 judges as nothing. Likewise `refills.drop_ts INTEGER`
-(D3/D4), `status.float_rise INTEGER` and `status.contra INTEGER NOT NULL DEFAULT 0`. *Amended
-2026-09-07:* `drop_ts` is carried on a tank already empty at the upgrade: the latest tap that saw
-the float gets `status.float_word_since` when the word is 0 and fell after the tap (or in its
-second, the tap having seen it full — a tap after the fall snapshots the 0). It is the drop D4
-would have stamped; left NULL, the rise after the next untapped refill counts for nothing (D3),
-every dose since a tap the tank demonstrably ran down from stays on the counter, and the board is
-paged stuck at full with a tap the only clear (D6). A word of full hides whatever fall preceded
-it: that tap keeps NULL, as with no fall. Another table's value, so `Added.carry`, run once every
-column is in. The app's copy says what the tap means (D9).
+(D3/D4), `status.float_rise INTEGER` and `status.contra INTEGER NOT NULL DEFAULT 0`. *Amended 2026-09-07, four times:* no
+carry of `drop_ts` at the upgrade — every 0.18.0 tap has a NULL snapshot and is no origin, so
+there is nothing to stamp; the first post-upgrade tap starts everything. (A carry written for an
+intermediate build's shape was unreachable on the NAS and went.) The app's copy says what the tap means (D9).
 
 **D3 — The counter.** `pumped_since(con, controller, since_ts) -> int`: `SUM(COALESCE(flow_ml,
 ml))` over `commands` with `kind = 'water'`, this controller, `acked_ts IS NOT NULL` and
@@ -78,7 +73,8 @@ tap made at empty, a `clear contra` after a tap, the manual dose lifting the fla
 leave the tap as the origin (the second review found the first wording lost the ordinary "tank
 empty, fill, tap" run's sample to exactly this). Sticky: a second drain after an untapped refill
 keeps the rise as the origin — `float_rise` stays where it was — rather than falling back to the
-tap and resurrecting water already sampled. Same second: the tap. Two reasons. A tap from 0.18.0 (NULL snapshot) never meant "full to the top" — a month of untapped
+tap and resurrecting water already sampled; and a rise out of a forced 0 (D4, `float_forced`)
+stamps no `float_rise`, so `clear contra` never becomes the origin. Same second: the tap. Two reasons. A tap from 0.18.0 (NULL snapshot) never meant "full to the top" — a month of untapped
 top-ups behind it would have become a 12 L sample and a threshold no stuck float ever reaches — so
 it is no origin for anything. And a float that went 1 → 0 → 1 since the tap is a tank that ran down
 and was refilled by someone who forgot to tap: the float demonstrably moved, so the counter restarts
@@ -102,8 +98,17 @@ the word once two consecutive reports that carry `float=` agree — its clocks a
 wire's word is one glitch to 0 by design (`safety.cpp:35-41` fails any of three samples), and a
 slosh at report time must not close a sample early and hand the origin to the glitch's recovery
 — the latest non-NULL-snapshot tap's `drop_ts` is set if it was NULL, **unless the report carries
-`ch207=1` or the board's latch stands**: a forced 0 is a fault, not a drop, and stamping it let
-`clear contra` read as a rise that laundered the counter and lost the run's sample. A sample is
+`ch207=1`** (*four times:* the contra latch is what forces the word; a `resetmid` board's float is
+real, and a drain under that latch is a drop like any other — the latch blocks the sample below,
+not the stamp): a forced 0 is a fault, not a drop, and stamping it let `clear contra` read as a
+rise that laundered the counter and lost the run's sample. A forced 0 is remembered:
+`status.float_forced INTEGER NOT NULL DEFAULT 0`, set on a firm 1 → 0 arriving with `ch207=1`,
+and the firm 0 → 1 that ends it (`clear contra`) sets **no** `float_rise` and clears the flag —
+the second review found the rise out of a forced 0 became the origin whenever `drop_ts` was
+already set (an untapped refill, then a contra). *Four times, too:* the duplicate check on
+`(controller, t)` runs **before** the status upsert and this edge step, not only before the
+readings insert — the firmware retries a lost response with the body kept (`netfsm.cpp:161`),
+and a one-glitch report delivered twice confirmed itself as a firm word. A sample is
 inserted only when that `drop_ts` **was** NULL (the first drop after this tap — a second drain after an untapped refill
 stores nothing, which is the rise-origin case: nobody said that refill was full), `pumped_since(tap)
 > 0`, the report does not carry `ch207=1`, no latch stands, and the board is not retired (§1, D1). Trap: `status`
@@ -192,8 +197,10 @@ not being over: refill to the top and tap refilled"), so a mode flip on one expl
   tank run empty twice without topping up, and tap refilled when you fill it to the top, so the
   butler learns its size."; when `over == 1`, an error-coloured line "board N pumped more than
   its tank holds while the float said full: check the float, refill to the top, then tap
-  refilled." (*thrice*: past tense — `over` outlives the float word) and, when `over == 1` and
-  `float` is null, "board N is not sending its float; a tap counts once it does." instead.
+  refilled." (*thrice*: past tense — `over` outlives the float word). *Four times:* no separate text
+  when `float` is null — the tap snapshots the board's last real word (D2), so a tap under
+  "float ?" counts; the app cannot tell a board that never sent `float=` from one that skipped
+  it once, and must not tell the person a tap is blind.
 - `problems()`: `"board N pumped more than its tank holds, float still says full"` when `over ==
   1` and `over:<c>` is not raised. `describeAlert`: `over` → "board N pumped more than its tank
   holds$since"; `stale` → "the float on board N still says empty after the refill$since: look at the magnet, or
@@ -219,8 +226,16 @@ a `resetmid` board latched **dry** on the firmware (`noinit.cpp:43`), and only `
 that (`cli.cpp:478`); `clear contra` clears the contradiction latch only. The 409 text, the
 `latch:<c>` page, `LATCH_TEXT` and the app's `LATCH_STEPS` (the card, the Resume dialog, the water
 refusal) say "type clear contra on the board" for `contra` and "type dry off on the board" for
-`resetmid`; one map in each repo, keyed by the reason. Pre-existing in 0.18.0, fixed here because
-D6/D7's pages send a person down the same steps.
+`resetmid`; one map in each repo, keyed by the reason, with the `contra` words for a reason it
+does not know (the backend and the app alike). *Four times:* a new reason arriving while the
+latch stands **overwrites** `latch_reason` (`latched_ts` stays): the newest fault is the one to
+fix, and after a resume the remaining latch re-pages with its own words. Pre-existing in 0.18.0,
+fixed here because D6/D7's pages send a person down the same steps.
+
+**D13 — `ERR_TOKEN` accepts digits.** *2026-09-07, from the review:* the firmware's
+`DOSE_REFUSED_I2C` token is `i2c` (`safety.cpp:150`); `[a-z_]{1,16}` refused it, and since `err=`
+is the board's sticky last error, one I2C refusal made every later report a 400 until reboot.
+`ERR_TOKEN = re.compile(r"\A[a-z0-9_]{1,16}\Z")`. Pre-existing in 0.18.0.
 
 ## 4. Global constraints (unchanged from the 0.18.0 spec)
 
