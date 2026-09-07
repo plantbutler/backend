@@ -257,7 +257,7 @@ def test_read_trefle_keeps_the_few_fields_that_exist():
 
 
 def test_read_trefle_survives_a_species_that_carries_nothing():
-    # Dracaena trifasciata, on 2026-09-04: resolves, and every field null.
+    # A species that resolves but carries every growth field null.
     care = read_trefle({"data": {"scientific_name": "x", "growth": {}}})
     assert set(care.values()) == {None}
 
@@ -289,10 +289,10 @@ def test_band_follows_the_kind_of_plant():
 
 
 def test_a_kind_outside_the_set_reads_as_unlabelled():
-    # Tolerant on the way out, strict on the way in: `plant_type` was free
-    # text until 0.15.0, so a row may still say "basil" or "foliage", and
-    # the base band is the honest reading of one. parse_pot refuses to
-    # write a new one — that half is tested in test_pots.
+    # Tolerant on the way out, strict on the way in: `plant_type` used to
+    # be free text, so a row may still say "basil" or "foliage", and the
+    # base band is the honest reading of one. parse_pot refuses to write
+    # a new one — that half is tested in test_pots.
     for stale in ("basil", "foliage", "hardy fern", "cauliflower"):
         assert target_band(stale, None, None, None, 4)[:2] == BASE_BAND
 
@@ -468,8 +468,8 @@ def test_a_family_suggests_a_kind():
     assert kind_for("Monstera deliciosa", "Araceae") == "tropical"
     assert kind_for("Crepis vesicaria", "Asteraceae") == "flower"
     assert kind_for("Nephrolepis exaltata", "Nephrolepidaceae") == "fern"
-    # A palm is no longer filed under the leafy houseplants, and a cactus is
-    # no longer filed under the succulents.
+    # A palm gets its own kind rather than falling into the leafy-tropical
+    # bucket, and cactus its own rather than blending into succulent.
     assert kind_for("Chamaedorea elegans", "Arecaceae") == "palm"
     assert kind_for("Dionaea muscipula", "Droseraceae") == "carnivorous"
     # GBIF's case is not a promise.
@@ -477,9 +477,8 @@ def test_a_family_suggests_a_kind():
 
 
 def test_an_orchid_is_answered_now_rather_than_dodged():
-    """Orchidaceae used to be left out on purpose, because a bark epiphyte
-    waters nothing like a flowering pot plant and there was no band for one.
-    There is now, so the honest answer is available."""
+    """A bark epiphyte like an orchid waters nothing like a flowering pot
+    plant, so it needs its own band rather than the generic one."""
     assert kind_for("Phalaenopsis amabilis", "Orchidaceae") == "orchid"
 
 
