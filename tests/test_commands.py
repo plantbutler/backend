@@ -240,6 +240,7 @@ def test_health_lists_a_configured_but_never_seen_controller(client, db):
         "pos_ok_seen": None,
         "retired": 0,
         "latched": None,
+        "flap": 0,
         "last_refill": None,
         "tank_ml": None,
         "tank_samples": 0,

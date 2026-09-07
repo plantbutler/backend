@@ -752,8 +752,8 @@ def age(db, seconds):
             "UPDATE status SET float_since = float_since - ?, "
             "float_word_since = float_word_since - ?, float_rise = float_rise - ?, "
             "float_seen = float_seen - ?, float_bad = float_bad - ?, "
-            "float_bad_prev = float_bad_prev - ?",
-            (seconds,) * 6,
+            "float_bad_prev = float_bad_prev - ?, flap_since = flap_since - ?",
+            (seconds,) * 7,
         )
         # The pages too, the ticker's own bookkeeping rows excepted (they
         # are its clock): a tap clears `over:` only when it is later than
@@ -1356,11 +1356,11 @@ def test_a_float_still_empty_its_minutes_after_the_tap_pages(app, client, db, se
     (alert,) = sent
     (tapped,) = taps(db)
     assert alert.priority == "high"
+    # The board sent no ch210: its own float check did not trip, so the
+    # float is presumed stuck (the flap's own text is test_latches').
     assert alert.message == (
         f"the float on board 0 still says empty 3 min after the refill at "
-        f"{butler.hhmm(tapped)}: a stuck float, or the board's own float check "
-        "tripped — look at the magnet, or water once from the phone (a granted "
-        "dose resets the board's check)"
+        f"{butler.hhmm(tapped)}: presumed stuck at empty, look at the magnet"
     )
     tick(app)
     assert keys(sent) == ["stale:0"]  # once

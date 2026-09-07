@@ -11,6 +11,7 @@ local `uv run uvicorn butler:create_app --factory` or at the NAS:
 
     python fake_device.py --token dev [--url http://localhost:8000]
         [--controller 9] [--channels 5] [--cycles 0]
+        [--float 0] [--pos unknown] [--err TOKEN] [--contra] [--flap] [--dry]
 """
 
 import argparse
@@ -35,14 +36,21 @@ def build_report(
     err=None,
     contra=False,
     float_age=None,
+    flap=False,
+    dry=False,
 ):
-    """One report body, exactly as the board would write it."""
+    """One report body, exactly as the board would write it: the three
+    latches in channel order, ch207, ch210, ch211."""
     tokens = [f"c={controller}", f"t={t_ms}"]
     tokens += [f"ch{i}={v}" for i, v in enumerate(values)]
     if float_age is not None:
         tokens.append(f"ch204={float_age}")
     if contra:
         tokens.append("ch207=1")
+    if flap:
+        tokens.append("ch210=1")
+    if dry:
+        tokens.append("ch211=1")
     if float_ok is not None:
         tokens.append(f"float={float_ok}")
     if pos is not None:
@@ -103,7 +111,8 @@ def main():
     ap.add_argument(
         "--err",
         metavar="TOKEN",
-        help="the board's last safety error, on every report (contra latches the backend)",
+        help="the board's last safety error, on every report (resetmid latches a "
+        "board that sends no ch211; contra never does — ch207 is the latch)",
     )
     ap.add_argument(
         "--contra",
@@ -116,6 +125,18 @@ def main():
         dest="float_age",
         metavar="N",
         help="seconds since the float last moved (ch204=N on every report)",
+    )
+    ap.add_argument(
+        "--flap",
+        action="store_true",
+        help="the board's float check tripped (ch210=1 on every report; pair it "
+        "with --float 0, as the board forces its word to 0 while the flap stands)",
+    )
+    ap.add_argument(
+        "--dry",
+        action="store_true",
+        help="the board's dry latch stands (ch211=1 on every report; latches the "
+        "backend under the dry off words)",
     )
     args = ap.parse_args()
     if not args.token:
@@ -148,6 +169,8 @@ def main():
                 err=args.err,
                 contra=args.contra,
                 float_age=args.float_age,
+                flap=args.flap,
+                dry=args.dry,
             )
             attempts = 0
         attempts += 1
