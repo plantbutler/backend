@@ -103,7 +103,8 @@ real, and a drain under that latch is a drop like any other — the latch blocks
 not the stamp): a forced 0 is a fault, not a drop, and stamping it let `clear contra` read as a
 rise that laundered the counter and lost the run's sample. A forced 0 is remembered:
 `status.float_forced INTEGER NOT NULL DEFAULT 0`, set on a firm 1 → 0 arriving with `ch207=1`,
-and the firm 0 → 1 that ends it (`clear contra`) sets **no** `float_rise` and clears the flag —
+and the firm 0 → 1 that ends it (`clear contra`) sets **no** `float_rise`; the flag is the last
+firm drop's and the next firm drop rewrites it —
 the second review found the rise out of a forced 0 became the origin whenever `drop_ts` was
 already set (an untapped refill, then a contra). *Four times, too:* the duplicate check on
 `(controller, t)` runs **before** the status upsert and this edge step, not only before the
@@ -241,11 +242,13 @@ renamed the reset `contra` before anyone had looked. Pre-existing in 0.18.0, fix
 because D6/D7's pages send a person down the same steps.
 
 **D14 — The last round, 2026-09-07.** Five things the fifth review left, ruled and closed here,
-after which what remains becomes issues, not rounds. (a) `is_over` reads the **firm** word
-(`status.float_firm = 1`), not `float_ok`: the origin waits for the firm word, so in the beat
-between a 0 → 1 sighting and its confirmation the raw word said full while the origin was still
-the tap whose run had just closed, and any run 10 % above the median paged "presumed stuck" and
-dried the rules until a tap. (b) The tap clears the `over:<c>` row **inline** in `record_refill`
+after which what remains becomes issues, not rounds. (a) `is_over` needs **both** words full, `status.float_ok = 1` and
+`status.float_firm = 1`: the origin waits for the firm word, so in the beat between a 0 → 1
+sighting and its confirmation the raw word said full while the origin was still the tap whose
+run had just closed; and the run's end arrives in the raw word, so at the first sighting of
+empty the firm word still said full over a counter past the size. On either word alone any run
+10 % above the median paged "presumed stuck" for one beat, and with the page standing until a
+tap one beat is enough. A float stuck at full says full in both, always. (b) The tap clears the `over:<c>` row **inline** in `record_refill`
 (`cleared_ts` = the tap), as `/resume` clears `latch:<c>`; no clear page is sent — the person did
 the thing — and `over_stands` is simply "raised and not cleared", for the rules, `/health` and
 the phone's strip alike. (c) The firm word starts NULL and becomes the word only once two
