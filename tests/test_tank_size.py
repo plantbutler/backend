@@ -90,9 +90,9 @@ def age(db, seconds):
         con.execute(
             "UPDATE status SET float_since = float_since - ?, "
             "float_word_since = float_word_since - ?, float_rise = float_rise - ?, "
-            "float_seen = float_seen - ?, "
+            "float_firm_since = float_firm_since - ?, float_seen = float_seen - ?, "
             "float_bad = float_bad - ?, float_bad_prev = float_bad_prev - ?",
-            (seconds, seconds, seconds, seconds, seconds, seconds),
+            (seconds,) * 7,
         )
         con.execute(
             "UPDATE commands SET created_ts = created_ts - ?, "
@@ -153,6 +153,32 @@ def dose(client, ml, flow=None):
     ack(client, hand(client, ml), flow)
 
 
+def full(client):
+    """The float says full, twice. One sighting is not yet the word the
+    tank is measured on: the firm word is what two consecutive reports
+    that carry float= agree on, and its rise is where the word rose."""
+    report(client, "c=0 ch0=1 float=1")
+    report(client, "c=0 ch0=1 float=1")
+
+
+def empty(client):
+    """The float says empty, twice: one sighting is a glitch by the
+    board's own design (any of its three samples failing fails the
+    word), and the drop is the firm word's, confirmed by the second."""
+    report(client, "c=0 ch0=1 float=0")
+    report(client, "c=0 ch0=1 float=0")
+
+
+def still_empty(client, db):
+    """A flap window on, the float still says empty: the sighting that
+    confirms an earlier one — a dose's ack, a first report of empty —
+    far enough from it that the two are the tank's run and not a float
+    flapping at the line, which is the float: rule's subject and would
+    page here."""
+    age(db, FLAP_WINDOW_S + 1)
+    report(client, "c=0 ch0=1 float=0")
+
+
 def samples(db):
     return run_sql(db, "SELECT refill_ts, ml FROM tank_samples ORDER BY ts, rowid")
 
@@ -176,8 +202,16 @@ def word_since(db):
 
 
 def rise(db):
-    """When the float's word last went 0 -> 1."""
+    """When the float's firm word last went 0 -> 1."""
     return run_sql(db, "SELECT float_rise FROM status WHERE controller = 0")[0][0]
+
+
+def firm(db):
+    """The float's firm word and its clock: what two consecutive reports
+    agreed on, and where the word moved to it."""
+    return run_sql(
+        db, "SELECT float_firm, float_firm_since FROM status WHERE controller = 0"
+    )[0]
 
 
 def drops(db):
@@ -210,12 +244,23 @@ def vm_steps(con, fetch):
 
 
 def test_a_tap_remembers_what_the_float_said(client, db):
+    """The board's last real word, not the latest report's float_ok,
+    which one report that omits float= blanks: a tap made under a row
+    reading "float ?" is a tap all the same, and must not be one that
+    counts for nothing. NULL only for a board that has never said
+    float= (spec D2, thrice)."""
     assert post(client, "/refill", "c=0").status_code == 200  # never reported
     report(client, "c=0 ch0=1 float=1")
     assert post(client, "/refill", "c=0").status_code == 200
     report(client, "c=0 ch0=1 float=0")
     assert post(client, "/refill", "c=0").status_code == 200
-    assert refills(db) == [(None,), (1,), (0,)]
+    report(client, "c=0 ch0=1")  # says nothing about the float
+    assert run_sql(db, "SELECT float_ok FROM status WHERE controller = 0") == [(None,)]
+    assert post(client, "/refill", "c=0").status_code == 200  # the last real word
+    assert refills(db) == [(None,), (1,), (0,), (0,)]
+    report(client, "c=1 ch0=1")  # reported, but never a word on the float
+    assert post(client, "/refill", "c=1").status_code == 200
+    assert run_sql(db, "SELECT float_ok FROM refills WHERE controller = 1") == [(None,)]
 
 
 # --------------------------------------------------------------------------- #
@@ -262,7 +307,9 @@ def test_the_counter_starts_at_the_latest_tap_that_saw_the_float_or_the_rise(
     assert post(client, "/refill", "c=0").status_code == 200  # never sent float=
     age(db, 60)
     assert origin(db) is None  # a tap that saw nothing is no origin
-    report(client, "c=0 ch0=1 float=1")  # the float's first word
+    report(client, "c=0 ch0=1 float=1")  # the float's first word...
+    assert rise(db) is None  # ...is one sighting, not yet a rise
+    report(client, "c=0 ch0=1 float=1")  # the next agrees: the first firm full
     assert rise(db) is not None and origin(db) is None  # a rise with no tap is none
     age(db, 60)
     dose(client, 100, flow=100)
@@ -276,12 +323,12 @@ def test_the_counter_starts_at_the_latest_tap_that_saw_the_float_or_the_rise(
     run_sql(db, "UPDATE refills SET float_ok = 1 WHERE ts = ?", since)
     # The float goes empty and full again with nobody tapping.
     dose(client, 100, flow=100)
-    report(client, "c=0 ch0=1 float=0")
+    empty(client)
     assert drops(db) == [None, word_since(db)]  # the tap's first drop
     assert origin(db) == (since, "tap")  # empty: its last rise is behind the tap
     assert health(client)["pumped_ml"] == 100
     age(db, 60)
-    report(client, "c=0 ch0=1 float=1")
+    full(client)
     assert rise(db) > since and origin(db) == (rise(db), "rise")
     assert health(client)["pumped_ml"] == 0  # that water went before the rise
     age(db, 60)
@@ -289,23 +336,23 @@ def test_the_counter_starts_at_the_latest_tap_that_saw_the_float_or_the_rise(
     assert health(client)["pumped_ml"] == 50
     # Sticky: a second drain keeps the rise, and does not move the drop.
     risen, dropped = rise(db), drops(db)[-1]
-    report(client, "c=0 ch0=1 float=0")
+    empty(client)
     assert origin(db) == (risen, "rise") and health(client)["pumped_ml"] == 50
     assert drops(db) == [None, dropped]
     age(db, 60)
-    report(client, "c=0 ch0=1 float=1")  # and a second untapped refill restarts it
+    full(client)  # and a second untapped refill restarts it
     assert rise(db) > risen - 60 and origin(db) == (rise(db), "rise")
     assert health(client)["pumped_ml"] == 0
     # A rise in the tap's own second is the tap's: the human's word wins.
-    report(client, "c=0 ch0=1 float=0")
-    report(client, "c=0 ch0=1 float=1")
+    empty(client)
+    full(client)
     since = tap(client, db)
     assert rise(db) == since and origin(db) == (since, "tap")
     # A drop and a rise in one second are a float bouncing, not a refill:
     # the tap stays.
     age(db, 60)
-    report(client, "c=0 ch0=1 float=0")
-    report(client, "c=0 ch0=1 float=1")
+    empty(client)
+    full(client)
     assert rise(db) == drops(db)[-1] and origin(db) == (since - 60, "tap")
 
 
@@ -314,41 +361,136 @@ def test_a_rise_before_any_drop_after_the_tap_leaves_the_tap(client, db):
     on the wire after a tap made at empty: the tap stays the origin, and
     the run it starts closes on the tap — the ordinary "tank empty, fill,
     tap" run, which the first wording lost (spec D3, D4, amended twice)."""
-    report(client, "c=0 ch0=1 float=1")
-    report(client, "c=0 ch0=1 float=0")  # ran dry
+    full(client)
+    empty(client)  # ran dry
     age(db, FLAP_WINDOW_S + 1)
     since = tap(client, db)  # the tap, with the float still saying empty
     assert refills(db) == [(0,)]
-    report(client, "c=0 ch0=1 float=1")  # the pour reaches the float
+    full(client)  # the pour reaches the float
     assert rise(db) > since and drops(db) == [None]
     assert origin(db) == (since, "tap") and health(client)["pumped_ml"] == 0
     dose(client, 150, flow=140)
     assert health(client)["pumped_ml"] == 140
     ack(client, hand(client, 100), flow=90, float_ok=0)
+    assert samples(db) == []  # one sighting of empty
+    report(client, "c=0 ch0=1 float=0")  # the next agrees
     assert samples(db) == [(since, 230)]
     assert drops(db) == [word_since(db)]
+
+
+def test_a_tap_between_the_two_sightings_of_empty_is_after_the_run(client, db):
+    """The drop is confirmed a report after the word fell, and a person
+    who saw the tank empty, filled it and tapped inside that beat made a
+    tap the run did not start from: the drop and the sample are the
+    earlier tap's, where the word fell, the new tap keeps NULL, and the
+    pour reaching the float is not a rise past a drop — the new tap stays
+    the origin, and its own run is the next sample (spec D2, D4, thrice)."""
+    full(client)
+    tap(client, db)
+    dose(client, 200, flow=200)
+    report(client, "c=0 ch0=1 float=0")  # the first sighting
+    age(db, 30)
+    tap(client, db)  # filled and tapped, the float still saying empty
+    assert refills(db) == [(1,), (0,)]
+    report(client, "c=0 ch0=1 float=0")  # the next agrees
+    first, second = taps(db)
+    assert drops(db) == [word_since(db), None] and word_since(db) < second
+    assert samples(db) == [(first, 200)]
+    full(client)  # the pour reaches the float
+    assert rise(db) > second and origin(db) == (second, "tap")
+    assert health(client)["pumped_ml"] == 0
+    dose(client, 100, flow=100)
+    empty(client)
+    assert samples(db) == [(first, 200), (second, 100)]
+
+
+def test_one_sighting_of_empty_between_two_of_full_moves_nothing(client, db):
+    """The wire's word is one glitch to 0 by design (safety.cpp fails the
+    word on any of three samples), so the tank is measured on the firm
+    word — two consecutive reports that carry float= agreeing — and a
+    slosh at report time neither closes the sample early nor hands the
+    origin to its recovery: no drop, no sample, no rise, the counter
+    where it was. Two sightings stamp the drop where the word fell and
+    close the sample on the water counted at the second, the dose handed
+    on the first included (spec D3, D4, thrice)."""
+    full(client)
+    since = tap(client, db)
+    dose(client, 100, flow=90)
+    risen, settled = rise(db), firm(db)
+    assert settled == (1, risen)
+    report(client, "c=0 ch0=1 float=0")  # a slosh
+    assert firm(db) == settled and drops(db) == [None] and samples(db) == []
+    report(client, "c=0 ch0=1")  # a report that says nothing sits between
+    report(client, "c=0 ch0=1 float=1")  # and full again: no rise
+    assert firm(db) == settled and rise(db) == risen
+    assert origin(db) == (since, "tap") and health(client)["pumped_ml"] == 90
+    dose(client, 50, flow=50)
+    answer = post(client, "/command", "c=0 water=3 ml=40")
+    assert answer.status_code == 200, answer.text
+    cmd_id = int(answer.text.strip().removeprefix("cmd="))
+    handed = report(client, "c=0 ch0=1 float=0 pos=ok").text  # the first sighting
+    assert f"cmd={cmd_id} water=3 ml=40" in handed
+    assert firm(db) == settled and drops(db) == [None] and samples(db) == []
+    fell = word_since(db)
+    # The next agrees, and acks the dose the first sighting handed.
+    report(client, f"c=0 ch0=1 float=0 pos=ok ack={cmd_id} flow_ml=35")
+    assert firm(db) == (0, fell) and drops(db) == [fell]
+    assert samples(db) == [(since, 90 + 50 + 35)]
+
+
+def test_a_forced_zero_is_not_a_drop(client, db):
+    """A contra forces the board's word to 0 on every report until
+    `clear contra` is typed: "float OK, zero pulses", a fault and not the
+    tank. Stamped as the tap's drop, the word coming back after `clear
+    contra` read as a rise past it — an untapped refill — and the counter
+    restarted with the run's water laundered and its sample lost. So
+    neither a report carrying ch207=1 nor one under the standing latch
+    stamps or closes anything: the tap stays the origin through the
+    contra, the resume and the clear, and the run's later real drain
+    closes its sample on all the water since the tap (spec §1, D3, D4,
+    thrice)."""
+    full(client)
+    since = tap(client, db)
+    dose(client, 100, flow=100)
+    report(client, "c=0 ch0=1 float=0 pos=ok ch207=1")  # the forced 0...
+    report(client, "c=0 ch0=1 float=0 pos=ok ch207=1")  # ...on every report
+    assert health(client)["latched"]["reason"] == "contra"
+    assert firm(db)[0] == 0  # the word is what the board says, forced or not
+    assert drops(db) == [None] and samples(db) == []
+    assert post(client, "/resume", "c=0").status_code == 200
+    report(client, "c=0 ch0=1 float=1 pos=ok ch207=0")  # clear contra was typed
+    report(client, "c=0 ch0=1 float=1 pos=ok ch207=0")
+    assert rise(db) > since and drops(db) == [None]
+    assert origin(db) == (since, "tap") and health(client)["pumped_ml"] == 100
+    dose(client, 120, flow=110)
+    empty(client)  # the real drain
+    assert drops(db) == [word_since(db)]
+    assert samples(db) == [(since, 210)]
 
 
 def test_clear_contra_after_a_tap_at_the_forced_zero_leaves_the_tap(client, db):
     """A contra forces the board's word to 0; the human taps, resumes and
     types `clear contra`, and the word comes back to 1. That rise had no
-    drop after the tap before it, so the tap stays the origin and the run
-    it starts is a sample (spec §1, D3 amended twice)."""
-    report(client, "c=0 ch0=1 float=1")
+    drop after the tap before it — the forced 0 stamped none on the tap
+    before either — so the tap stays the origin and the run it starts is
+    a sample (spec §1, D3 amended twice, then thrice)."""
+    full(client)
     tap(client, db)
     dose(client, 100, flow=100)
     report(client, "c=0 ch0=1 float=0 pos=ok ch207=1")  # the forced 0
+    report(client, "c=0 ch0=1 float=0 pos=ok ch207=1")
     assert health(client)["latched"]["reason"] == "contra"
-    assert samples(db) == [] and drops(db) == [word_since(db)]
+    assert samples(db) == [] and drops(db) == [None]
     age(db, 60)
     since = tap(client, db)  # a look at the tank, at the forced 0
     assert refills(db)[-1] == (0,)
     assert post(client, "/resume", "c=0").status_code == 200
     report(client, "c=0 ch0=1 float=1 pos=ok")  # clear contra on the board
-    assert rise(db) > since and drops(db)[-1] is None
+    report(client, "c=0 ch0=1 float=1 pos=ok")
+    assert rise(db) > since and drops(db) == [None, None]
     assert origin(db) == (since, "tap")
     dose(client, 120, flow=110)
-    report(client, "c=0 ch0=1 float=0")
+    empty(client)
     assert samples(db) == [(since, 110)]
 
 
@@ -357,12 +499,12 @@ def test_a_report_without_float_moves_no_rise(client, db):
     falls: the rise the float had stands through it, and none is invented
     when it says the same word again — the word's own clock, not
     float_since, which such a report restarts (spec D3, amended)."""
-    report(client, "c=0 ch0=1 float=1")
+    full(client)
     since = tap(client, db)
     dose(client, 150, flow=150)
-    report(client, "c=0 ch0=1 float=0")  # ran down...
+    empty(client)  # ran down...
     age(db, 60)
-    report(client, "c=0 ch0=1 float=1")  # ...and refilled, untapped
+    full(client)  # ...and refilled, untapped
     rise = word_since(db)
     assert rise > since and origin(db) == (rise, "rise")
     assert health(client)["pumped_ml"] == 0  # that water went before the rise
@@ -398,13 +540,15 @@ def test_a_dose_typed_before_the_tap_and_handed_after_it_counts(client, db):
 
 
 def test_a_dose_handed_on_the_report_that_raises_the_float_counts(client, db):
-    """The report that first says full after empty is the rise, and it
-    hands whatever was queued with the same clock: that dose pumps after
-    it was handed, from the refilled tank, and a counter strict about the
-    origin's second lost it for ever (spec D3, amended)."""
-    report(client, "c=0 ch0=1 float=1")
+    """The report that first says full after empty is the rise, once the
+    next agrees, and it hands whatever was queued with its own clock: that
+    dose pumps after it was handed, from the refilled tank. A counter
+    strict about the origin's second lost it for ever, and so would a
+    rise stamped where it was confirmed, a beat later, rather than where
+    the word rose (spec D3, amended, then thrice)."""
+    full(client)
     tap(client, db)
-    report(client, "c=0 ch0=1 float=0")  # ran down
+    empty(client)  # ran down
     age(db, 60)
     answer = post(client, "/command", "c=0 water=3 ml=80")  # typed while empty
     assert answer.status_code == 200, answer.text
@@ -412,10 +556,14 @@ def test_a_dose_handed_on_the_report_that_raises_the_float_counts(client, db):
     # Refilled untapped: this one report is the rise and hands the dose.
     handed = report(client, "c=0 ch0=1 float=1 pos=ok").text
     assert f"cmd={cmd_id} water=3 ml=80" in handed
-    rise = word_since(db)
-    assert origin(db) == (rise, "rise")
-    assert run_sql(db, "SELECT sent_ts FROM commands WHERE id = ?", cmd_id) == [(rise,)]
-    ack(client, cmd_id, flow=80)
+    assert origin(db)[1] == "tap"  # one sighting of full is not yet the rise
+    age(db, 60)  # a beat later...
+    report(client, f"c=0 ch0=1 float=1 pos=ok ack={cmd_id} flow_ml=80")  # ...it agrees
+    risen = rise(db)
+    assert risen == word_since(db) and origin(db) == (risen, "rise")
+    assert run_sql(db, "SELECT sent_ts FROM commands WHERE id = ?", cmd_id) == [
+        (risen,)
+    ]
     assert health(client)["pumped_ml"] == 80
 
 
@@ -437,7 +585,7 @@ def test_a_stop_acked_with_a_count_is_not_water(client, db):
     stopped, which the dose's own ack already counted. The ack step stamps
     it on the stop row like any other, so only the counter's kind = 'water'
     keeps it out of pumped_ml and out of the sample (spec D3)."""
-    report(client, "c=0 ch0=1 float=1")
+    full(client)
     tap(client, db)
     dose(client, 100, flow=90)
     answer = post(client, "/command", "c=0 stop=1")
@@ -445,6 +593,7 @@ def test_a_stop_acked_with_a_count_is_not_water(client, db):
     stop_id = int(answer.text.strip().removeprefix("cmd="))
     assert f"cmd={stop_id} stop=1" in report(client, "c=0 ch0=1 float=1 pos=ok").text
     ack(client, stop_id, flow=60, float_ok=0)  # and the float drops on that report
+    report(client, "c=0 ch0=1 float=0")  # and says so again
     assert run_sql(
         db, "SELECT kind, ml, flow_ml FROM commands WHERE id = ?", stop_id
     ) == [("stop", None, 60)]
@@ -458,25 +607,27 @@ def test_a_stop_acked_with_a_count_is_not_water(client, db):
 
 
 def test_the_float_going_empty_closes_one_sample_per_tap(client, db):
-    report(client, "c=0 ch0=1 float=1")
+    full(client)
     tap(client, db)
     dose(client, 100, flow=90)
-    # The dose that drains the tank acks on the very report that says
-    # empty, and that count is part of the run.
+    # The dose that drains the tank acks on the report that first says
+    # empty, and that count is part of the run the next report closes.
     ack(client, hand(client, 100), flow=80, float_ok=0)
+    assert samples(db) == []
+    report(client, "c=0 ch0=1 float=0")
     assert samples(db) == [(taps(db)[0], 170)]
     report(client, "c=0 ch0=1 float=0")  # still empty: nothing new
-    report(client, "c=0 ch0=1 float=1")  # bouncing at the line, no tap
+    full(client)  # bouncing at the line, no tap
     dose(client, 100, flow=100)  # and watered while it says full
-    report(client, "c=0 ch0=1 float=0")  # the first crossing stands, not 270
+    empty(client)  # the first crossing stands, not 270
     assert samples(db) == [(taps(db)[0], 170)]
     # A tap, nothing pumped, and the float goes empty: not a measurement,
     # but the tap's first drop all the same.
     age(db, 60)
-    report(client, "c=0 ch0=1 float=1")
+    full(client)
     tap(client, db)
     assert drops(db)[-1] is None
-    report(client, "c=0 ch0=1 float=0")
+    empty(client)
     assert samples(db) == [(taps(db)[0], 170)]
     assert drops(db)[-1] == word_since(db)
     # Water flows and the float goes empty again on the same tap — but it
@@ -484,17 +635,17 @@ def test_the_float_going_empty_closes_one_sample_per_tap(client, db):
     # did not say so, and how full it was is anybody's guess: a second
     # drain stores nothing (spec D4, amended twice).
     age(db, 60)
-    report(client, "c=0 ch0=1 float=1")
+    full(client)
     assert origin(db)[1] == "rise"
     dose(client, 200, flow=210)
-    report(client, "c=0 ch0=1 float=0")
+    empty(client)
     assert samples(db) == [(taps(db)[0], 170)]
     # Said so: the next tap's run is a sample.
     age(db, 60)
-    report(client, "c=0 ch0=1 float=1")
+    full(client)
     tap(client, db)
     dose(client, 200, flow=210)
-    report(client, "c=0 ch0=1 float=0")
+    empty(client)
     first, _second, third = taps(db)
     assert samples(db) == [(first, 170), (third, 210)]
 
@@ -503,30 +654,32 @@ def test_a_contra_report_or_a_standing_latch_closes_no_sample(client, db):
     """ch207=1 is "float OK, zero pulses", and zero pulses is a dead meter,
     a kinked tube, a dead pump or 12 V absent as often as anything about
     the tank: a fault, not a measurement (spec §1, D4 amended)."""
-    report(client, "c=0 ch0=1 float=1")
+    full(client)
     tap(client, db)
     cmd_id = hand(client, 100)
     report(client, f"c=0 ch0=1 float=0 pos=ok ack={cmd_id} flow_ml=90 ch207=1")
+    report(client, "c=0 ch0=1 float=0 pos=ok ch207=1")  # and keeps saying so
     assert health(client)["latched"]["reason"] == "contra"
     assert health(client)["pumped_ml"] == 90  # acked water is a fact
-    assert samples(db) == []
+    assert samples(db) == [] and drops(db) == [None]  # a forced 0 is no drop
     # A latch standing from before the edge — here the reset with the pump
-    # running, the float saying full throughout — closes none either.
+    # running, the float saying full throughout — closes none either, and
+    # stamps no drop: the word under a latch is not the tank's.
     assert post(client, "/resume", "c=0").status_code == 200
-    report(client, "c=0 ch0=1 float=1")
+    full(client)
     tap(client, db)
     dose(client, 100, flow=90)
     report(client, "c=0 ch0=1 float=1 err=resetmid")
-    report(client, "c=0 ch0=1 float=0")
+    empty(client)
     assert health(client)["latched"]["reason"] == "resetmid"
-    assert samples(db) == []
+    assert samples(db) == [] and drops(db) == [None, None]
     # Resumed, a tap and a run: learning again.
     assert post(client, "/resume", "c=0").status_code == 200
     age(db, 60)
-    report(client, "c=0 ch0=1 float=1")
+    full(client)
     tap(client, db)
     dose(client, 100, flow=90)
-    report(client, "c=0 ch0=1 float=0")
+    empty(client)
     assert samples(db) == [(taps(db)[-1], 90)]
 
 
@@ -555,7 +708,7 @@ def test_a_report_without_float_hides_no_edge(client, db):
     silence an edge, a heartbeat mid-dose would close the sample at the
     water so far, and the true crossing's count would be dropped on the
     tap's key (spec D4)."""
-    report(client, "c=0 ch0=1 float=1")
+    full(client)
     tap(client, db)
     dose(client, 100, flow=90)
     answer = post(client, "/command", "c=0 water=3 ml=50")
@@ -564,11 +717,18 @@ def test_a_report_without_float_hides_no_edge(client, db):
     # A report that says nothing about the float hands the dose...
     handed = report(client, "c=0 ch0=1 pos=ok").text
     assert f"cmd={cmd_id} water=3 ml=50" in handed
-    assert run_sql(db, "SELECT float_ok, float_word FROM status") == [(None, 1)]
+    assert run_sql(db, "SELECT float_ok, float_word, float_firm FROM status") == [
+        (None, 1, 1)
+    ]
     assert samples(db) == []  # ...and closes nothing: silence is not empty
-    # Full, silent, empty is an edge, and the run it closes is the whole
-    # run: the dose in flight through the silence acks on this report.
+    # Full, silent, empty, silent, empty is an edge — the two sightings
+    # are the last two reports that carried float=, whatever said nothing
+    # between them — and the run it closes is the whole run: the dose in
+    # flight through the silence acks on the first sighting.
     ack(client, cmd_id, flow=40, float_ok=0)
+    report(client, "c=0 ch0=1 pos=ok")
+    assert samples(db) == []
+    report(client, "c=0 ch0=1 float=0 pos=ok")
     assert samples(db) == [(taps(db)[0], 130)]
     # Empty, silent, empty is not one, whatever the counter says.
     since = tap(client, db)
@@ -586,11 +746,12 @@ def test_a_report_without_float_hides_no_edge(client, db):
 
 
 def test_a_retired_board_learns_nothing(client, db):
-    report(client, "c=0 ch0=1 float=1")
+    full(client)
     tap(client, db)
     cmd_id = hand(client, 100)  # with the board when it is retired
     assert post(client, "/controller", "c=0 retired=1").status_code == 200
     ack(client, cmd_id, flow=90, float_ok=0)  # the ack lands, the float drops
+    report(client, "c=0 ch0=1 float=0")  # and says so again
     assert health(client)["pumped_ml"] == 90  # acked water is a fact
     assert samples(db) == []  # a measurement is learning
     assert drops(db) == [word_since(db)]  # the drop is a fact too
@@ -598,10 +759,10 @@ def test_a_retired_board_learns_nothing(client, db):
     # new run are what it learns from.
     assert post(client, "/controller", "c=0 retired=0").status_code == 200
     age(db, 60)
-    report(client, "c=0 ch0=1 float=1")
+    full(client)
     tap(client, db)
     dose(client, 100, flow=90)
-    report(client, "c=0 ch0=1 float=0")
+    empty(client)
     assert samples(db) == [(taps(db)[-1], 90)]
 
 
@@ -745,22 +906,22 @@ def test_finding_the_unannounced_samples_costs_the_pending_few(db, app):
 
 
 def test_health_carries_the_size_the_count_and_the_counter(client, db):
-    report(client, "c=0 ch0=1 float=1")
+    full(client)
     entry = health(client)
     assert entry["tank_ml"] is None
     assert entry["tank_samples"] == 0
     assert entry["pumped_ml"] == 0
     tap(client, db)
     dose(client, 200, flow=180)
-    report(client, "c=0 ch0=1 float=0")
-    report(client, "c=0 ch0=1 float=1")
+    empty(client)
+    full(client)
     entry = health(client)
     assert (entry["tank_ml"], entry["tank_samples"]) == (None, 1)
     age(db, 60)
     tap(client, db)
     dose(client, 200, flow=200)
     dose(client, 50, flow=40)
-    report(client, "c=0 ch0=1 float=0")
+    empty(client)
     entry = health(client)
     assert (entry["tank_ml"], entry["tank_samples"]) == (210, 2)
     assert entry["pumped_ml"] == 240
@@ -815,11 +976,15 @@ def test_an_existing_database_carries_the_floats_last_word_at_startup(db):
         create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900)
     )
     # The word, its clock and its rise, carried from float_ok and
-    # float_since: the rise the float had before the upgrade is where it
-    # was, and no report has carried ch207 yet.
+    # float_since, and the firm word with its clock from those: the rise
+    # the float had before the upgrade is where it was, the one report
+    # the upgrade has to go on is taken at its word, and no report has
+    # carried ch207 yet.
     assert run_sql(
-        db, "SELECT float_word, float_word_since, float_rise, contra FROM status"
-    ) == [(1, 5, 5, 0)]
+        db,
+        "SELECT float_word, float_word_since, float_rise, contra, "
+        "float_firm, float_firm_since FROM status",
+    ) == [(1, 5, 5, 0, 1, 5)]
     assert post(client, "/refill", "c=0").status_code == 200  # snapshots the carried 1
     run_sql(db, "UPDATE refills SET ts = ts - 60 WHERE float_ok IS NOT NULL")
     assert refills(db) == [(None,), (1,)]
@@ -831,7 +996,7 @@ def test_an_existing_database_carries_the_floats_last_word_at_startup(db):
         "VALUES (?, 0, 'water', 3, 100, 30, 'acked', 'manual', ?, ?, 100)",
         since + 1, since + 1, since + 2,
     )
-    report(client, "c=0 ch0=1 float=0")
+    empty(client)
     assert samples(db) == [(since, 100)]
 
 
@@ -841,7 +1006,8 @@ def test_the_carried_clocks_come_only_with_the_word(db):
     neither is a clock for it — a clock without a word would read as a
     float that has not moved since before any tap. A word of empty brings
     its clock and no rise (float_since is its fall); a word of full brings
-    both (spec D3, amended)."""
+    both. The firm word and its clock are the word's, under the same gate
+    (spec D3, amended, then thrice)."""
     with sqlite3.connect(db) as con:
         con.executescript(
             OLD_STATUS
@@ -853,9 +1019,13 @@ def test_the_carried_clocks_come_only_with_the_word(db):
     TestClient(create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900))
     assert run_sql(
         db,
-        "SELECT controller, float_word, float_word_since, float_rise FROM status "
-        "ORDER BY controller",
-    ) == [(0, None, None, None), (1, 0, 6, None), (2, 1, 5, 5)]
+        "SELECT controller, float_word, float_word_since, float_rise, "
+        "float_firm, float_firm_since FROM status ORDER BY controller",
+    ) == [
+        (0, None, None, None, None, None),
+        (1, 0, 6, None, 0, 6),
+        (2, 1, 5, 5, 1, 5),
+    ]
 
 
 # The shape between the two amendments: the tap already snapshots the
@@ -925,6 +1095,12 @@ def test_a_tank_already_empty_at_the_upgrade_carries_its_drop(db):
         (6, 10, 30),
         (6, 20, None),
     ]
+    # The firm word is the word the row had, this shape having no other.
+    assert run_sql(
+        db,
+        "SELECT controller, float_firm, float_firm_since FROM status "
+        "WHERE controller IN (0, 3) ORDER BY controller",
+    ) == [(0, 0, 30), (3, 1, 30)]
     # Board 0 pumped a tank's worth between its tap and the fall — the run
     # the old code closed — and is now refilled by someone who forgot to
     # tap: the rise is the origin, nothing is on the counter, and the
@@ -940,13 +1116,13 @@ def test_a_tank_already_empty_at_the_upgrade_carries_its_drop(db):
         "state, source, sent_ts, acked_ts, flow_ml) "
         "VALUES (20, 0, 'water', 3, 250, 30, 'acked', 'manual', 20, 21, 250)",
     )
-    report(client, "c=0 ch0=1 float=1 pos=ok")
+    full(client)
     assert origin(db) == (rise(db), "rise")
     entry = health(client)
     assert (entry["tank_ml"], entry["pumped_ml"], entry["over"]) == (225, 0, 0)
     # Its second drain is the untapped refill's, not the tap's: the tap
     # keeps the drop it was carried, and the rise stays the origin.
-    report(client, "c=0 ch0=1 float=0 pos=ok")
+    empty(client)
     assert run_sql(db, "SELECT drop_ts FROM refills WHERE controller = 0") == [(30,)]
     assert origin(db) == (rise(db), "rise")
     assert samples(db) == [(1, 200), (10, 250)]
@@ -961,25 +1137,28 @@ def run_the_tank_down(app, client, db, ml):
     """One run, a flap window after the last: the float saying full again
     (before the tap — a rise after it would be the origin, and no sample
     closes on a rise), a tap, `ml` through the meter in doses the board
-    accepts, the float going empty, and a tick. Returns the tap's ts as it
-    stands."""
+    accepts, the float going empty and still empty a flap window on, and
+    a tick. Returns the tap's ts as it stood at the tick."""
     age(db, FLAP_WINDOW_S + 1)
-    report(client, "c=0 ch0=1 float=1")
-    since = tap(client, db)
+    full(client)
+    tap(client, db)
     while ml:
         part = min(ml, MAX_DOSE_ML)
         dose(client, part, flow=part)
         ml -= part
     report(client, "c=0 ch0=1 float=0")
+    still_empty(client, db)
     tick(app)
-    return since
+    return taps(db)[-1]
 
 
 def test_every_sample_is_announced_once(app, client, db, sent):
-    report(client, "c=0 ch0=1 float=1")
-    first = tap(client, db)
+    full(client)
+    tap(client, db)
     dose(client, 200, flow=190)
     report(client, "c=0 ch0=1 float=0")
+    still_empty(client, db)
+    first = taps(db)[-1]
     tick(app)
     tick(app)
     assert keys(sent) == [f"tank:0:{first}"]  # once
@@ -1004,9 +1183,10 @@ def test_every_sample_is_announced_once(app, client, db, sent):
     ) == [(None,), (None,)]
     # A tap, nothing pumped, the float going empty: no sample, no page.
     age(db, FLAP_WINDOW_S + 1)
-    report(client, "c=0 ch0=1 float=1")
+    full(client)
     tap(client, db)
     report(client, "c=0 ch0=1 float=0")
+    still_empty(client, db)
     tick(app)
     assert len(sent) == 2
 
@@ -1018,16 +1198,17 @@ def test_two_runs_waiting_on_one_tick_are_each_judged_as_they_closed(
     send failed) judges the first against what the tank knew when it
     closed — nothing — not against the second, which had not happened
     yet (spec D8)."""
-    report(client, "c=0 ch0=1 float=1")
+    full(client)
     tap(client, db)
     dose(client, 200, flow=200)
     report(client, "c=0 ch0=1 float=0")
-    age(db, FLAP_WINDOW_S + 1)
-    report(client, "c=0 ch0=1 float=1")
+    still_empty(client, db)
+    full(client)
     tap(client, db)
     dose(client, 250, flow=250)
     dose(client, 150, flow=150)
     report(client, "c=0 ch0=1 float=0")
+    still_empty(client, db)
     tick(app)
     first, second = taps(db)
     assert keys(sent) == [f"tank:0:{first}", f"tank:0:{second}"]
@@ -1036,7 +1217,7 @@ def test_two_runs_waiting_on_one_tick_are_each_judged_as_they_closed(
 
 
 def test_a_sample_off_the_size_it_knew_is_a_warning(app, client, db, sent):
-    report(client, "c=0 ch0=1 float=1")
+    full(client)
     run_the_tank_down(app, client, db, 200)
     run_the_tank_down(app, client, db, 200)
     since = run_the_tank_down(app, client, db, 250)  # 200 + 25 %: at the line
@@ -1066,7 +1247,7 @@ def test_the_count_is_the_samples_the_size_rests_on(app, client, db, sent):
     many the board has closed in its life (spec D5, D8). Left by age, not
     by size: the sixth run's page is handed six samples where /health's
     tank_ml is handed five, and the two must name the same tank."""
-    report(client, "c=0 ch0=1 float=1")
+    full(client)
     for ml in (1000, 200, 200, 300, 300):
         run_the_tank_down(app, client, db, ml)
     assert sent[-1].message.endswith("(tank 300 ml over 5 samples)")
@@ -1083,7 +1264,7 @@ def test_a_sample_is_judged_against_the_five_before_it(app, client, db, sent):
     """The size a sample is held to is the median of the five that came
     before it, not of the four: a run that fetched only the window ending
     at the sample would judge it against a different number."""
-    report(client, "c=0 ch0=1 float=1")
+    full(client)
     for ml in (1000, 1000, 1000, 200, 200):
         run_the_tank_down(app, client, db, ml)
     # Of the five before: 1000. Of the four before: 600, and 1000 would
@@ -1099,7 +1280,7 @@ def test_a_sample_is_judged_against_the_five_before_it(app, client, db, sent):
 def test_the_announcements_never_reach_the_app_or_the_up_count(
     app, client, db, sent
 ):
-    report(client, "c=0 ch0=1 float=1")
+    full(client)
     run_the_tank_down(app, client, db, 200)
     assert len(keys(sent)) == 1
     assert client.get("/health").json()["alerts"] == []
@@ -1116,10 +1297,12 @@ def test_the_announcements_never_reach_the_app_or_the_up_count(
 
 
 def test_a_retired_boards_sample_waits_for_it(app, client, db, sent):
-    report(client, "c=0 ch0=1 float=1")
-    since = tap(client, db)
+    full(client)
+    tap(client, db)
     dose(client, 200, flow=200)
     report(client, "c=0 ch0=1 float=0")
+    still_empty(client, db)
+    since = taps(db)[-1]
     assert post(client, "/controller", "c=0 retired=1").status_code == 200
     tick(app)
     assert keys(sent) == []

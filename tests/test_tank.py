@@ -615,9 +615,9 @@ def age(db, seconds):
         con.execute(
             "UPDATE status SET float_since = float_since - ?, "
             "float_word_since = float_word_since - ?, float_rise = float_rise - ?, "
-            "float_seen = float_seen - ?, "
+            "float_firm_since = float_firm_since - ?, float_seen = float_seen - ?, "
             "float_bad = float_bad - ?, float_bad_prev = float_bad_prev - ?",
-            (seconds, seconds, seconds, seconds, seconds, seconds),
+            (seconds,) * 7,
         )
         # The pages too, the ticker's own bookkeeping rows excepted (they
         # are its clock): a tap clears `over:` only when it is later than
@@ -649,7 +649,8 @@ def tap(client, db):
 
 def dose(client, ml, float_ok=1):
     """A manual dose, handed on one report and acked with the meter's count
-    on the next, whose float= says `float_ok`."""
+    on the next, whose float= says `float_ok` — one sighting, which on
+    empty is not yet the word the tank is measured on (still_empty is)."""
     answer = post(client, "/command", f"c=0 water=3 ml={ml}")
     assert answer.status_code == 200, answer.text
     cmd_id = int(answer.text.strip().removeprefix("cmd="))
@@ -658,17 +659,35 @@ def dose(client, ml, float_ok=1):
     report(client, f"c=0 ch0=1 float={float_ok} pos=ok ack={cmd_id} flow_ml={ml}")
 
 
-def learn_the_tank(app, client, db, sent, size):
-    """Two runs of `size` ml, each ended by the float and a flap window
-    apart: the tank is known, and its two announcements are ticked away
-    (they are test_tank_size's subject). Returns the line `over` starts
-    past."""
+def still_empty(client, db):
+    """A flap window on, the float still says empty: the sighting that
+    confirms an earlier one — a dose's ack, a first report of empty — so
+    the firm word drops, far enough from it that the two are the tank's
+    run and not a float flapping at the line, which is the float: rule's
+    subject and would page here."""
+    age(db, FLAP_WINDOW_S + 1)
+    report(client, "c=0 ch0=1 float=0 pos=ok")
+
+
+def full(client):
+    """The float says full, twice: one sighting is not yet the word the
+    tank is measured on, and the rise is the firm word's."""
     report(client, "c=0 ch0=1 float=1 pos=ok")
+    report(client, "c=0 ch0=1 float=1 pos=ok")
+
+
+def learn_the_tank(app, client, db, sent, size):
+    """Two runs of `size` ml, each ended by the float — saying empty on
+    the dose's ack and still a flap window on — and a flap window apart:
+    the tank is known, and its two announcements are ticked away (they
+    are test_tank_size's subject). Returns the line `over` starts past."""
+    full(client)
     for _ in range(TANK_SAMPLES_TO_ARM):
         tap(client, db)
         dose(client, size, float_ok=0)
+        still_empty(client, db)
         age(db, FLAP_WINDOW_S + 1)
-        report(client, "c=0 ch0=1 float=1 pos=ok")
+        full(client)
     assert health(client)["tank_ml"] == size
     tick(app)
     assert [k.split(":")[0] for k in keys(sent)] == ["tank"] * TANK_SAMPLES_TO_ARM
@@ -749,9 +768,10 @@ def test_over_counts_from_the_rise_when_the_float_moved_since_the_tap(
     learn_the_tank(app, client, db, sent, 200)
     tap(client, db)
     dose(client, 150)
-    dose(client, 60, float_ok=0)  # 210: the tank ran down, as a tank does
+    dose(client, 60, float_ok=0)  # 210: the tank ran down, as a tank does...
+    still_empty(client, db)  # ...and said so again
     age(db, FLAP_WINDOW_S + 1)
-    report(client, "c=0 ch0=1 float=1 pos=ok")  # refilled, untapped
+    full(client)  # refilled, untapped
     age(db, 60)
     risen = rise(db)
     assert risen > taps(db)[-1]
@@ -760,13 +780,15 @@ def test_over_counts_from_the_rise_when_the_float_moved_since_the_tap(
     assert entry["pumped_ml"] == 20 and entry["over"] == 0
     tick(app)
     assert [k.split(":")[0] for k in keys(sent)] == ["tank"]  # the run, no over
-    dose(client, 180, float_ok=0)  # 200 since the rise: drained again
+    dose(client, 180, float_ok=0)  # 200 since the rise: drained again...
+    still_empty(client, db)  # ...and said so
+    risen -= FLAP_WINDOW_S + 1  # as it stands after that window
     assert health(client)["tank_samples"] == 3  # the tapped run, not this one
     with sqlite3.connect(db) as con:
         assert butler.counter_origin(con, 0) == (risen, "rise")  # sticky
     assert health(client)["pumped_ml"] == 200
     age(db, FLAP_WINDOW_S + 1)
-    report(client, "c=0 ch0=1 float=1 pos=ok")  # refilled untapped again
+    full(client)  # refilled untapped again
     assert rise(db) > risen - FLAP_WINDOW_S - 1  # a new rise, and the counter restarts
     age(db, 60)
     risen = rise(db)
@@ -838,11 +860,12 @@ def test_over_clears_on_a_tap_and_on_nothing_else(app, client, db, sent):
     tick(app)
     assert keys(sent) == ["over:0"]
     assert health(client)["over"] == 1
-    report(client, "c=0 ch0=1 float=0 pos=ok")  # empty: the run is a sample...
+    report(client, "c=0 ch0=1 float=0 pos=ok")  # empty, and still empty...
+    still_empty(client, db)  # ...a window on: the run is a sample...
     tick(app)  # ...heard with the float at 0, which clears nothing...
     assert alerts(client) == ["over:0"] and health(client)["over"] == 1
     age(db, 60)
-    report(client, "c=0 ch0=1 float=1 pos=ok")  # ...and full again, untapped
+    full(client)  # ...and full again, untapped
     tick(app)
     assert [k for k in keys(sent) if k.startswith("over:")] == ["over:0"]
     assert alerts(client) == ["over:0"]
@@ -854,9 +877,11 @@ def test_over_clears_on_a_tap_and_on_nothing_else(app, client, db, sent):
     run_sql(db, "UPDATE refills SET float_ok = NULL WHERE ts = ?", taps(db)[-1])
     tick(app)
     assert alerts(client) == ["over:0"]
-    # A tap that saw the float, later than the raise: cleared, and that is
-    # all it says — "watering resumes" was untrue on a float at 0.
+    # A tap that saw the float, later than the raise: answered the moment
+    # it lands, cleared on the tick, and that is all it says — "watering
+    # resumes" was untrue on a float at 0.
     refill(client)
+    assert alerts(client) == ["over:0"] and health(client)["over"] == 0
     tick(app)
     assert sent[-1].key == "over:0" and sent[-1].priority == "default"
     assert sent[-1].message == "the tank on board 0 was refilled"
@@ -867,12 +892,13 @@ def test_a_float_that_goes_empty_past_the_size_is_a_float_that_works(
     app, client, db, sent
 ):
     learn_the_tank(app, client, db, sent, 200)
-    since = tap(client, db)
+    tap(client, db)
     dose(client, 150)
     dose(client, 71, float_ok=0)  # 221, and the float said so
     assert health(client)["over"] == 0
+    still_empty(client, db)
     tick(app)
-    assert keys(sent) == [f"tank:0:{since}"]  # a longer run, learned and told
+    assert keys(sent) == [f"tank:0:{taps(db)[-1]}"]  # a longer run, learned and told
     assert health(client)["tank_samples"] == 3
 
 
@@ -892,15 +918,55 @@ def test_over_holds_the_rules_not_the_phone_and_the_tap_is_the_clear(
     dose(client, 50)
     age(db, 60)  # a minute on...
     tap(client, db)  # ...the tap, later than the page
-    assert health(client)["over"] == 1  # until the ticker hears of it
+    # Answered the moment it lands, before the ticker hears of it: the
+    # window is already five dry readings deep, and the next report waters.
+    assert alerts(client) == ["over:0"] and health(client)["over"] == 0
+    assert "cmd=" in dry_reports(client, n=1)
+    assert len(rules_water(db)) == 1
     tick(app)
     assert keys(sent) == ["over:0", "over:0"]
     assert sent[-1].priority == "default"
     assert sent[-1].message == "the tank on board 0 was refilled"
     assert alerts(client) == [] and health(client)["over"] == 0
-    # The window is already five dry readings deep: the next report waters.
+
+
+def test_the_tap_frees_the_rules_before_ntfy_hears_of_it(db, sent):
+    """The ticker clears over: only once ntfy has taken the clear, and
+    ntfy is down as often as anything: the rules and /health honour the
+    tap the moment it lands, as /resume does for the latch, and the
+    ticker still says "was refilled" when it can (spec D6, thrice)."""
+    accepted = [True]
+    app = create_app(
+        db_path=str(db),
+        token=TOKEN,
+        next_s=60,
+        cmd_ttl_s=900,
+        quiet="0-0",
+        send=lambda alert: sent.append(alert) or accepted[0],
+        ping=lambda: True,
+    )
+    client = TestClient(app)
+    make_pot(client, cooldown_h=0, daily_cap_ml=100_000)
+    learn_the_tank(app, client, db, sent, 200)
+    tap(client, db)
+    dose(client, 250)
+    tick(app)
+    assert keys(sent) == ["over:0"]
+    dry_reports(client)
+    assert rules_water(db) == []
+    accepted[0] = False  # ntfy goes down
+    age(db, 60)
+    tap(client, db)
+    assert alerts(client) == ["over:0"] and health(client)["over"] == 0
     assert "cmd=" in dry_reports(client, n=1)
     assert len(rules_water(db)) == 1
+    assert tick(app) is False  # the clear could not be sent...
+    assert alerts(client) == ["over:0"]  # ...so the page stands, unanswered by ntfy...
+    assert health(client)["over"] == 0  # ...and answered all the same
+    accepted[0] = True
+    assert tick(app) is True
+    assert sent[-1].message == "the tank on board 0 was refilled"
+    assert alerts(client) == []
 
 
 def test_over_holds_the_rules_through_a_float_bounce_until_the_tap(
@@ -919,8 +985,9 @@ def test_over_holds_the_rules_through_a_float_bounce_until_the_tap(
     assert keys(sent) == ["over:0"]
     age(db, 60)
     report(client, f"c=0 ch0={DRY} float=0 pos=ok")
+    still_empty(client, db)
     age(db, 60)
-    report(client, f"c=0 ch0={DRY} float=1 pos=ok")  # a bounce, untapped
+    full(client)  # a bounce, untapped
     entry = health(client)
     assert entry["pumped_ml"] == 0  # the counter let go...
     assert entry["over"] == 1  # ...the page did not
@@ -928,6 +995,7 @@ def test_over_holds_the_rules_through_a_float_bounce_until_the_tap(
     assert rules_water(db) == []  # and the rules read the page
     age(db, 60)
     tap(client, db)
+    assert health(client)["over"] == 0
     tick(app)
     assert alerts(client) == [] and health(client)["over"] == 0
     assert "cmd=" in dry_reports(client, n=1)
@@ -1016,11 +1084,12 @@ def test_retiring_a_board_clears_its_over_page(app, client, db, sent):
 
 
 def test_a_tank_still_learning_is_never_over(app, client, db, sent):
-    report(client, "c=0 ch0=1 float=1 pos=ok")
+    full(client)
     tap(client, db)
     dose(client, 200, float_ok=0)  # one sample: the size is not known yet
+    still_empty(client, db)
     age(db, FLAP_WINDOW_S + 1)
-    report(client, "c=0 ch0=1 float=1 pos=ok")
+    full(client)
     tap(client, db)
     dose(client, 250)
     dose(client, 250)  # 500 since the tap, past any size, the float at full

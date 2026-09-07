@@ -355,15 +355,18 @@ ADDED_COLUMNS = (
     # drop after it (stamped, on a tank already empty at the upgrade, from
     # the word's clock: carry_drops, a lambda for the same reason as
     # above), the board's last word on the float with when it last
-    # changed and last rose, and the ch207 of its last report (none yet).
-    # The word and its clocks are carried from float_ok and
+    # changed and last rose, the ch207 of its last report (none yet), and
+    # the firm word — the word two consecutive reports agreed on — with
+    # its clock. The word and its clocks are carried from float_ok and
     # float_since so a tank sitting at full through the upgrade still
-    # closes its sample and its rise is where it was — all three under one
+    # closes its sample and its rise is where it was — all under one
     # gate: a last pre-upgrade report that omitted float= blanked float_ok
     # and restarted float_since, and a clock carried without its word would
     # read as a float that has not moved since before any tap. The rise
     # comes only with a word of full; float_since under a word of empty
-    # is its fall.
+    # is its fall. The firm word is the word, under the same gate: the
+    # upgrade has one report to go on and takes it at its word, rather
+    # than have every board wait a report to be believed.
     Added("refills", "float_ok", "INTEGER"),
     Added("refills", "drop_ts", "INTEGER", carry=lambda con: carry_drops(con)),
     Added("status", "float_word", "INTEGER", "float_ok"),
@@ -372,6 +375,14 @@ ADDED_COLUMNS = (
     ),
     Added("status", "float_rise", "INTEGER", "float_since", gate="float_ok = 1"),
     Added("status", "contra", "INTEGER NOT NULL DEFAULT 0"),
+    Added("status", "float_firm", "INTEGER", "float_word", gate="float_ok IS NOT NULL"),
+    Added(
+        "status",
+        "float_firm_since",
+        "INTEGER",
+        "float_word_since",
+        gate="float_ok IS NOT NULL",
+    ),
 )
 
 
@@ -857,8 +868,6 @@ def latch_steps(reason: str) -> str:
     )
 
 
-
-
 def latch_reason(r: Report, prev_err: str | None) -> str | None:
     """What in this report latches the backend, if anything; `prev_err` is
     the stored status.err before this report. ch207 is a level: the board
@@ -902,20 +911,28 @@ def latest_refill(
 
 
 def base_tap(
-    con: sqlite3.Connection, controller: int
+    con: sqlite3.Connection, controller: int, fell: int | None = None
 ) -> tuple[int, int, int | None] | None:
     """The latest tap that saw the float, (ts, rowid, drop_ts), or None:
-    the base the counter starts from, and the row whose `drop_ts` the
-    first 1 -> 0 of the word after it stamps. A tap whose snapshot is
-    NULL (the rows 0.18.0 left behind, a board that had never said
-    float=) never meant "full to the top": a month of untapped top-ups
-    behind it would become a 12 L sample and a threshold no stuck float
-    ever reaches, so it is no base for anything (spec D3, D4)."""
+    the base the counter starts from. With `fell` — when the word went
+    1 -> 0 — the latest such tap the fall came after, or in whose second
+    it came with the tap having seen full (a tap after the fall snapshots
+    the 0): the row that drop stamps and the run it closes. Not simply
+    the latest: the drop is confirmed a report after the word fell, and a
+    person who filled and tapped between the two sightings made a tap the
+    run did not start from — the sample is the earlier tap's, and the new
+    tap keeps NULL, so the pour reaching the float is not a rise past a
+    drop. A tap whose snapshot is NULL (the rows 0.18.0 left behind, a
+    board that had never said float=) never meant "full to the top": a
+    month of untapped top-ups behind it would become a 12 L sample and a
+    threshold no stuck float ever reaches, so it is no base for anything
+    (spec D2, D3, D4)."""
     row = con.execute(
         "SELECT ts, rowid, drop_ts FROM refills "
         "WHERE controller = ? AND float_ok IS NOT NULL "
+        "AND (? IS NULL OR ts < ? OR (ts = ? AND float_ok = 1)) "
         "ORDER BY ts DESC, rowid DESC LIMIT 1",
-        (controller,),
+        (controller, fell, fell, fell),
     ).fetchone()
     return (row[0], row[1], row[2]) if row else None
 
@@ -941,17 +958,10 @@ def carry_drops(con: sqlite3.Connection) -> None:
         "SELECT controller, float_word_since FROM status "
         "WHERE float_word = 0 AND float_word_since IS NOT NULL"
     ).fetchall():
-        tap = con.execute(
-            "SELECT ts, rowid, float_ok FROM refills WHERE controller = ? "
-            "AND float_ok IS NOT NULL ORDER BY ts DESC, rowid DESC LIMIT 1",
-            (controller,),
-        ).fetchone()
-        if tap is None:
-            continue
-        ts, rowid, saw = tap
-        if fell > ts or (fell == ts and saw == 1):
+        tap = base_tap(con, controller, fell)
+        if tap is not None and tap[2] is None:
             con.execute(
-                "UPDATE refills SET drop_ts = ? WHERE rowid = ?", (fell, rowid)
+                "UPDATE refills SET drop_ts = ? WHERE rowid = ?", (fell, tap[1])
             )
 
 
@@ -973,12 +983,15 @@ def counter_origin(
     refill keeps the rise (float_rise stays where it was) rather than
     falling back to the tap and resurrecting water already sampled. The
     same second is the tap's — a drop and a rise in one second are a
-    float bouncing. The word's own clocks, not float_ok's: a report that
-    omits float= blanks that column and float_since (which the fields:
-    rule wants blanked), and a float that said nothing once neither rose
-    nor fell — the rise it had stands, and none is invented when it
-    speaks again. With no tap the counter is 0 and nothing arms (spec
-    D3)."""
+    float bouncing. Both edges are the firm word's — the word two
+    consecutive reports agreed on, stamped where the word moved once the
+    next report confirmed it — so one report's glitch to 0 neither drops
+    nor, on its recovery, rises. The word's own clocks, not float_ok's:
+    a report that omits float= blanks that column and float_since (which
+    the fields: rule wants blanked), and a float that said nothing once
+    neither rose nor fell — the rise it had stands, and none is invented
+    when it speaks again. With no tap the counter is 0 and nothing arms
+    (spec D3)."""
     tap = base_tap(con, controller)
     if tap is None:
         return None
@@ -1007,19 +1020,21 @@ def tapped_after(con: sqlite3.Connection, controller: int, ts: int) -> bool:
 
 
 def over_stands(con: sqlite3.Connection, controller: int) -> bool:
-    """Whether over:<c> is raised and not yet cleared. The page is the fact
+    """Whether over:<c> is raised, not cleared, and unanswered: no tap
+    that saw the float is later than the raise. The page is the fact
     until a tap answers it, and the rules stay dry on it as /health's
     `over` stays 1 — not on the live predicate alone, which a float
     bouncing 0 -> 1 with nobody tapping lets go of: that is a rise, a
     fresh origin and a counter at 0, and the page was raised on a float
-    presumed stuck at full (spec D6)."""
-    return (
-        con.execute(
-            "SELECT 1 FROM alerts WHERE key = ? AND cleared_ts IS NULL",
-            (f"over:{controller}",),
-        ).fetchone()
-        is not None
-    )
+    presumed stuck at full. The tap answers it here, the moment it lands,
+    as /resume lifts the latch: the ticker clears the row only once ntfy
+    has taken the clear, and ntfy being down must not keep a tank
+    somebody just filled from being watered from (spec D6)."""
+    page = con.execute(
+        "SELECT raised_ts FROM alerts WHERE key = ? AND cleared_ts IS NULL",
+        (f"over:{controller}",),
+    ).fetchone()
+    return page is not None and not tapped_after(con, controller, page[0])
 
 
 def pumped_since(con: sqlite3.Connection, controller: int, since_ts: int) -> int:
@@ -2948,18 +2963,27 @@ def create_app(
             # the edge. A first report has neither: there is no row yet,
             # and it closes nothing.
             prev = con.execute(
-                "SELECT err, float_word FROM status WHERE controller = ?",
+                "SELECT err, float_word, float_firm, float_word_since "
+                "FROM status WHERE controller = ?",
                 (r.controller,),
             ).fetchone()
-            prev_err = prev[0] if prev else None
-            prev_float = prev[1] if prev else None
-            # The tap the float's edge belongs to: the latest one that saw
-            # the float, with whether the word has dropped since it. The
-            # first drop after a tap is stamped on it below and closes its
-            # run; a later one is a second drain after an untapped refill
-            # (spec D3, D4).
-            edge = prev_float == 1 and r.float_ok == 0
-            tap = base_tap(con, r.controller) if edge else None
+            prev_err, prev_word, prev_firm, prev_fell = prev or (None,) * 4
+            # The firm word going 1 -> 0: the word was firmly full, the
+            # last report that carried float= said empty, and so does this
+            # one. One sighting is a glitch by the board's own design (any
+            # of its three samples failing fails the word), and a slosh at
+            # report time must not close a sample early and hand the origin
+            # to its recovery. The tap the drop belongs to is the one the
+            # word fell after (base_tap's `fell`, the word's clock before
+            # this report): a person who filled and tapped between the two
+            # sightings made a tap this run did not start from. The first
+            # drop after a tap is stamped on it below and closes its run —
+            # not under the board's latch, which a ch207=1 report sets
+            # before the stamp is reached — and a later one is a second
+            # drain after an untapped refill (spec D3, D4).
+            edge = prev_firm == 1 and prev_word == 0 and r.float_ok == 0
+            forced = r.channels.get(CONTRA_CHANNEL) == 1
+            tap = base_tap(con, r.controller, prev_fell) if edge else None
             # The latest safety fields, with enough history for the alert
             # rules: when each value last changed (`since`), when each was
             # last sent at all (`seen` — its vanishing is an alarm), and the
@@ -2977,8 +3001,10 @@ def create_app(
                 "INSERT INTO status (controller, ts, float_ok, float_since, "
                 "pos, pos_since, float_seen, pos_seen, float_bad, "
                 "float_bad_prev, pos_bad, pos_bad_prev, err, err_ts, pos_ok_seen, "
-                "float_word, float_word_since, float_rise, contra) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?, ?, ?, ?, ?) "
+                "float_word, float_word_since, float_rise, contra, "
+                "float_firm, float_firm_since) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?, ?, ?, "
+                "NULL, ?, NULL, NULL) "
                 "ON CONFLICT(controller) DO UPDATE SET ts = excluded.ts, "
                 "float_ok = excluded.float_ok, pos = excluded.pos, "
                 "float_since = CASE WHEN status.float_ok IS excluded.float_ok "
@@ -3004,21 +3030,35 @@ def create_app(
                 "pos_ok_seen = CASE WHEN excluded.pos = 'ok' "
                 "THEN excluded.ts ELSE status.pos_ok_seen END, "
                 "float_word = COALESCE(excluded.float_word, status.float_word), "
-                # The word's own clocks, unlike float_since (float_ok's,
+                # The word's own clock, unlike float_since (float_ok's,
                 # which a report that omits float= moves, and the fields:
-                # rule counts from): the one moves on 1 -> 0 and 0 -> 1
-                # and on nothing else, the other on 0 -> 1 alone (the
-                # first word of full included), so the float's latest rise
-                # and its last fall are where they were after a report
-                # that said nothing. ch207 is this report's, absent being
-                # 0: the board's own latch, which it repeats until `clear
-                # contra` is typed.
+                # rule counts from): it moves on 1 -> 0 and 0 -> 1 and on
+                # nothing else, so the float's last move is where it was
+                # after a report that said nothing. The firm word is the
+                # word once this report and the last that carried float=
+                # agree — one sighting is a glitch by the board's own
+                # design — and its clock, like the rise (the firm word
+                # going to 1, the first firm word of full included), is
+                # where the word moved, not where it was confirmed: the
+                # report that raises the word hands its queued dose with
+                # that clock, and the counter must not lose it. Every SET
+                # reads the row before this update, so float_word_since
+                # here is the move the agreement confirms. ch207 is this
+                # report's, absent being 0: the board's own latch, which it
+                # repeats until `clear contra` is typed.
                 "float_word_since = CASE WHEN excluded.float_word IS NULL "
                 "OR status.float_word IS excluded.float_word "
                 "THEN status.float_word_since ELSE excluded.ts END, "
+                "float_firm = CASE WHEN excluded.float_word IS NOT NULL "
+                "AND status.float_word IS excluded.float_word "
+                "THEN excluded.float_word ELSE status.float_firm END, "
+                "float_firm_since = CASE WHEN excluded.float_word IS NOT NULL "
+                "AND status.float_word IS excluded.float_word "
+                "AND status.float_firm IS NOT excluded.float_word "
+                "THEN status.float_word_since ELSE status.float_firm_since END, "
                 "float_rise = CASE WHEN excluded.float_word = 1 "
-                "AND status.float_word IS NOT 1 "
-                "THEN excluded.ts ELSE status.float_rise END, "
+                "AND status.float_word = 1 AND status.float_firm IS NOT 1 "
+                "THEN status.float_word_since ELSE status.float_rise END, "
                 "contra = excluded.contra",
                 (
                     r.controller,
@@ -3036,8 +3076,7 @@ def create_app(
                     now if r.pos == "ok" else None,
                     r.float_ok,
                     now if r.float_ok is not None else None,
-                    now if r.float_ok == 1 else None,
-                    int(r.channels.get(CONTRA_CHANNEL) == 1),
+                    int(forced),
                 ),
             )
             reason = latch_reason(r, prev_err)
@@ -3062,33 +3101,36 @@ def create_app(
                     "WHERE id = ? AND controller = ? AND state = 'sent'",
                     (now, r.flow_ml, r.ack, r.controller),
                 )
-            if tap is not None and tap[2] is None:
-                # The float went empty for the first time since the tap:
-                # stamped on it whatever else is true of this report, so a
-                # rise from here on is a refill nobody said was full and a
-                # later drop is a second drain of it. Then the water the
-                # meter counted since the tap is one measurement of the
-                # tank — after the ack step, because the dose that drained
-                # it acks on this very report. One per tap — a float
-                # bouncing at the line adds nothing after its first
-                # crossing — and nothing on zero: a tank drained by
-                # something the meter never saw is not a measurement.
-                # Nothing either while the board's latch stands — ch207=1
-                # on this very report set it just above, and "float OK,
-                # zero pulses" is a dead meter, a kinked tube or 12 V
-                # absent as often as anything about the tank — or for a
-                # retired board, whose reports still land but which learns
-                # nothing (spec D1, D4).
+            if (
+                tap is not None
+                and tap[2] is None
+                and latch_of(con, r.controller) is None
+            ):
+                # The float went empty for the first time since the tap,
+                # and this report confirms it: stamped on the tap where the
+                # word fell, so a rise from here on is a refill nobody said
+                # was full and a later drop is a second drain of it. Then
+                # the water the meter counted since the tap is one
+                # measurement of the tank — after the ack step, because the
+                # dose that drained it acks on the sighting or on this one.
+                # One per tap — a float bouncing at the line adds nothing
+                # after its first crossing — and nothing on zero: a tank
+                # drained by something the meter never saw is not a
+                # measurement. Neither while the board's latch stands —
+                # ch207=1 on this very report set it just above, a reset
+                # with the pump running set it a report ago — since a
+                # forced 0 is "float OK, zero pulses", a fault and not a
+                # drop, and stamping it let `clear contra` read as a rise
+                # past the drop that laundered the counter and lost the
+                # run's sample; nor a sample for a retired board, whose
+                # reports still land but which learns nothing (spec D1,
+                # D4).
                 since, rowid, _ = tap
                 con.execute(
-                    "UPDATE refills SET drop_ts = ? WHERE rowid = ?", (now, rowid)
+                    "UPDATE refills SET drop_ts = ? WHERE rowid = ?", (prev_fell, rowid)
                 )
                 pumped = pumped_since(con, r.controller, since)
-                if (
-                    pumped > 0
-                    and latch_of(con, r.controller) is None
-                    and not is_retired(con, r.controller)
-                ):
+                if pumped > 0 and not is_retired(con, r.controller):
                     con.execute(
                         "INSERT OR IGNORE INTO tank_samples "
                         "(ts, controller, refill_ts, ml) VALUES (?, ?, ?, ?)",
@@ -3301,15 +3343,18 @@ def create_app(
             )
 
     def record_refill(controller: int) -> int:
-        """The tap means "full to the top". What the float said at that
-        moment goes on the row, NULL for a board that has never sent
-        float= (and then the tap judges nothing), read under the write lock
-        so a report cannot slip between the look and the insert (spec D2)."""
+        """The tap means "full to the top". The board's last real word on
+        the float goes on the row — float_word, not float_ok, which one
+        report that omits float= blanks: a tap made under a row reading
+        "float ?" must not be a tap that counts for nothing — NULL only
+        for a board that has never sent float= (and then the tap judges
+        nothing), read under the write lock so a report cannot slip
+        between the look and the insert (spec D2)."""
         now = int(time.time())
         with connect() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
-                "SELECT float_ok FROM status WHERE controller = ?", (controller,)
+                "SELECT float_word FROM status WHERE controller = ?", (controller,)
             ).fetchone()
             con.execute(
                 "INSERT INTO refills (ts, controller, float_ok) VALUES (?, ?, ?)",
@@ -4040,7 +4085,9 @@ def create_app(
         # presumed stuck, the rules stay dry on it, and a tap later than
         # the page is the only clear — a person who tapped looked at the
         # tank, where the word dropping to 0 is a contra, a flap or an
-        # omitted float= as often as an empty tank. Stuck at empty is
+        # omitted float= as often as an empty tank. The rules and /health
+        # let go the moment the tap lands (over_stands); this is where the
+        # phone hears of it, once ntfy takes the message. Stuck at empty is
         # harmless: the rules are dry on empty already, so it is a page and
         # nothing else, cleared when the float says full. Its `stale:` key
         # is the clock rule's, kept so a page standing from 0.18.0 clears
