@@ -90,17 +90,17 @@ def test_a_command_waits_for_its_own_controller(client, db):
 
 def test_a_report_without_the_ack_expires_the_sent_command(client, db):
     command(client, "c=0 water=3 ml=50 cap_s=30")
-    report(client, "c=0 t=1000 ch0=8000")  # handed here
+    report(client, "c=0 t=1000 ch0=8000")
 
-    answer = report(client, "c=0 t=61000 ch0=8000")  # no ack
+    answer = report(client, "c=0 t=61000 ch0=8000")
     assert "cmd=" not in answer.text
     assert states(db) == {1: "expired"}
 
 
 def test_a_lost_response_expires_the_command_it_carried(client, db):
-    # The board retries the same report when the response is lost; the retry
-    # cannot carry an ack, so the command the lost response carried is gone —
-    # never re-handed, because the board might still be executing a copy.
+    # a retry of a lost-response report can't carry an ack, so the command it
+    # carried is gone for good, never re-handed, since the board might still
+    # be executing a copy of it
     command(client, "c=0 water=3 ml=50 cap_s=30")
     report(client, "c=0 t=1000 ch0=8000")
 
@@ -110,11 +110,8 @@ def test_a_lost_response_expires_the_command_it_carried(client, db):
 
 
 def test_a_retry_of_the_acking_report_is_heard_once(client, db):
-    # The board keeps the body when the response is lost, the ack with
-    # it. The retry is the same report, not the next: answered 200, its
-    # readings stored once, and the command it acked stays acked with the
-    # flow it carried — stamped once, and not expired as one the board
-    # never answered for.
+    # a retry of the same report must be answered 200, its readings stored
+    # once, and the ack it carried applied once, not expired as unanswered
     command(client, "c=0 water=3 ml=50 cap_s=30")
     report(client, "c=0 t=1000 ch0=8000")
     report(client, "c=0 t=61000 ch0=8000 ack=1 flow_ml=48")
@@ -134,7 +131,7 @@ def test_a_retry_of_the_acking_report_is_heard_once(client, db):
 def test_a_late_ack_for_an_expired_command_changes_nothing(client, db):
     command(client, "c=0 water=3 ml=50 cap_s=30")
     report(client, "c=0 t=1000 ch0=8000")
-    report(client, "c=0 t=61000 ch0=8000")  # expires it
+    report(client, "c=0 t=61000 ch0=8000")
 
     report(client, "c=0 t=121000 ch0=8000 ack=1 flow_ml=48")
     assert states(db) == {1: "expired"}
@@ -255,7 +252,6 @@ def test_health_lists_a_configured_but_never_seen_controller(client, db):
 
 
 def test_a_dose_without_a_cap_gets_the_rules_own_cap(client, db):
-    # One owner for the flow constant: the app never copies the formula.
     assert command(client, "c=0 water=3 ml=50").status_code == 200
     handed = report(client, "c=0 ch0=1").text
     assert "cmd=1 water=3 ml=50 cap_s=7" in handed  # 50 // 20 + 5
@@ -306,7 +302,7 @@ def test_a_malformed_interval_is_refused(client, db, body):
 
 def test_the_knob_cannot_let_a_live_board_outlive_the_command_ttl(client, db):
     # next=3600 parses, but with a 900s TTL the board's on-time report would
-    # land after its own command had been swept aside — the double-dose hole.
+    # land after its own command had been swept aside
     answer = interval(client, "c=0 next=3600")
     assert answer.status_code == 400
     assert "BUTLER_CMD_TTL_S" in answer.text

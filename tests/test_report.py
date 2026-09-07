@@ -50,15 +50,10 @@ def pot(client, body):
 
 
 def test_the_controller_is_an_integer_and_zero_is_a_real_board(client, db):
-    """`c=` was free text until 0.17.0, which made it the one field a typo
-    could turn into a whole second garden: a report from "bench1 " opened
-    its own controller row, its own heartbeat and its own alerts, and
-    nothing said the two were the same board.
-
-    Board 0 is the trap inside the trap — it is falsy, and it is the number
-    the app fills in by default, so a `if not controller` check would refuse
-    the commonest board there is.
-    """
+    """A typo in a free-text `c=` could open a second controller row with its
+    own heartbeat and alerts, silently. Board 0 is the trap inside the trap:
+    it is falsy, and the app fills it in by default, so `if not controller`
+    would refuse the commonest board there is."""
     assert post(client, "c=0 ch0=8000").status_code == 200
     with sqlite3.connect(db) as con:
         assert con.execute("SELECT controller FROM readings").fetchone() == (0,)
@@ -91,15 +86,13 @@ def test_a_controller_that_is_not_a_number_is_refused(client, db, body, why):
 def test_a_reading_carries_the_pot_that_was_on_that_channel(client, db):
     basil = pot(client, "name=basil controller=0 channel=0")
     post(client, REPORT)
-    # ch0 is basil's; ch1 and ch2 are sockets nobody has claimed, and NULL
-    # is the honest answer for them rather than a gap to fill in later.
+    # ch1 and ch2 are sockets nobody has claimed: NULL is the honest answer
     assert stamps(db) == [(0, basil), (1, None), (2, None)]
 
 
 def test_a_remap_changes_what_is_stamped_next_and_leaves_the_past_alone(client, db):
-    """The whole point of stamping: a plant moved to another socket takes
-    its old readings with it, and the pot that arrives on the socket it
-    left does not inherit them."""
+    """A plant moved to another socket takes its old readings with it, and
+    the pot that arrives on the socket it left does not inherit them."""
     basil = pot(client, "name=basil controller=0 channel=0")
     post(client, "c=0 t=1\nch0=8000\n")
     pot(client, f"id={basil} channel=1")
@@ -110,8 +103,8 @@ def test_a_remap_changes_what_is_stamped_next_and_leaves_the_past_alone(client, 
 
 
 def test_a_buried_pots_channel_stamps_nobody(client, db):
-    """Burying a pot closes its window, and the socket goes back to the
-    garden — so a reading that arrives afterwards belongs to no plant."""
+    """Burying a pot closes its window, so a reading that arrives on that
+    socket afterwards belongs to no plant."""
     basil = pot(client, "name=basil controller=0 channel=0")
     post(client, "c=0 t=1\nch0=8000\n")
     client.post(
@@ -123,8 +116,8 @@ def test_a_buried_pots_channel_stamps_nobody(client, db):
 
 
 def test_a_retry_still_dedups_when_nothing_is_mapped(client, db):
-    """The dedup probe is on (controller, t) and has nothing to do with
-    pots: an unmapped board must not write its readings twice."""
+    """The dedup probe is on (controller, t), not on pots: an unmapped
+    board must not write its readings twice."""
     post(client, REPORT)
     post(client, REPORT)
     assert len(stamps(db)) == 3
@@ -176,8 +169,7 @@ def test_reports_append_and_health_counts_them(client, db):
 
 
 def test_health_reports_the_default_interval_not_an_override(db):
-    # The app assumes this interval instead of its own hard-coded 60, so the
-    # suite must tell a literal from the configured value.
+    # a non-default next_s, to tell the configured value from the code's own literal
     client = TestClient(
         create_app(db_path=str(db), token=TOKEN, next_s=45, cmd_ttl_s=900)
     )
@@ -234,9 +226,9 @@ def test_a_missing_token_header_stores_nothing(client, db):
 
 
 def test_a_non_ascii_token_is_a_401_not_a_500(client, db):
-    # Bytes, because that is what actually happens: h11 lets obs-text header
-    # bytes through and the ASGI layer decodes them latin-1, so the handler
-    # sees a non-ASCII str. compare_digest on str would 500 on it.
+    # h11 lets obs-text header bytes through and the ASGI layer decodes them
+    # latin-1, so the handler sees a non-ASCII str; compare_digest on that
+    # would 500 rather than 401.
     answer = client.post(
         "/report", content=REPORT, headers={"X-Token": "sécret".encode("latin-1")}
     )
@@ -313,9 +305,8 @@ def test_a_malformed_interval_refuses_with_its_name_not_a_traceback(db, monkeypa
 
 
 def test_a_data_path_without_a_data_mount_refuses_to_serve():
-    # On any machine where /data is not a mountpoint — every laptop, and a
-    # container whose bind mount was forgotten — the default path must refuse
-    # rather than quietly keep readings in a layer that dies with the container.
+    # a container whose bind mount was forgotten must refuse rather than
+    # quietly keep readings in a layer that dies with the container
     with pytest.raises(ValueError, match="/data"):
         create_app(db_path="/data/butler.db", token=TOKEN)
 
