@@ -927,10 +927,11 @@ def pumped_since(con: sqlite3.Connection, controller: int, since_ts: int) -> int
 
 
 def tank_median(samples: list[int]) -> int | None:
-    """The size a run of samples says, oldest last: the median of the last
-    TANK_MEDIAN_OF, None until TANK_SAMPLES_TO_ARM. A median, not a mean,
-    so one tap that was not a fill moves the number little; of two, their
-    mean, which is fine (spec D5)."""
+    """The size a run of samples says, oldest first as tank_history hands
+    them: the median of the last TANK_MEDIAN_OF, None until
+    TANK_SAMPLES_TO_ARM. A median, not a mean, so one tap that was not a
+    fill moves the number little; of two, their mean, which is fine (spec
+    D5)."""
     last = sorted(samples[-TANK_MEDIAN_OF:])
     if len(last) < TANK_SAMPLES_TO_ARM:
         return None

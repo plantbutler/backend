@@ -474,13 +474,26 @@ def test_a_first_report_has_no_previous_float_and_closes_nothing(client, db):
 
 
 def test_a_report_without_float_hides_no_edge(client, db):
+    """The edge is read off the board's last real word: a report that omits
+    float= neither hides the crossing after it nor is one itself. Were
+    silence an edge, a heartbeat mid-dose would close the sample at the
+    water so far, and the true crossing's count would be dropped on the
+    tap's key (spec D4)."""
     report(client, "c=0 ch0=1 float=1")
     tap(client, db)
     dose(client, 100, flow=90)
-    report(client, "c=0 ch0=1")  # says nothing about the float
+    answer = post(client, "/command", "c=0 water=3 ml=50")
+    assert answer.status_code == 200, answer.text
+    cmd_id = int(answer.text.strip().removeprefix("cmd="))
+    # A report that says nothing about the float hands the dose...
+    handed = report(client, "c=0 ch0=1 pos=ok").text
+    assert f"cmd={cmd_id} water=3 ml=50" in handed
     assert run_sql(db, "SELECT float_ok, float_word FROM status") == [(None, 1)]
-    report(client, "c=0 ch0=1 float=0")  # full, silent, empty: an edge
-    assert samples(db) == [(taps(db)[0], 90)]
+    assert samples(db) == []  # ...and closes nothing: silence is not empty
+    # Full, silent, empty is an edge, and the run it closes is the whole
+    # run: the dose in flight through the silence acks on this report.
+    ack(client, cmd_id, flow=40, float_ok=0)
+    assert samples(db) == [(taps(db)[0], 130)]
     # Empty, silent, empty is not one, whatever the counter says.
     since = tap(client, db)
     run_sql(
@@ -493,7 +506,7 @@ def test_a_report_without_float_hides_no_edge(client, db):
     report(client, "c=0 ch0=1")
     report(client, "c=0 ch0=1 float=0")
     first, _second = taps(db)
-    assert samples(db) == [(first, 90)]
+    assert samples(db) == [(first, 130)]
 
 
 def test_a_retired_board_learns_nothing(client, db):
