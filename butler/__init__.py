@@ -20,14 +20,10 @@ thing here. `fake_device.py` drives the whole wire without a board, and
 import asyncio
 import contextlib
 import hmac
-import json
-import os
 import sqlite3
 import sys
 import time
 from collections.abc import Callable
-from pathlib import Path
-from urllib.parse import quote, urlencode
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
@@ -60,6 +56,15 @@ from .band import (
     kind_for,
     size_shifts,
     target_band,
+)
+from .care import (
+    care_for,
+    care_note,
+    cached_care,
+    look_up,
+    miss_note,
+    search_for,
+    taxon_for,
 )
 from .config import Config, configure, env_int
 from .constants import (
@@ -154,7 +159,15 @@ from .species import (
     read_trefle,
     sole_match,
 )
-
+from .store import (
+    connect,
+    forget_photo,
+    keep_photo,
+    photo_blob,
+    photo_path,
+    photo_rows,
+    write_new_file,
+)
 from .tank import (
     Latched,
     Retired,
@@ -215,17 +228,6 @@ from .wire import (
 # The container installs no package — it copies this one beside fastapi and
 # runs it — so the version lives here. A test holds it to pyproject.toml.
 VERSION = "0.20.0"
-
-
-def write_new_file(path: Path, blob: bytes) -> None:
-    """Create `path` with `blob`, refusing to overwrite it.
-
-    O_EXCL, so claiming a name and finding it taken is one atomic step: a
-    photograph's id is also its filename, and overwriting would destroy an
-    earlier picture whose row would then point at nothing.
-    """
-    with open(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY), "wb") as f:
-        f.write(blob)
 
 
 def moisture_pct(raw: int, dry_raw: int | None, wet_raw: int | None) -> int | None:
@@ -311,344 +313,6 @@ def create_app(
         if named:
             print(f"named {named} standing latch(es)", file=sys.stderr)
 
-    def connect() -> sqlite3.Connection:
-        con = sqlite3.connect(db, timeout=5)
-        con.execute("PRAGMA journal_mode=WAL")
-        return con
-
-    def photo_path(pot_id: str, photo_id: str) -> Path:
-        """Where one picture's bytes live. One directory per pot, so the
-        volume stays readable by a person with a file browser and a backup
-        of one pot is a directory.
-
-        Both halves are re-checked here rather than trusted from wherever
-        they came: this is the only function that turns an id into a path,
-        so it is the only place a traversal could get in.
-        """
-        if not SAFE_ID.fullmatch(pot_id) or not SAFE_ID.fullmatch(photo_id):
-            raise ValueError("not an id")
-        return photos / pot_id / f"{photo_id}.jpg"
-
-    def keep_photo(
-        pot_id: str, blob: bytes, w: int | None, h: int | None, now: int
-    ) -> str:
-        """The bytes, then the row. Returns the new photograph's id.
-
-        A crash between the two leaves a file no row knows about, which
-        nothing lists and nothing serves; the other order would leave a row
-        whose picture never existed and which the strip would show as missing
-        for ever. Neither connection is held across the disk write — a
-        photograph is megabytes over a NAS volume, and a write transaction
-        held that long is the board's reports blocked.
-
-        The id is claimed by creating its file exclusively, and a taken one is
-        tried again. Overwriting first and finding out from the INSERT would
-        destroy the picture already at that path, leaving its committed row
-        pointing at nothing. A collision comes two ways — the file is there,
-        or only the row is — and both must fall out the same way.
-        """
-        with connect() as con:
-            row = con.execute(
-                "SELECT species FROM pots WHERE id = ?", (pot_id,)
-            ).fetchone()
-        if row is None:
-            raise ValueError(f"no such pot: {pot_id}")
-        for _ in range(PHOTO_ID_TRIES):
-            photo_id = new_photo_id()
-            path = photo_path(pot_id, photo_id)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                write_new_file(path, blob)
-            except FileExistsError:
-                continue
-            try:
-                with connect() as con:
-                    con.execute(
-                        "INSERT INTO photos (id, pot_id, ts, bytes, w, h, species) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (photo_id, pot_id, now, len(blob), w, h, row[0]),
-                    )
-            except sqlite3.IntegrityError:
-                # The row is there and its file was not: the id belongs to
-                # a photograph whose bytes were lost. Leave that row alone
-                # and take another id.
-                path.unlink(missing_ok=True)
-                continue
-            except Exception:
-                path.unlink(missing_ok=True)
-                raise
-            return photo_id
-        raise sqlite3.IntegrityError(
-            f"could not mint a free photograph id in {PHOTO_ID_TRIES} tries"
-        )
-
-    def photo_rows(pot_id: str, limit: int) -> list[dict]:
-        """One pot's strip, newest first, straight from the rows.
-
-        `missing` is the one thing the disk is asked: a row whose file has
-        gone — a half-restored backup, a volume that came back empty — is
-        listed and said to be missing rather than served as a picture that
-        will not load.
-        """
-        with connect() as con:
-            rows = con.execute(
-                "SELECT id, ts, bytes, w, h, species FROM photos "
-                "WHERE pot_id = ? ORDER BY ts DESC, rowid DESC LIMIT ?",
-                (pot_id, limit),
-            ).fetchall()
-        return [
-            {
-                "id": photo_id,
-                "ts": ts,
-                "bytes": size,
-                "w": w,
-                "h": h,
-                "species": species,
-                "missing": not photo_path(pot_id, photo_id).exists(),
-            }
-            for photo_id, ts, size, w, h, species in rows
-        ]
-
-    def photo_blob(photo_id: str) -> bytes:
-        """The picture itself, found through its row and never through the
-        directory: a file nothing here minted is not reachable by guessing
-        its name."""
-        with connect() as con:
-            row = con.execute(
-                "SELECT pot_id FROM photos WHERE id = ?", (photo_id,)
-            ).fetchone()
-        if row is None:
-            raise ValueError(f"no such photo: {photo_id}")
-        try:
-            return photo_path(row[0], photo_id).read_bytes()
-        except OSError:
-            raise ValueError(f"{photo_id} is listed but its file is gone") from None
-
-    def forget_photo(photo_id: str) -> None:
-        """The row, then the file — the opposite order to keeping one, and for
-        the same reason: whichever way a crash lands, what is left over is a
-        file nobody knows about rather than a row nobody can show. The person
-        said the picture is gone, so it leaves the listing even if the volume
-        refuses to give up the bytes."""
-        with connect() as con:
-            row = con.execute(
-                "SELECT pot_id FROM photos WHERE id = ?", (photo_id,)
-            ).fetchone()
-            if row is None:
-                raise ValueError(f"no such photo: {photo_id}")
-            # The DELETE decides, not the SELECT before it: two deletes of one
-            # photograph can both see the row — a bare SELECT takes no lock —
-            # and only the one that removed it may answer ok.
-            if con.execute("DELETE FROM photos WHERE id = ?", (photo_id,)).rowcount == 0:
-                raise ValueError(f"no such photo: {photo_id}")
-        with contextlib.suppress(OSError):
-            photo_path(row[0], photo_id).unlink(missing_ok=True)
-
-    def taxon_for(query: str, now: int) -> Taxon | None:
-        """The accepted binomial for what somebody typed, cached.
-
-        None means the name service could not be asked — which is not the
-        same as "no such plant" and must not be written down as one.
-
-        No database connection is held across the fetch, here or below. The
-        first write in a connection opens sqlite's write transaction, and
-        holding one for the length of three HTTP timeouts would make every
-        board report in that window answer "try again": somebody typing a
-        plant's name must not be able to stop the garden reporting.
-        """
-        with connect() as con:
-            row = con.execute(
-                "SELECT accepted, rank, matched, fetched_ts, family "
-                "FROM species_names WHERE query = ?",
-                (query,),
-            ).fetchone()
-        # A hit is kept for ever only when it is COMPLETE: a row that resolved
-        # a name but carries no family can suggest no plant kind, and a cache
-        # hit never re-asks, so without this it would suggest nothing for the
-        # life of the database. Re-asking is TTL-gated, so a name that really
-        # has no family costs one call a month, not one per screen open.
-        fresh = row and now - row[3] < CARE_MISS_TTL_S
-        complete = row and row[0] is not None and row[4] is not None
-        if row and (complete or fresh):
-            return Taxon(row[0], row[1], row[2], row[4])
-        payload = get_json(
-            f"{GBIF_MATCH_URL}?{urlencode({'name': binomial_case(query)})}"
-        )
-        if payload is None:
-            # A re-ask that cannot reach GBIF must not turn a name that
-            # resolved yesterday into "the lookup is not answering".
-            return Taxon(row[0], row[1], row[2], row[4]) if row and row[0] else None
-        taxon = read_gbif(payload)
-        with connect() as con:
-            con.execute(
-                "INSERT OR REPLACE INTO species_names "
-                "(query, fetched_ts, accepted, rank, matched, family) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (query, now, taxon.accepted, taxon.rank, taxon.matched, taxon.family),
-            )
-        return taxon
-
-    def cached_care(con: sqlite3.Connection, key: str) -> dict | None:
-        row = con.execute(
-            "SELECT fetched_ts, source, found, "
-            f"{', '.join(CARE_KEYS)} FROM species_care WHERE species = ?",
-            (key,),
-        ).fetchone()
-        if not row:
-            return None
-        entry = {"fetched": row[0], "source": row[1], "found": bool(row[2])}
-        entry.update(zip(CARE_KEYS, row[3:]))
-        return entry
-
-    def care_for(accepted: str, now: int) -> dict | None:
-        """What the care source says about one binomial, cached.
-
-        A miss is cached too — Trefle's houseplant coverage is empty, not
-        thin, so "nothing known" is the ordinary answer and re-asking it on
-        every screen open would be the bug. None means it could not be
-        asked at all: no token configured, or the source is not answering.
-        """
-        key = normalise_species(accepted)
-        with connect() as con:
-            entry = cached_care(con, key)
-        if entry and (entry["found"] or now - entry["fetched"] < CARE_MISS_TTL_S):
-            return entry
-        if not care_token:
-            return None
-        found = get_json(
-            f"{TREFLE_BASE}/species/search?"
-            f"{urlencode({'q': accepted, 'token': care_token})}"
-        )
-        if found is None:
-            return None
-        slug = pick_species(found, key)
-        care = dict.fromkeys(CARE_KEYS)
-        if slug:
-            detail = get_json(
-                f"{TREFLE_BASE}/species/{quote(slug, safe='')}?"
-                f"{urlencode({'token': care_token})}"
-            )
-            if detail is None:
-                return None
-            care = read_trefle(detail)
-        with connect() as con:
-            con.execute(
-                "INSERT OR REPLACE INTO species_care "
-                f"(species, fetched_ts, source, found, {', '.join(CARE_KEYS)}) "
-                f"VALUES (?, ?, 'trefle', ?, {', '.join('?' * len(CARE_KEYS))})",
-                (key, now, int(bool(slug)), *(care[k] for k in CARE_KEYS)),
-            )
-        return {"fetched": now, "source": "trefle", "found": bool(slug), **care}
-
-    def search_for(query: str, now: int) -> list[dict]:
-        """Trefle's own search on what was typed, cached.
-
-        This is the fuzzy half. GBIF only knows scientific names, so "basil",
-        "basilico" and "tomatoe" resolve to nothing there; Trefle's search
-        matches common names, survives a typo, and its rows already carry a
-        picture — which is what lets somebody confirm by eye rather than by
-        spelling. An empty list is both "nothing found" and "could not ask":
-        the screen is the same either way, a list with nothing in it.
-        """
-        with connect() as con:
-            row = con.execute(
-                "SELECT fetched_ts, candidates FROM species_search WHERE query = ?",
-                (query,),
-            ).fetchone()
-        if row:
-            cached = json.loads(row[1])
-            if cached or now - row[0] < CARE_MISS_TTL_S:
-                return cached
-        if not care_token:
-            return []
-        payload = get_json(
-            f"{TREFLE_BASE}/species/search?"
-            f"{urlencode({'q': query, 'token': care_token})}"
-        )
-        if payload is None:
-            return []
-        candidates = read_candidates(payload)
-        with connect() as con:
-            con.execute(
-                "INSERT OR REPLACE INTO species_search "
-                "(query, fetched_ts, candidates) VALUES (?, ?, ?)",
-                (query, now, json.dumps(candidates)),
-            )
-        return candidates
-
-    def care_note(accepted: str, matched: str, care: dict) -> str:
-        if care["light"] is None and care["humidity"] is None:
-            note = f"Trefle knows {accepted} but has no numbers for it"
-        else:
-            note = f"Trefle: {accepted}"
-        return f"read as {accepted}. {note}" if matched == "fuzzy" else note
-
-    def miss_note(answer: dict) -> str:
-        if answer["candidates"]:
-            return "not sure which one — pick the plant you recognise"
-        if answer["matched"] == "unavailable":
-            return "the lookup is not answering — type the numbers in"
-        if answer["matched"] == "genus":
-            return "that is a genus — which species?"
-        if answer["accepted"] is None:
-            return "no plant of that name — check the spelling, or type the numbers in"
-        if answer["care"] is None:
-            return "no care source configured or answering — type the numbers in"
-        return f"{answer['accepted']} is not in Trefle — type the numbers in"
-
-    def look_up(query: str, depth: int = 0) -> dict:
-        """One species lookup, and a sentence saying what came of it.
-
-        Three ways in, in order of how much they can be trusted. GBIF on the
-        typing resolves a scientific name, corrects a typo in one, and
-        redirects a synonym to the name the plant was renamed to. Failing
-        that, Trefle's search takes the typing as a common name and answers
-        with pictures. And if exactly one of those pictures is called what
-        was typed, that is not a guess and is followed.
-
-        Every unhappy path ends in a working screen: the numbers are typed
-        in, which is what happens for most houseplants anyway.
-        """
-        now = int(time.time())
-        taxon = taxon_for(query, now)
-        answer = {
-            "query": query,
-            "matched": "unavailable",
-            "accepted": None,
-            "rank": None,
-            "kind": None,
-            "care": None,
-            "candidates": [],
-            "note": "",
-        }
-        if taxon is not None:
-            answer["matched"] = taxon.matched
-            answer["accepted"] = taxon.accepted
-            answer["rank"] = taxon.rank
-            answer["kind"] = kind_for(taxon.accepted, taxon.family)
-            if taxon.accepted:
-                answer["care"] = care_for(taxon.accepted, now)
-                care = answer["care"]
-                if care is not None and care["found"]:
-                    answer["note"] = care_note(taxon.accepted, taxon.matched, care)
-                    return answer
-                # A name GBIF resolved and Trefle has never heard of is a
-                # finished answer, not a reason to go offering other plants:
-                # the shortlist is for a name nobody could place at all.
-                answer["note"] = miss_note(answer)
-                return answer
-        candidates = search_for(query, now)
-        pick = sole_match(candidates, query)
-        if pick and depth == 0 and normalise_species(pick) != query:
-            deeper = look_up(normalise_species(pick), depth + 1)
-            if deeper["accepted"]:
-                deeper["query"] = query
-                deeper["matched"] = "common"
-                return deeper
-        answer["candidates"] = candidates
-        answer["note"] = miss_note(answer)
-        return answer
-
     def advice_for(con: sqlite3.Connection, entry: dict, now: int) -> dict | None:
         """The band this pot would be offered, or None when there is nothing
         to say: the pot is off, it already holds those numbers, or the
@@ -676,7 +340,7 @@ def create_app(
 
     def dismiss_advice(pot_id: str, kind: str) -> None:
         now = int(time.time())
-        with connect() as con:
+        with connect(db) as con:
             row = con.execute(
                 "SELECT id, plant_type, soil, pot_diameter_cm, plant_height_cm, "
                 "target_low_pct, target_high_pct FROM pots_now WHERE id = ?",
@@ -875,7 +539,7 @@ def create_app(
         command the rules queue here rides out on this very response: the
         safety fields it was judged on are from this same report."""
         now = int(time.time())
-        with connect() as con:
+        with connect(db) as con:
             con.execute("BEGIN IMMEDIATE")  # writers serialize up front
             con.execute(
                 "INSERT INTO controllers (controller, last_seen) VALUES (?, ?) "
@@ -1182,7 +846,7 @@ def create_app(
         """Fill the slot or report who holds it. The TTL backstop runs here
         too, so a dead board's abandoned command cannot wedge the slot."""
         now = int(time.time())
-        with connect() as con:
+        with connect(db) as con:
             con.execute("BEGIN IMMEDIATE")
             con.execute(
                 "UPDATE commands SET state = 'expired' "
@@ -1230,7 +894,7 @@ def create_app(
             return cmd_id, None
 
     def set_interval(controller: str, value: int) -> int:
-        with connect() as con:
+        with connect(db) as con:
             con.execute("BEGIN IMMEDIATE")
             con.execute(
                 "INSERT INTO controllers (controller, last_seen, next_s) "
@@ -1253,7 +917,7 @@ def create_app(
         row itself stays: nobody checked that tank, and the board comes back
         with it."""
         now = int(time.time())
-        with connect() as con:
+        with connect(db) as con:
             con.execute("BEGIN IMMEDIATE")
             con.execute(
                 "INSERT INTO controllers (controller, last_seen, retired) "
@@ -1289,7 +953,7 @@ def create_app(
         page together, so /health and the phone agree the moment it answers;
         idempotent on a board that was not latched."""
         now = int(time.time())
-        with connect() as con:
+        with connect(db) as con:
             con.execute("BEGIN IMMEDIATE")
             con.execute(
                 "UPDATE status SET latched_ts = NULL, latch_reason = NULL "
@@ -1315,7 +979,7 @@ def create_app(
         so the rules, /health and the phone let go the moment it lands.
         """
         now = int(time.time())
-        with connect() as con:
+        with connect(db) as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
                 "SELECT float_word FROM status WHERE controller = ?", (controller,)
@@ -1387,7 +1051,7 @@ def create_app(
         wrong". commands.id is AUTOINCREMENT so no id is handed out twice,
         which is the belt to this pair of braces.
         """
-        with connect() as con:
+        with connect(db) as con:
             con.execute("BEGIN IMMEDIATE")
             photo_ids = [
                 row[0]
@@ -1439,7 +1103,7 @@ def create_app(
         # so the row goes first and the bytes follow, never the other way.
         for photo_id in photo_ids:
             with contextlib.suppress(OSError):
-                photo_path(pot_id, photo_id).unlink(missing_ok=True)
+                photo_path(photos, pot_id, photo_id).unlink(missing_ok=True)
         # rmdir, not rmtree: the directory is not the truth, and a tree
         # delete would take bytes belonging to rows this transaction never
         # selected — including one the keep_photo race can create.
@@ -1461,7 +1125,7 @@ def create_app(
         """
         pot_id = fields.get("id")
         now = int(time.time())
-        with connect() as con:
+        with connect(db) as con:
             con.execute("BEGIN IMMEDIATE")
             if pot_id is not None:
                 row = con.execute(
@@ -1649,7 +1313,7 @@ def create_app(
         a human.
         """
         now = int(time.time())
-        with connect() as con:
+        with connect(db) as con:
             con.execute("BEGIN IMMEDIATE")
             # The proposal-TTL sweep normally runs on the controller's own
             # reports; a board gone dark never sweeps, so enforce the TTL
@@ -1694,7 +1358,7 @@ def create_app(
     def record_verdict(cmd_id: int, verdict: str) -> None:
         """One human judgement per executed dose; a re-verdict replaces."""
         now = int(time.time())
-        with connect() as con:
+        with connect(db) as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
                 "SELECT sent_ts FROM commands WHERE id = ?", (cmd_id,)
@@ -1710,7 +1374,7 @@ def create_app(
     started = int(time.time())
     observed = {"since": started, "last_tick": None}
     up_sent = False
-    with connect() as con:
+    with connect(db) as con:
         prior = con.execute(
             "SELECT raised_ts, detail FROM alerts WHERE key = 'meta:tick'"
         ).fetchone()
@@ -2397,7 +2061,7 @@ def create_app(
         if observed["last_tick"] is not None and now - observed["last_tick"] > 3 * beat:
             observed["since"] = now  # the butler was away, not the boards
         observed["last_tick"] = now
-        with connect() as con:
+        with connect(db) as con:
             con.execute("BEGIN IMMEDIATE")
             # The observation window survives short restarts through this
             # row (read back in create_app): a crash-looping butler must not
@@ -2408,7 +2072,7 @@ def create_app(
                 "VALUES ('meta:tick', ?, NULL, ?)",
                 (now, str(observed["since"])),
             )
-        with connect() as con:
+        with connect(db) as con:
             pending = evaluate(con, now, observed["since"])
         ok = True
         attempted = False
@@ -2418,7 +2082,7 @@ def create_app(
                 if not send(alert):
                     ok = False
                     break
-            with connect() as con:
+            with connect(db) as con:
                 con.execute("BEGIN IMMEDIATE")
                 alert.record(con)
         if ok and not up_sent and now - started >= UP_AFTER_S:
@@ -2428,7 +2092,7 @@ def create_app(
             # typo'd topic is a permanent, undetectable alert blackout:
             # ntfy answers 200 on any topic, and a healthy garden is also
             # silent.
-            with connect() as con:
+            with connect(db) as con:
                 (raised_count,) = con.execute(
                     f"SELECT COUNT(*) FROM alerts WHERE {RAISED_SQL}"
                 ).fetchone()
@@ -2447,7 +2111,7 @@ def create_app(
                 attempted = True
                 if send(probe_alert):
                     up_sent = True
-                    with connect() as con:
+                    with connect(db) as con:
                         con.execute("BEGIN IMMEDIATE")
                         con.execute(
                             "INSERT OR REPLACE INTO alerts "
@@ -2726,7 +2390,7 @@ def create_app(
     @app.get("/pots")
     def pots():
         try:
-            with connect() as con:
+            with connect(db) as con:
                 garden = []
                 for row in con.execute(
                     f"SELECT {', '.join(POT_COLUMNS)} FROM pots_now ORDER BY name"
@@ -2859,7 +2523,7 @@ def create_app(
         try:
             # In the threadpool: two HTTP hops with their own timeouts have
             # no business on the event loop, and neither has the disk.
-            answer = await run_in_threadpool(look_up, query)
+            answer = await run_in_threadpool(look_up, db, get_json, care_token, query)
         except sqlite3.OperationalError as why:
             return PlainTextResponse(f"try again: {why}\n", status_code=503)
         return JSONResponse(answer)
@@ -2952,7 +2616,7 @@ def create_app(
             )
             args = (pot_id, *cursor, limit)
         try:
-            with connect() as con:
+            with connect(db) as con:
                 rows = [dict(zip(DOSE_KEYS, row)) for row in con.execute(sql, args)]
         except sqlite3.OperationalError as why:
             return PlainTextResponse(f"try again: {why}\n", status_code=503)
@@ -2983,7 +2647,7 @@ def create_app(
         # bucket is whole instead of a partial that wobbles with the clock.
         since = (now - hours * 3600) // bucket_s * bucket_s
         try:
-            with connect() as con:
+            with connect(db) as con:
                 points = [
                     {"ts": bucket, "raw": round(avg), "lo": lo, "hi": hi, "n": n}
                     for bucket, avg, lo, hi, n in con.execute(
@@ -3031,7 +2695,9 @@ def create_app(
             )
         now = int(time.time())
         try:
-            photo_id = await run_in_threadpool(keep_photo, pot_id, body, w, h, now)
+            photo_id = await run_in_threadpool(
+                keep_photo, db, photos, pot_id, body, w, h, now
+            )
         except ValueError as why:
             return PlainTextResponse(f"refused: {why}\n", status_code=400)
         except sqlite3.IntegrityError as why:
@@ -3063,7 +2729,7 @@ def create_app(
         except ValueError as why:
             return PlainTextResponse(f"refused: {why}\n", status_code=400)
         try:
-            rows = photo_rows(pot_id, limit)
+            rows = photo_rows(db, photos, pot_id, limit)
         except sqlite3.OperationalError as why:
             return PlainTextResponse(f"try again: {why}\n", status_code=503)
         return JSONResponse(
@@ -3085,7 +2751,7 @@ def create_app(
         if not SAFE_ID.fullmatch(photo_id):
             return PlainTextResponse("refused: not a photo id\n", status_code=400)
         try:
-            blob = await run_in_threadpool(photo_blob, photo_id)
+            blob = await run_in_threadpool(photo_blob, db, photos, photo_id)
         except ValueError as why:
             return PlainTextResponse(f"refused: {why}\n", status_code=404)
         except sqlite3.OperationalError as why:
@@ -3118,7 +2784,7 @@ def create_app(
         except (UnicodeDecodeError, ValueError) as why:
             return PlainTextResponse(f"refused: {why}\n", status_code=400)
         try:
-            await run_in_threadpool(forget_photo, photo_id)
+            await run_in_threadpool(forget_photo, db, photos, photo_id)
         except ValueError as why:
             return PlainTextResponse(f"refused: {why}\n", status_code=400)
         except sqlite3.OperationalError as why:
@@ -3146,7 +2812,7 @@ def create_app(
     @app.get("/health")
     def health():
         try:
-            with connect() as con:
+            with connect(db) as con:
                 count, last = con.execute(
                     "SELECT COUNT(*), MAX(ts) FROM readings"
                 ).fetchone()

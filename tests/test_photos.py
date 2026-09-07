@@ -299,14 +299,17 @@ def test_a_failed_row_write_takes_its_file_with_it(client, db, photos, monkeypat
     while the file is on disk and the row that was about to point at it
     never lands."""
     pot = make_pot(client)
-    real = butler.write_new_file
+    real = butler.store.write_new_file
 
     def then_break(path, blob):
         real(path, blob)
         with sqlite3.connect(db) as con:
             con.execute("DROP TABLE photos")
 
-    monkeypatch.setattr(butler, "write_new_file", then_break)
+    # On the module that owns it: keep_photo calls write_new_file from
+    # store's own globals, so patching the name butler re-exports would
+    # not reach it.
+    monkeypatch.setattr(butler.store, "write_new_file", then_break)
     answer = upload(client, pot)
     monkeypatch.undo()
     assert answer.status_code == 503, answer.text
@@ -363,7 +366,7 @@ def test_the_write_lock_is_not_held_across_the_disk_write(client, db, monkeypatc
     to disk between two short connections, not inside one, or a board
     report landing mid-upload would get "try again"."""
     wrote = []
-    real = butler.write_new_file
+    real = butler.store.write_new_file
 
     def slow(path, blob):
         # a writer with a short timeout, which fails outright if the lock is held
@@ -376,7 +379,7 @@ def test_the_write_lock_is_not_held_across_the_disk_write(client, db, monkeypatc
         real(path, blob)
 
     pot = make_pot(client)
-    monkeypatch.setattr(butler, "write_new_file", slow)
+    monkeypatch.setattr(butler.store, "write_new_file", slow)
     answer = upload(client, pot)
     monkeypatch.undo()
     assert answer.status_code == 200, answer.text
@@ -443,7 +446,7 @@ def test_a_taken_id_is_given_up_rather_than_overwritten(client, photos, monkeypa
     path, an earlier photograph whose row would then point at nothing."""
     pot = make_pot(client)
     minted = iter(["photo-aaaaaaaa", "photo-aaaaaaaa", "photo-bbbbbbbb"])
-    monkeypatch.setattr(butler, "new_photo_id", lambda: next(minted))
+    monkeypatch.setattr(butler.schema, "new_photo_id", lambda: next(minted))
     first = photo_id(upload(client, pot, blob=JPEG))
     second_bytes = JPEG + b"different"
     second = photo_id(upload(client, pot, blob=second_bytes))
@@ -462,7 +465,7 @@ def test_an_id_whose_row_outlived_its_file_is_also_given_up(client, photos, monk
     row's id and must not touch that row."""
     pot = make_pot(client)
     minted = iter(["photo-aaaaaaaa", "photo-aaaaaaaa", "photo-bbbbbbbb"])
-    monkeypatch.setattr(butler, "new_photo_id", lambda: next(minted))
+    monkeypatch.setattr(butler.schema, "new_photo_id", lambda: next(minted))
     first = photo_id(upload(client, pot))
     (photos / pot / f"{first}.jpg").unlink()  # the file, not the row
     second = photo_id(upload(client, pot))
@@ -474,7 +477,7 @@ def test_an_id_whose_row_outlived_its_file_is_also_given_up(client, photos, monk
 
 def test_an_id_that_cannot_be_minted_is_a_try_again_and_not_a_500(client, monkeypatch):
     pot = make_pot(client)
-    monkeypatch.setattr(butler, "new_photo_id", lambda: "photo-aaaaaaaa")
+    monkeypatch.setattr(butler.schema, "new_photo_id", lambda: "photo-aaaaaaaa")
     photo_id(upload(client, pot))
     answer = upload(client, pot)
     monkeypatch.undo()
