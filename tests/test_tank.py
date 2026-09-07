@@ -551,6 +551,18 @@ def test_a_reset_under_a_standing_contra_names_the_reset(client, db):
     assert answer.text.rstrip().endswith(
         "check the tank, type dry off on the board, then resume"
     )
+    # Nobody has acted yet, and the board's next reports say both again:
+    # the contra on every one, err= sticky at resetmid. A repeat is not a
+    # new fault, so the reset stays named, with the same onset — renamed
+    # contra here, the reset hid one report after it was found.
+    report(client, "c=0 ch0=1 float=0 pos=ok ch207=1 err=resetmid")
+    report(client, "c=0 ch0=1 float=0 pos=ok ch207=1 err=resetmid")
+    assert health(client)["latched"] == {"since": stamp, "reason": "resetmid"}
+    answer = post(client, "/command", "c=0 water=3 ml=50")
+    assert answer.status_code == 409
+    assert answer.text.rstrip().endswith(
+        "check the tank, type dry off on the board, then resume"
+    )
     # `dry off` typed and resumed; the contra still stands on the board,
     # and it is the next latch, with its own step, then `clear contra`.
     assert post(client, "/resume", "c=0").text == "resumed=0\n"

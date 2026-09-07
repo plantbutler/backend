@@ -142,8 +142,10 @@ watering.
   spell the steps from: `clear contra` for a contra, `dry off` for a board that reset with the
   pump running, which the firmware latches dry and `clear contra` does not touch, the contra
   words for a reason neither knows. A second fault landing while the latch stands overwrites
-  the reason and keeps the stamp: the newest fault is the one to fix; both on one report name
-  `resetmid`, the edge seen this once — the contra level re-latches after the resume. The float
+  the reason and keeps the stamp: the newest fault is the one to fix, and a fault the board
+  merely repeats is not a second one; both on one report name `resetmid`, the edge seen this
+  once — the contra level re-asserts the latch under that name until the resume, then
+  re-latches with its own words. The float
   going empty does not latch: the rules already refuse on it. `POST /refill` records a human
   refill, and the tap means "full to the top": the row snapshots `status.float_word`, the
   board's last real word (a report that omits `float=` blanks `float_ok`, and a tap made under

@@ -855,28 +855,37 @@ def latch_steps(reason: str) -> str:
     return f"check the tank, {LATCH_STEP.get(reason, LATCH_STEP['contra'])}, then resume"
 
 
-def latch_reason(r: Report, prev_err: str | None) -> str | None:
-    """What in this report latches the backend, if anything; `prev_err` is
-    the stored status.err before this report. ch207 is a level: the board
-    sends it on every report while its latch stands, and `clear contra` on
-    the console drops it. err= is the board's sticky last error, repeated
-    on every report until a later dose ends with something else and never
-    touched by the console, so `err=contra` is not a trigger — it would
-    re-latch a resumed board forever — and resetmid is an edge: the value
-    turning into it in this report. Both on one report — the contra lives
-    in .noinit through a reset, so a board that resets mid-dose under it
-    says so — name the edge: it is seen this once (the upsert makes
-    status.err resetmid whatever is named here), while the level repeats
-    on every report until `clear contra` is typed, so after `dry off` and
-    the resume the contra re-latches with its own words. Named the other
-    way round, the contra hid the reset for ever, and `clear contra` was
-    the only step a person was ever told (spec D12). The float going empty
-    is deliberately not here either: the rules already refuse on float=0,
-    and a refill is the human event for that (spec D2)."""
+def latch_reason(
+    r: Report, prev_err: str | None, standing: str | None
+) -> str | None:
+    """What in this report latches the backend, if anything, and under
+    what name; `prev_err` is the stored status.err before this report,
+    `standing` the reason of the latch already standing, None when none
+    does. ch207 is a level: the board sends it on every report while its
+    latch stands, and `clear contra` on the console drops it. err= is the
+    board's sticky last error, repeated on every report until a later
+    dose ends with something else and never touched by the console, so
+    `err=contra` is not a trigger — it would re-latch a resumed board
+    forever — and resetmid is an edge: the value turning into it in this
+    report. An edge is a new fault and names the latch, standing or not;
+    a level re-asserts a standing latch under the name it has and names
+    contra only when it starts one — a repeat is not a new fault. Both
+    on one report — the contra lives in .noinit through a reset, so a
+    board that resets mid-dose under it says so — name the edge: it is
+    seen this once (the upsert makes status.err resetmid whatever is
+    named here), while the level repeats on every report until `clear
+    contra` is typed, so after `dry off` and the resume the contra
+    re-latches with its own words. Named the other way round, the contra
+    hid the reset for ever, and `clear contra` was the only step a person
+    was ever told; and a level that renamed the latch it stood under hid
+    it again one report later, before anyone had looked (spec D12). The
+    float going empty is deliberately not here either: the rules already
+    refuse on float=0, and a refill is the human event for that (spec
+    D2)."""
     if r.err == "resetmid" and prev_err != "resetmid":
         return "resetmid"
     if r.channels.get(CONTRA_CHANNEL) == 1:
-        return "contra"
+        return standing or "contra"
     return None
 
 
@@ -2947,14 +2956,19 @@ def create_app(
                 # the other, and the upsert below overwrites both. The
                 # float is its last word, not float_ok: a report that
                 # omits float= blanks that column (its vanishing is its
-                # own alarm) and must not hide the edge. A first report
-                # has neither: there is no row yet, and it closes nothing.
+                # own alarm) and must not hide the edge. And the latch
+                # already standing, by its reason: set with latched_ts
+                # and cleared with it by /resume, never by the upsert, so
+                # a reason is a latch. A first report has none of these:
+                # there is no row yet, and it closes nothing.
                 prev = con.execute(
-                    "SELECT err, float_word, float_firm, float_word_since "
-                    "FROM status WHERE controller = ?",
+                    "SELECT err, float_word, float_firm, float_word_since, "
+                    "latch_reason FROM status WHERE controller = ?",
                     (r.controller,),
                 ).fetchone()
-                prev_err, prev_word, prev_firm, prev_fell = prev or (None,) * 4
+                prev_err, prev_word, prev_firm, prev_fell, standing = (
+                    prev or (None,) * 5
+                )
                 # The firm word going 1 -> 0: the word was firmly full, the
                 # last report that carried float= said empty, and so does
                 # this one. One sighting is a glitch by the board's own
@@ -3087,12 +3101,14 @@ def create_app(
                         int(forced),
                     ),
                 )
-                reason = latch_reason(r, prev_err)
+                reason = latch_reason(r, prev_err, standing)
                 if reason is not None:
                     # `since` is set once, never refreshed while the latch
                     # stands: when the trouble began. The reason is the
-                    # newest fault's — the one to fix; after a resume, a
-                    # latch still standing re-pages with its own words. A
+                    # newest fault's — the one to fix — and a fault the
+                    # board merely repeats is not newer than the one named;
+                    # after a resume, a latch still standing re-pages with
+                    # its own words. A
                     # dose still waiting would pour into a tank nobody has
                     # looked at, so it goes the way burial sends one; a
                     # 'sent' one is with the board, whose own latch holds.

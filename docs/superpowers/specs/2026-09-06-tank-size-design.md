@@ -233,7 +233,11 @@ fix, and after a resume the remaining latch re-pages with its own words. Both on
 standing `ch207=1` (it lives in `.noinit`, through a reset) and `err=` turning to `resetmid` —
 name `resetmid`: the edge is seen this once and the level repeats until `clear contra`, so after
 `dry off` and the resume the contra re-latches with its own words; contra first hid the reset for
-ever behind a step already taken (the fix round's review). Pre-existing in 0.18.0, fixed here
+ever behind a step already taken (the fix round's review). *Five times, from the second fix
+round's review:* a repeat is not a new fault — the level re-asserts a standing latch under the
+name it has and names `contra` only when it starts one (`latch_reason` is handed the standing
+reason); left level-triggered, the board's next report after the edge, still carrying both,
+renamed the reset `contra` before anyone had looked. Pre-existing in 0.18.0, fixed here
 because D6/D7's pages send a person down the same steps.
 
 **D13 — `ERR_TOKEN` accepts digits.** *2026-09-07, from the review:* the firmware's
