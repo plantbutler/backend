@@ -4,6 +4,7 @@ band the two of them deliberately do not decide."""
 import sqlite3
 import time
 
+import pytest
 from fastapi.testclient import TestClient
 
 from butler import (
@@ -269,9 +270,17 @@ def test_band_without_a_single_field_is_still_an_offer():
     assert "unlabelled" in band.why
 
 
-def test_band_follows_the_kind_of_plant():
-    assert target_band("succulent", None, None, None, 4)[:2] == (15, 30)
-    assert target_band("fern", None, None, None, 4)[:2] == (55, 75)
+@pytest.mark.parametrize(
+    "kind, band",
+    [
+        ("succulent", (15, 30)),
+        ("fern", (55, 75)),
+        # A cactus is drier than the succulents it used to share a row with.
+        ("cactus", (10, 25)),
+    ],
+)
+def test_band_follows_the_kind_of_plant(kind, band):
+    assert target_band(kind, None, None, None, 4)[:2] == band
 
 
 def test_a_kind_outside_the_set_reads_as_unlabelled():
@@ -281,11 +290,6 @@ def test_a_kind_outside_the_set_reads_as_unlabelled():
     # a new one — that half is tested in test_pots.
     for stale in ("basil", "foliage", "hardy fern", "cauliflower"):
         assert target_band(stale, None, None, None, 4)[:2] == BASE_BAND
-
-
-def test_a_cactus_is_drier_than_the_succulents_it_used_to_share_a_row_with():
-    assert target_band("cactus", None, None, None, 4)[:2] == (10, 25)
-    assert target_band("succulent", None, None, None, 4)[:2] == (15, 30)
 
 
 def test_the_new_kinds_all_move_the_band():
@@ -449,41 +453,39 @@ def test_a_measurement_reads_as_a_number_not_a_word():
 # --- the plant kind the lookup offers ------------------------------------
 
 
-def test_a_family_suggests_a_kind():
-    assert kind_for("Ocimum basilicum", "Lamiaceae") == "herb"
-    assert kind_for("Monstera deliciosa", "Araceae") == "tropical"
-    assert kind_for("Crepis vesicaria", "Asteraceae") == "flower"
-    assert kind_for("Nephrolepis exaltata", "Nephrolepidaceae") == "fern"
-    # A palm gets its own kind rather than falling into the leafy-tropical
-    # bucket, and cactus its own rather than blending into succulent.
-    assert kind_for("Chamaedorea elegans", "Arecaceae") == "palm"
-    assert kind_for("Dionaea muscipula", "Droseraceae") == "carnivorous"
-    # GBIF's case is not a promise.
-    assert kind_for("Echinopsis pachanoi", "CACTACEAE") == "cactus"
-
-
-def test_an_orchid_is_answered_now_rather_than_dodged():
-    """A bark epiphyte like an orchid waters nothing like a flowering pot
-    plant, so it needs its own band rather than the generic one."""
-    assert kind_for("Phalaenopsis amabilis", "Orchidaceae") == "orchid"
-
-
-def test_the_genus_is_asked_before_the_family():
-    # Asparagaceae holds a leafy thing that wants watering and a succulent
-    # in all but name, so the family alone would water one of them wrong.
-    assert kind_for("Dracaena fragrans", "Asparagaceae") == "tropical"
-    assert kind_for("Dracaena trifasciata", "Asparagaceae") == "succulent"
-    assert kind_for("Zamioculcas zamiifolia", "Araceae") == "succulent"
-    assert kind_for("Euphorbia trigona", "Euphorbiaceae") == "succulent"
-
-
-def test_an_unknown_family_offers_nothing_rather_than_a_guess():
-    # An unlisted family means nobody here knows, and "not sure" already
-    # behaves correctly — better than 20 confident points the wrong way.
-    assert kind_for("Ginkgo biloba", "Ginkgoaceae") is None
-    assert kind_for("Some plant", "Nothingaceae") is None
-    assert kind_for("Some plant", None) is None
-    assert kind_for(None, "Lamiaceae") is None
+@pytest.mark.parametrize(
+    "species, family, kind",
+    [
+        # A family suggests a kind. A palm gets its own rather than falling
+        # into the leafy-tropical bucket, and cactus its own rather than
+        # blending into succulent; an orchid is a bark epiphyte and waters
+        # nothing like a flowering pot plant, so it is answered rather than
+        # dodged. GBIF's case is not a promise.
+        ("Ocimum basilicum", "Lamiaceae", "herb"),
+        ("Monstera deliciosa", "Araceae", "tropical"),
+        ("Crepis vesicaria", "Asteraceae", "flower"),
+        ("Nephrolepis exaltata", "Nephrolepidaceae", "fern"),
+        ("Chamaedorea elegans", "Arecaceae", "palm"),
+        ("Dionaea muscipula", "Droseraceae", "carnivorous"),
+        ("Echinopsis pachanoi", "CACTACEAE", "cactus"),
+        ("Phalaenopsis amabilis", "Orchidaceae", "orchid"),
+        # The genus is asked before the family: Asparagaceae holds a leafy
+        # thing that wants watering and a succulent in all but name, so the
+        # family alone would water one of them wrong.
+        ("Dracaena fragrans", "Asparagaceae", "tropical"),
+        ("Dracaena trifasciata", "Asparagaceae", "succulent"),
+        ("Zamioculcas zamiifolia", "Araceae", "succulent"),
+        ("Euphorbia trigona", "Euphorbiaceae", "succulent"),
+        # An unlisted family means nobody here knows, and "not sure" already
+        # behaves correctly — better than 20 confident points the wrong way.
+        ("Ginkgo biloba", "Ginkgoaceae", None),
+        ("Some plant", "Nothingaceae", None),
+        ("Some plant", None, None),
+        (None, "Lamiaceae", None),
+    ],
+)
+def test_the_kind_a_name_and_its_family_suggest(species, family, kind):
+    assert kind_for(species, family) == kind
 
 
 def test_every_suggested_kind_is_one_the_form_can_show():
@@ -573,13 +575,15 @@ def test_a_complete_row_is_never_asked_again(db):
     assert sources.hits("gbif") == before
 
 
-def test_a_family_nobody_listed_offers_no_kind(db):
-    sources = Sources({**BASIL, "gbif": gbif(family="Ginkgoaceae")})
-    assert look(app(db, sources), "Ocimum_basilicum")["kind"] is None
-
-
-def test_a_name_that_resolved_to_nothing_offers_no_kind(db):
-    sources = Sources({**BASIL, "gbif": gbif(match="NONE")})
+@pytest.mark.parametrize(
+    "answered",
+    [
+        pytest.param({"family": "Ginkgoaceae"}, id="a_family_nobody_listed"),
+        pytest.param({"match": "NONE"}, id="a_name_that_resolved_to_nothing"),
+    ],
+)
+def test_the_endpoint_offers_no_kind_it_cannot_stand_behind(db, answered):
+    sources = Sources({**BASIL, "gbif": gbif(**answered)})
     assert look(app(db, sources), "Ocimum_basilicum")["kind"] is None
 
 

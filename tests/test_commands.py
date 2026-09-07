@@ -66,24 +66,22 @@ def test_a_command_waits_for_its_own_controller(client, db):
 # --------------------------------------------------------------------------- #
 
 
-def test_a_report_without_the_ack_expires_the_sent_command(client, db):
+@pytest.mark.parametrize(
+    "t",
+    [
+        pytest.param(61000, id="a_report_without_the_ack"),
+        # A retry of a lost-response report can't carry an ack, so the
+        # command it carried is gone for good, never re-handed, since the
+        # board might still be executing a copy of it.
+        pytest.param(1000, id="a_retry_of_the_report_that_carried_it"),
+    ],
+)
+def test_a_sent_command_the_next_report_does_not_ack_expires(client, db, t):
     command(client, "c=0 water=3 ml=50 cap_s=30")
     report(client, "c=0 t=1000 ch0=8000")
 
-    answer = report(client, "c=0 t=61000 ch0=8000")
+    answer = report(client, f"c=0 t={t} ch0=8000")
     assert "cmd=" not in answer.text
-    assert states(db) == {1: "expired"}
-
-
-def test_a_lost_response_expires_the_command_it_carried(client, db):
-    # a retry of a lost-response report can't carry an ack, so the command it
-    # carried is gone for good, never re-handed, since the board might still
-    # be executing a copy of it
-    command(client, "c=0 water=3 ml=50 cap_s=30")
-    report(client, "c=0 t=1000 ch0=8000")
-
-    retry = report(client, "c=0 t=1000 ch0=8000")
-    assert "cmd=" not in retry.text
     assert states(db) == {1: "expired"}
 
 
@@ -283,14 +281,22 @@ def test_the_knob_cannot_let_a_live_board_outlive_the_command_ttl(client, db):
     assert "BUTLER_CMD_TTL_S" in answer.text
 
 
-def test_a_ttl_shorter_than_the_report_beat_refuses_to_start(db):
-    with pytest.raises(ValueError, match="BUTLER_CMD_TTL_S"):
-        create_app(db_path=str(db), token=TOKEN, next_s=600, cmd_ttl_s=900)
-
-
-def test_an_out_of_range_default_interval_refuses_to_start(db):
-    with pytest.raises(ValueError, match="BUTLER_NEXT_S"):
-        create_app(db_path=str(db), token=TOKEN, next_s=0)
+@pytest.mark.parametrize(
+    "over, names",
+    [
+        pytest.param(
+            {"next_s": 600, "cmd_ttl_s": 900},
+            "BUTLER_CMD_TTL_S",
+            id="a_ttl_shorter_than_the_report_beat",
+        ),
+        pytest.param(
+            {"next_s": 0}, "BUTLER_NEXT_S", id="an_out_of_range_default_interval"
+        ),
+    ],
+)
+def test_a_refusal_to_start_names_the_variable_to_fix(db, over, names):
+    with pytest.raises(ValueError, match=names):
+        create_app(db_path=str(db), token=TOKEN, **over)
 
 
 def test_commands_and_the_knob_need_the_token_too(client, db):

@@ -77,13 +77,29 @@ def test_burying_a_pot_expires_the_proposal_it_was_waiting_on(client, db):
     assert count(db, "commands", "state = 'proposed'") == 0
 
 
-def test_burying_a_pot_clears_the_sensor_alarm_nobody_could_clear(client, db):
-    """The raise and the clear both live inside a loop over the live pots,
-    so a pot that leaves the loop while its alarm stands would leave a row
-    nothing can ever clear."""
-    basil = pot(client, "name=basil controller=0 channel=0")
+@pytest.mark.parametrize(
+    "wiring, change",
+    [
+        # The raise and the clear both live inside a loop over the live
+        # pots, so a pot that leaves the loop while its alarm stands would
+        # leave a row nothing can ever clear.
+        pytest.param(
+            "channel=0", "status=graveyard", id="burying_a_pot_clears_the_sensor_alarm"
+        ),
+        # Both the raise and the clear read the pot's CURRENT wiring, so a
+        # pot moved to another channel would otherwise leave the old
+        # channel's alarm with nobody to clear it.
+        pytest.param(
+            "channel=0 outlet=0", "channel=1", id="a_remap_frees_the_socket_it_left"
+        ),
+    ],
+)
+def test_a_channel_nobody_is_on_keeps_no_alarm_nobody_could_clear(
+    client, db, wiring, change
+):
+    basil = pot(client, f"name=basil controller=0 {wiring}")
     raise_alert(db, "sensor:0:0")
-    post(client, "/pot", f"id={basil} status=graveyard")
+    post(client, "/pot", f"id={basil} {change}")
     assert count(db, "alerts", "key = 'sensor:0:0'") == 0
 
 
@@ -143,16 +159,6 @@ def test_a_delete_frees_the_alerts_the_pot_leaves_behind(client, db):
     assert count(db, "alerts", "key = 'proposal:0:0'") == 0
     # the board's own conditions are not this pot's to clear
     assert count(db, "alerts", "key = 'silent:0'") == 1
-
-
-def test_a_remap_frees_the_socket_it_left(client, db):
-    """Both the raise and the clear read the pot's CURRENT wiring, so a pot
-    moved to another channel would otherwise leave the old channel's alarm
-    with nobody to clear it."""
-    basil = pot(client, "name=basil controller=0 channel=0 outlet=0")
-    raise_alert(db, "sensor:0:0")
-    post(client, "/pot", f"id={basil} channel=1")
-    assert count(db, "alerts", "key = 'sensor:0:0'") == 0
 
 
 def test_burying_a_pot_takes_a_queued_dose_with_it(client, db):

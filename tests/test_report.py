@@ -123,12 +123,26 @@ def test_the_server_stamps_arrival_time_itself(client, db):
     assert abs(time.time() - ts) < 5
 
 
-def test_keys_this_version_does_not_know_are_ignored(client, db):
-    body = "c=0 float=1 pos=ok last=ok zz=9 ch0=8123\n"
+@pytest.mark.parametrize(
+    "body, landed",
+    [
+        pytest.param(
+            "c=0 float=1 pos=ok last=ok zz=9 ch0=8123\n",
+            [(0, 0, 8123)],
+            id="keys_this_version_does_not_know",
+        ),
+        pytest.param(
+            "c=0 ch\u0667=7 ch0=1\n",  # Arabic-Indic seven: an unknown key
+            [(0, 0, 1)],
+            id="unicode_digits_do_not_alias_onto_ascii_channels",
+        ),
+    ],
+)
+def test_a_key_this_version_cannot_read_is_skipped_and_the_rest_lands(client, db, body, landed):
     answer = reported(client, body)
 
     assert answer.status_code == 200
-    assert rows(db) == [(0, 0, 8123)]
+    assert rows(db) == landed
 
 
 def test_reports_append_and_health_counts_them(client, db):
@@ -191,26 +205,19 @@ def test_a_report_without_t_never_dedups(client, db):
 # --------------------------------------------------------------------------- #
 
 
-def test_a_wrong_token_stores_nothing(client, db):
-    assert reported(client, REPORT, token="nope").status_code == 401
-    assert rows(db) == []
-
-
-def test_a_missing_token_header_stores_nothing(client, db):
-    answer = client.post("/report", content=REPORT)
-
-    assert answer.status_code == 401
-    assert rows(db) == []
-
-
-def test_a_non_ascii_token_is_a_401_not_a_500(client, db):
-    # h11 lets obs-text header bytes through and the ASGI layer decodes them
-    # latin-1, so the handler sees a non-ASCII str; compare_digest on that
-    # would 500 rather than 401.
-    answer = client.post(
-        "/report", content=REPORT, headers={"X-Token": "sécret".encode("latin-1")}
-    )
-    assert answer.status_code == 401
+@pytest.mark.parametrize(
+    "token",
+    [
+        pytest.param("nope", id="a_wrong_token"),
+        pytest.param(None, id="a_missing_token_header"),
+        # h11 lets obs-text header bytes through and the ASGI layer decodes
+        # them latin-1, so the handler sees a non-ASCII str; compare_digest
+        # on that would 500 rather than 401.
+        pytest.param("sécret".encode("latin-1"), id="a_non_ascii_token"),
+    ],
+)
+def test_a_report_the_token_does_not_open_stores_nothing(client, db, token):
+    assert reported(client, REPORT, token=token).status_code == 401
     assert rows(db) == []
 
 
@@ -256,14 +263,6 @@ def test_an_oversized_body_is_cut_off_with_413(client, db):
 
     assert answer.status_code == 413
     assert rows(db) == []
-
-
-def test_unicode_digits_do_not_alias_onto_ascii_channels(client, db):
-    body = "c=0 ch٧=7 ch0=1\n"  # Arabic-Indic seven: unknown key, skipped
-    answer = reported(client, body)
-
-    assert answer.status_code == 200
-    assert rows(db) == [(0, 0, 1)]
 
 
 # --------------------------------------------------------------------------- #

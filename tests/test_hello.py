@@ -25,22 +25,22 @@ def test_the_right_token_gets_the_version(client):
     assert answer.text.strip() == f"butler={butler.VERSION}"
 
 
-def test_a_wrong_token_is_refused_in_the_backend_s_own_words(client):
-    answer = hello(client, token="not-the-token")
+@pytest.mark.parametrize(
+    "token",
+    [
+        pytest.param("not-the-token", id="a_wrong_token"),
+        pytest.param(None, id="no_token_header_at_all"),
+        # httpx won't encode a non-ASCII header itself; Starlette hands it on
+        # as latin-1 mojibake, and compare_digest needs bytes here or this is
+        # a 500.
+        pytest.param("tökén".encode("utf-8"), id="a_non_ascii_token"),
+    ],
+)
+def test_every_refusal_is_a_401_in_the_backends_own_words(client, token):
+    answer = hello(client, token=token)
     assert answer.status_code == 401
     # the app shows refusals verbatim, so this text is user-facing
     assert answer.text.strip() == "bad token"
-
-
-def test_no_token_header_at_all_is_a_wrong_token(client):
-    assert hello(client, token=None).status_code == 401
-
-
-def test_a_non_ascii_token_is_a_401_and_not_a_500(client):
-    # httpx won't encode a non-ASCII header itself; Starlette hands it on as
-    # latin-1 mojibake, and compare_digest needs bytes here or this is a 500.
-    answer = client.get("/hello", headers={"X-Token": "tökén".encode("utf-8")})
-    assert answer.status_code == 401
 
 
 def test_hello_answers_when_the_database_cannot_be_opened(db, client):

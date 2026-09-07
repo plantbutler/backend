@@ -247,9 +247,16 @@ def test_a_photo_id_that_is_not_an_id_is_refused_before_the_database(client):
     assert answer.status_code == 400
 
 
-def test_a_delete_of_something_that_is_not_an_id_is_refused(client):
-    answer = client.post("/photo/delete", content="photo=../x", headers=auth())
-    assert answer.status_code == 400
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param("photo=../x", id="something_that_is_not_an_id"),
+        pytest.param("", id="no_body_at_all"),
+        pytest.param("pot=x", id="a_body_that_names_no_photo"),
+    ],
+)
+def test_a_delete_that_names_no_photograph_is_refused(client, body):
+    assert client.post("/photo/delete", content=body, headers=auth()).status_code == 400
 
 
 # --------------------------------------------------------------------------- #
@@ -339,13 +346,6 @@ def test_a_row_whose_file_is_already_gone_can_still_be_deleted(client, photos):
     assert strip(client, pot).json()["photos"] == []
 
 
-def test_a_delete_without_a_photo_is_refused(client):
-    assert client.post("/photo/delete", content="", headers=auth()).status_code == 400
-    assert (
-        client.post("/photo/delete", content="pot=x", headers=auth()).status_code == 400
-    )
-
-
 # --------------------------------------------------------------------------- #
 # The lock. A photograph is megabytes over a NAS volume.
 
@@ -402,9 +402,21 @@ def test_two_uploads_at_once_both_land(client):
 # Where the store lives
 
 
-def test_the_store_sits_beside_the_database_by_default(tmp_path):
+@pytest.mark.parametrize(
+    "over",
+    [
+        pytest.param({}, id="photos_dir_unset"),
+        # `db_path=""` falls back to the default; this has to do the same,
+        # or the store lands in the working directory and skips the
+        # unmounted-/data refusal on the way.
+        pytest.param({"photos_dir": ""}, id="photos_dir_empty"),
+    ],
+)
+def test_the_store_sits_beside_the_database_by_default(tmp_path, over):
+    # create_app itself, not conftest's make_app: make_app always passes an
+    # explicit photos_dir, which is the very default this is about.
     db = tmp_path / "here" / "butler.db"
-    client = TestClient(create_app(db_path=str(db), token=TOKEN))
+    client = TestClient(create_app(db_path=str(db), token=TOKEN, **over))
     pot = make_pot(client, bare=True)
     pid = photo_id(upload(client, pot))
     assert (tmp_path / "here" / "photos" / pot / f"{pid}.jpg").exists()
@@ -494,17 +506,6 @@ def test_only_one_of_two_racing_deletes_says_ok(client):
         t.join()
     assert sorted(codes) == [200] + [400] * 5, codes
     assert strip(client, pot).json()["photos"] == []
-
-
-def test_an_empty_photos_dir_falls_back_like_an_empty_db_path(tmp_path):
-    """`db_path=""` falls back to the default; this has to do the same, or
-    the store lands in the working directory and skips the unmounted-/data
-    refusal on the way."""
-    db = tmp_path / "here" / "butler.db"
-    client = TestClient(create_app(db_path=str(db), token=TOKEN, photos_dir=""))
-    pot = make_pot(client, bare=True)
-    pid = photo_id(upload(client, pot))
-    assert (tmp_path / "here" / "photos" / pot / f"{pid}.jpg").exists()
 
 
 def test_the_garden_carries_the_newest_picture_for_the_thumbnail(client, db):

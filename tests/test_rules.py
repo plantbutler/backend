@@ -241,21 +241,34 @@ def test_a_bad_quiet_setting_refuses_to_start(db):
 # --------------------------------------------------------------------------- #
 
 
-def test_cooldown_blocks_a_second_dose(client, db):
-    make_pot(client)  # default cooldown: 6 h
+@pytest.mark.parametrize("moved", [False, True], ids=["", "with_its_hose_moved"])
+@pytest.mark.parametrize(
+    "knobs, flowed",
+    [
+        pytest.param({}, 97, id="cooldown_blocks_a_second_dose"),  # default: 6 h
+        pytest.param(
+            {"cooldown_h": 0, "daily_cap_ml": 150},
+            100,  # first dose 100 of 150, so 100 + 100 > 150: capped
+            id="the_daily_cap_counts_what_actually_flowed",
+        ),
+    ],
+)
+def test_one_dose_only_however_the_hose_hangs(client, db, knobs, flowed, moved):
+    """The six hours and the millilitres belong to the plant, not to the
+    plumbing: watering a pot and then moving its hose must not water it
+    twice, and a remap is not a fresh allowance.
+
+    No rewind before the remap on purpose: it lands in the very second of
+    the dose, the one genuinely ambiguous point of the window, and the
+    gates have to read that ambiguity as "watered" in both directions.
+    """
+    basil = make_pot(client, **knobs)
     soak(client, 5)  # waters
-    report(client, extra="ack=1 flow_ml=97")
+    report(client, extra=f"ack=1 flow_ml={flowed}")
+    if moved:
+        post(client, "/pot", f"id={basil} outlet=4")
 
     soak(client, 6)  # still bone dry, but freshly watered
-    assert len(commands(db)) == 1
-
-
-def test_the_daily_cap_counts_what_actually_flowed(client, db):
-    make_pot(client, cooldown_h=0, daily_cap_ml=150)
-    soak(client, 5)  # first dose: 100 of 150
-    report(client, extra="ack=1 flow_ml=100")
-
-    soak(client, 6)  # 100 + 100 > 150: capped
     assert len(commands(db)) == 1
 
 
@@ -562,36 +575,6 @@ def test_a_proposal_is_not_inherited_by_the_next_pot_on_the_hose(client, db):
 
     assert cards(client)["mint"]["proposal"] is None
     assert cards(client)["basil"]["proposal"] is None  # not on that hose now
-
-
-def test_the_cooldown_stays_with_the_pot_when_its_hose_moves(client, db):
-    """The six hours belong to the plant, not to the plumbing. Watering a
-    pot and then moving its hose must not water it twice.
-
-    No rewind here on purpose: the remap lands in the very second of the
-    dose, which is the one genuinely ambiguous point of the window, and
-    the gates have to read that ambiguity as "watered" in both directions.
-    """
-    basil = make_pot(client)  # auto, outlet 3, default 6 h cooldown
-    soak(client, 5)
-    report(client, extra="ack=1 flow_ml=97")
-
-    post(client, "/pot", f"id={basil} outlet=4")
-
-    soak(client, 6)  # still bone dry, still freshly watered
-    assert len(commands(db)) == 1
-
-
-def test_the_daily_cap_stays_with_the_pot_when_its_hose_moves(client, db):
-    """The same, for the millilitres: a remap is not a fresh allowance."""
-    basil = make_pot(client, cooldown_h=0, daily_cap_ml=150)
-    soak(client, 5)
-    report(client, extra="ack=1 flow_ml=100")
-
-    post(client, "/pot", f"id={basil} outlet=4")
-
-    soak(client, 6)  # 100 + 100 > 150 wherever the hose hangs
-    assert len(commands(db)) == 1
 
 
 def test_a_proposal_survives_a_correction_that_leaves_the_hose_alone(client, db):

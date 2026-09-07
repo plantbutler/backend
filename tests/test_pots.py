@@ -132,18 +132,17 @@ def test_an_inverted_target_range_is_refused(client):
 # --------------------------------------------------------------------------- #
 
 
-def test_two_live_pots_cannot_share_a_channel(client):
-    pot(client, "name=basil controller=0 channel=0")
+@pytest.mark.parametrize(
+    "wiring",
+    [
+        pytest.param("channel=0", id="two_live_pots_cannot_share_a_channel"),
+        pytest.param("outlet=3", id="two_live_pots_cannot_share_an_outlet"),
+    ],
+)
+def test_one_hose_one_pot_and_the_refusal_names_the_holder(client, wiring):
+    pot(client, f"name=basil controller=0 {wiring}")
 
-    answer = pot(client, "name=mint controller=0 channel=0")
-    assert answer.status_code == 400
-    assert "taken by pot basil" in answer.text
-
-
-def test_two_live_pots_cannot_share_an_outlet(client):
-    pot(client, "name=basil controller=0 outlet=3")
-
-    answer = pot(client, "name=mint controller=0 outlet=3")
+    answer = pot(client, f"name=mint controller=0 {wiring}")
     assert answer.status_code == 400
     assert "taken by pot basil" in answer.text
 

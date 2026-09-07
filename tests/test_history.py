@@ -93,8 +93,11 @@ def test_history_needs_no_token(client, db):
         ("pot=", "no pot="),
         ("pot=pot-aaaaaa&hours=0", "hours= out of range"),
         ("pot=pot-aaaaaa&hours=745", "hours= out of range"),  # a month is the ceiling
+        ("pot=pot-aaaaaa&hours=745&bucket_s=3600", "hours= out of range"),
         ("pot=pot-aaaaaa&bucket_s=59", "bucket_s= out of range"),
         ("pot=pot-aaaaaa&hours=168&bucket_s=60", "too many buckets"),
+        # Raising the hours cap must not let the bucket cap be walked past.
+        ("pot=pot-aaaaaa&hours=744&bucket_s=300", "too many buckets"),
         ("pot=pot-a&pot=pot-b", "pot= given twice"),  # last-wins would chart pot-b
         ("pot=pot-aaaaaa&hours=24&hours=1", "hours= given twice"),
         ("pot=pot-aaaaaa&bucket_s=60&bucket_s=3600", "bucket_s= given twice"),
@@ -153,14 +156,3 @@ def test_a_month_back_is_askable_at_a_sane_bucket(client, db):
     assert body["to"] - body["since"] >= 743 * 3600
 
 
-def test_past_a_month_is_still_refused(client):
-    answer = client.get("/history", params={"pot": "pot-aaaaaa", "hours": 745, "bucket_s": 3600})
-    assert answer.status_code == 400
-    assert "hours" in answer.text
-
-
-def test_a_month_at_five_minute_buckets_is_still_too_many(client):
-    """Raising the hours cap must not let the bucket cap be walked past."""
-    answer = client.get("/history", params={"pot": "pot-aaaaaa", "hours": 744, "bucket_s": 300})
-    assert answer.status_code == 400
-    assert "too many buckets" in answer.text
