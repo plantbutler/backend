@@ -11,29 +11,29 @@ from fastapi.testclient import TestClient
 
 import butler
 from butler import FLAP_WINDOW_S, PERSIST_S, SOAK_S, create_app
-from test_tank import (  # the fixtures and the tank's own moves, shared
-    DRY,
+from conftest import (
     TOKEN,
+    health,
+    keys,
+    make_pot,
+    origin,
+    post,
+    report,
+    run_sql,
+    taps,
+    tick,
+)
+from test_tank import (  # the tank's own moves, and the app it builds
+    DRY,
     WET,
     age,
     alerts,
-    app,  # noqa: F401 — a fixture
-    client,  # noqa: F401 — a fixture
-    db,  # noqa: F401 — a fixture
     dose,
     dry_reports,
-    health,
-    keys,
     learn_the_tank,
-    make_pot,
-    post,
-    report,
     rules_water,
-    run_sql,
-    sent,  # noqa: F401 — a fixture
+    settings,  # noqa: F401 — a fixture: the same app the tank's tests get
     tap,
-    taps,
-    tick,
 )
 
 
@@ -45,11 +45,6 @@ def flap_since(db):
 def float_since(db):
     """When the board's word last changed: not the flap's clock."""
     return run_sql(db, "SELECT float_since FROM status WHERE controller = 0")[0][0]
-
-
-def origin(db):
-    with sqlite3.connect(db) as con:
-        return butler.counter_origin(con, 0)
 
 
 def flapped(client, n=1):

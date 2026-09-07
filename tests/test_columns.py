@@ -13,8 +13,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from butler import add_columns, create_app
+from conftest import TOKEN
 
-TOKEN = "test-token"
 
 # The pre-upgrade shape: pots already keyed on `pot-xxxxxx`, wiring already
 # in pot_mappings, but the two sizes still free text.

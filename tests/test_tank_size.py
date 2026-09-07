@@ -17,64 +17,25 @@ from butler import (
     UP_AFTER_S,
     create_app,
 )
-
-TOKEN = "test-token"
-
-
-@pytest.fixture
-def db(tmp_path):
-    return tmp_path / "butler.db"
-
-
-@pytest.fixture
-def sent():
-    return []
-
-
-@pytest.fixture
-def app(db, sent):
-    return create_app(
-        db_path=str(db),
-        token=TOKEN,
-        next_s=60,
-        cmd_ttl_s=900,
-        quiet="0-0",
-        send=lambda alert: sent.append(alert) or True,
-        ping=lambda: True,
-    )
+from conftest import (
+    TOKEN,
+    capturing,
+    health,
+    keys,
+    origin,
+    post,
+    report,
+    run_sql,
+    taps,
+    tick,
+    word_since,
+)
 
 
 @pytest.fixture
-def client(app):
-    return TestClient(app)
-
-
-def post(client, path, body):
-    return client.post(path, content=body, headers={"X-Token": TOKEN})
-
-
-def report(client, body):
-    answer = post(client, "/report", body)
-    assert answer.status_code == 200, answer.text
-    return answer
-
-
-def health(client, controller=0):
-    entries = client.get("/health").json()["controllers"]
-    return next(c for c in entries if c["controller"] == controller)
-
-
-def tick(app, now=None):
-    return app.state.tick(now)
-
-
-def keys(sent):
-    return [a.key for a in sent if a.message is not None]
-
-
-def run_sql(db, sql, *params):
-    with sqlite3.connect(db) as con:
-        return con.execute(sql, params).fetchall()
+def settings(sent, pinged):
+    # quiet="0-0": the tests must not care what time it is
+    return {"quiet": "0-0"} | capturing(sent, pinged)
 
 
 def age(db, seconds):
@@ -184,20 +145,6 @@ def samples(db):
 
 def refills(db):
     return run_sql(db, "SELECT float_ok FROM refills ORDER BY ts, rowid")
-
-
-def taps(db):
-    return [ts for (ts,) in run_sql(db, "SELECT ts FROM refills ORDER BY ts, rowid")]
-
-
-def origin(db):
-    with sqlite3.connect(db) as con:
-        return butler.counter_origin(con, 0)
-
-
-def word_since(db):
-    """When the float's word last changed, 1 -> 0 or 0 -> 1."""
-    return run_sql(db, "SELECT float_word_since FROM status WHERE controller = 0")[0][0]
 
 
 def rise(db):
@@ -1240,7 +1187,6 @@ CREATE TABLE status (
   pos_bad INTEGER, pos_bad_prev INTEGER, err TEXT, err_ts INTEGER,
   latched_ts INTEGER, latch_reason TEXT, pos_ok_seen INTEGER);
 """
-
 
 def test_an_existing_database_carries_the_floats_last_word_at_startup(db):
     # The pre-upgrade shape of status: float_ok, no float_word. A tank

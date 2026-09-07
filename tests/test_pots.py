@@ -5,24 +5,10 @@ import time
 import types
 
 import pytest
-from fastapi.testclient import TestClient
 
 import butler
-from butler import create_app, moisture_pct, parse_pot
-
-TOKEN = "test-token"
-
-
-@pytest.fixture
-def db(tmp_path):
-    return tmp_path / "butler.db"
-
-
-@pytest.fixture
-def client(db):
-    return TestClient(
-        create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900)
-    )
+from butler import moisture_pct, parse_pot
+from conftest import TOKEN
 
 
 def pot(client, body, token=TOKEN):

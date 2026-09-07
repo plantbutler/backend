@@ -7,21 +7,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from butler import create_app, parse_report
+from conftest import TOKEN
 
-TOKEN = "test-token"
 
 REPORT = "c=0 t=123456\nch0=8123 ch1=7902 ch2=15\n"
-
-
-@pytest.fixture
-def db(tmp_path):
-    return tmp_path / "butler.db"
-
-
-@pytest.fixture
-def client(db):
-    app = create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900)
-    return TestClient(app)
 
 
 def rows(db):

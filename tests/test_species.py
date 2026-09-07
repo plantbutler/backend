@@ -5,7 +5,6 @@ import json
 import sqlite3
 import time
 
-import pytest
 from fastapi.testclient import TestClient
 
 from butler import (
@@ -29,13 +28,7 @@ from butler import (
     read_trefle,
     target_band,
 )
-
-TOKEN = "test-token"
-
-
-@pytest.fixture
-def db(tmp_path):
-    return tmp_path / "butler.db"
+from conftest import TOKEN
 
 
 class Sources:

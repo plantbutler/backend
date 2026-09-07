@@ -21,62 +21,37 @@ from butler import (
     create_app,
     post_ntfy,
 )
+from conftest import (
+    TOKEN,
+    age_controller,
+    capturing,
+    keys,
+    make_app,
+    make_pot,
+    post,
+    run_sql,
+    tick,
+)
 
-TOKEN = "test-token"
 DRY = 11000  # pct 12 with the calibration below
 WET = 8000  # pct 50
 
 
-@pytest.fixture
-def db(tmp_path):
-    return tmp_path / "butler.db"
-
-
-@pytest.fixture
-def sent():
-    return []
-
-
-@pytest.fixture
-def pinged():
-    return []
-
-
 def build_app(db, sent, pinged, **over):
-    settings = {
-        "db_path": str(db),
-        "token": TOKEN,
-        "next_s": 60,
-        "cmd_ttl_s": 900,
-        "quiet": "0-0",
-        "send": lambda alert: sent.append(alert) or True,
-        "ping": lambda: pinged.append(True) or True,
-    } | over
-    return create_app(**settings)
+    """The `app` fixture's own app, for the tests that want two of them."""
+    return make_app(db, **({"quiet": "0-0"} | capturing(sent, pinged) | over))
 
 
 @pytest.fixture
-def app(db, sent, pinged):
-    return build_app(db, sent, pinged)
-
-
-@pytest.fixture
-def client(app):
-    return TestClient(app)
-
-
-def tick(app, now=None):
-    return app.state.tick(now)
+def settings(sent, pinged):
+    # quiet="0-0": the tests must not care what time it is
+    return {"quiet": "0-0"} | capturing(sent, pinged)
 
 
 def see_everything(app):
     # Silence is measured from the later of last_seen and the observation
     # start, so backdating last_seen must also backdate the window.
     app.state.observed["since"] = 0
-
-
-def post(client, path, body):
-    return client.post(path, content=body, headers={"X-Token": TOKEN})
 
 
 def report(client, raw=DRY, safe=True, extra=""):
@@ -88,30 +63,6 @@ def report(client, raw=DRY, safe=True, extra=""):
     answer = post(client, "/report", body)
     assert answer.status_code == 200, answer.text
     return answer
-
-
-def make_pot(client, **over):
-    fields = {
-        "name": "basil",
-        "controller": 0,
-        "channel": 0,
-        "outlet": 3,
-        "dry_raw": 12000,
-        "wet_raw": 4000,
-        "target_low_pct": 30,
-        "target_high_pct": 60,
-        "dose_ml": 100,
-        "mode": "auto",
-    } | over
-    body = " ".join(f"{k}={v}" for k, v in fields.items())
-    answer = post(client, "/pot", body)
-    assert answer.status_code == 200, answer.text
-    return answer.text.split()[0].removeprefix("pot=")
-
-
-def run_sql(db, sql, *params):
-    with sqlite3.connect(db) as con:
-        return con.execute(sql, params).fetchall()
 
 
 def alert_rows(db):
@@ -127,11 +78,6 @@ def dose_rows(db):
     )
 
 
-def age_controller(db, seconds):
-    with sqlite3.connect(db) as con:
-        con.execute("UPDATE controllers SET last_seen = last_seen - ?", (seconds,))
-
-
 def age_status(db, seconds):
     with sqlite3.connect(db) as con:
         con.execute(
@@ -141,10 +87,6 @@ def age_status(db, seconds):
             "pos_bad_prev = pos_bad_prev - ?",
             (seconds,) * 6,
         )
-
-
-def keys(sent):
-    return [a.key for a in sent if a.message is not None]
 
 
 def plant_dose(

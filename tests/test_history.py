@@ -4,24 +4,9 @@ import sqlite3
 import time
 
 import pytest
-from fastapi.testclient import TestClient
 from starlette.datastructures import QueryParams
 
-from butler import create_app, parse_history
-
-TOKEN = "test-token"
-
-
-@pytest.fixture
-def db(tmp_path):
-    return tmp_path / "butler.db"
-
-
-@pytest.fixture
-def client(db):
-    return TestClient(
-        create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900)
-    )
+from butler import parse_history
 
 
 def plant(db, rows):

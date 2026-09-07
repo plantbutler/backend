@@ -14,30 +14,13 @@ from fastapi.testclient import TestClient
 
 import butler
 from butler import PHOTO_CAP, create_app
+from conftest import TOKEN
 
-TOKEN = "test-token"
 
 # A one-pixel JPEG, near enough: the backend checks the first three bytes
 # and never opens the image, so the rest only has to be bytes.
 JPEG = b"\xff\xd8\xff\xe0" + b"plant" * 20 + b"\xff\xd9"
 PNG = b"\x89PNG\r\n\x1a\n" + b"plant" * 20
-
-
-@pytest.fixture
-def db(tmp_path):
-    return tmp_path / "butler.db"
-
-
-@pytest.fixture
-def store(tmp_path):
-    return tmp_path / "pictures"
-
-
-@pytest.fixture
-def client(db, store):
-    return TestClient(
-        create_app(db_path=str(db), token=TOKEN, photos_dir=str(store))
-    )
 
 
 def auth(token=TOKEN):
@@ -122,12 +105,12 @@ def test_a_pot_sees_only_its_own_pictures(client):
     assert [row["id"] for row in strip(client, basil).json()["photos"]] == [mine]
 
 
-def test_the_file_lands_under_the_pot_s_own_directory(client, store):
+def test_the_file_lands_under_the_pot_s_own_directory(client, photos):
     pot = make_pot(client)
     pid = photo_id(upload(client, pot))
-    assert (store / pot / f"{pid}.jpg").read_bytes() == JPEG
+    assert (photos / pot / f"{pid}.jpg").read_bytes() == JPEG
     # nothing half-written is left beside it
-    assert list((store / pot).glob("*.part")) == []
+    assert list((photos / pot).glob("*.part")) == []
 
 
 def test_the_species_of_the_day_is_stamped_on_the_picture(client):
@@ -172,12 +155,12 @@ def test_a_wrong_token_cannot_tell_a_real_photo_id_from_a_made_up_one(client):
 # Refusals
 
 
-def test_a_photograph_of_a_pot_that_does_not_exist_is_refused(client, store):
+def test_a_photograph_of_a_pot_that_does_not_exist_is_refused(client, photos):
     answer = upload(client, "pot-abcdef")
     assert answer.status_code == 400
     assert "no such pot" in answer.text
     # refused before anything was written
-    assert list(store.rglob("*.jpg")) == []
+    assert list(photos.rglob("*.jpg")) == []
 
 
 def test_only_a_jpeg_gets_in(client):
@@ -259,7 +242,7 @@ def test_the_limit_pages_and_says_there_is_more(client):
 
 
 @pytest.mark.parametrize("nasty", ["../../etc", "a/b", "..", "pot%2F..%2Fx"])
-def test_a_pot_id_cannot_climb_out_of_the_store(client, store, nasty, tmp_path):
+def test_a_pot_id_cannot_climb_out_of_the_store(client, photos, nasty, tmp_path):
     answer = client.post(f"/photo?pot={nasty}", content=JPEG, headers=auth())
     assert answer.status_code in (400, 404), answer.text
     assert list(tmp_path.rglob("*.jpg")) == []
@@ -284,12 +267,12 @@ def test_a_delete_of_something_that_is_not_an_id_is_refused(client):
 # The two ways bytes and rows come apart
 
 
-def test_a_row_whose_file_has_gone_is_listed_as_missing_not_served(client, store):
+def test_a_row_whose_file_has_gone_is_listed_as_missing_not_served(client, photos):
     """What a database restored from a newer backup than the volume looks
     like: said out loud rather than served as a picture that will not load."""
     pot = make_pot(client)
     pid = photo_id(upload(client, pot))
-    (store / pot / f"{pid}.jpg").unlink()
+    (photos / pot / f"{pid}.jpg").unlink()
     (row,) = strip(client, pot).json()["photos"]
     assert row["id"] == pid
     assert row["missing"] is True
@@ -298,19 +281,19 @@ def test_a_row_whose_file_has_gone_is_listed_as_missing_not_served(client, store
     assert "its file is gone" in gone.text
 
 
-def test_a_file_no_row_knows_about_is_invisible(client, store):
+def test_a_file_no_row_knows_about_is_invisible(client, photos):
     """The other direction — a crash between the two writes, or a volume
     restored from a newer backup than the database: the strip is built
     from rows, never from the directory."""
     pot = make_pot(client)
-    orphan = store / pot
+    orphan = photos / pot
     orphan.mkdir(parents=True, exist_ok=True)
     (orphan / "photo-deadbeef.jpg").write_bytes(JPEG)
     assert strip(client, pot).json()["photos"] == []
     assert fetch(client, "photo-deadbeef").status_code == 404
 
 
-def test_a_failed_row_write_takes_its_file_with_it(client, db, store, monkeypatch):
+def test_a_failed_row_write_takes_its_file_with_it(client, db, photos, monkeypatch):
     """The bytes are written first; this is the window where an orphan can
     be minted deliberately rather than by a crash — the table is taken away
     while the file is on disk and the row that was about to point at it
@@ -327,21 +310,21 @@ def test_a_failed_row_write_takes_its_file_with_it(client, db, store, monkeypatc
     answer = upload(client, pot)
     monkeypatch.undo()
     assert answer.status_code == 503, answer.text
-    assert list(store.rglob("*.jpg")) == []
+    assert list(photos.rglob("*.jpg")) == []
 
 
 # --------------------------------------------------------------------------- #
 # Deleting
 
 
-def test_deleting_takes_the_row_and_the_file(client, store):
+def test_deleting_takes_the_row_and_the_file(client, photos):
     pot = make_pot(client)
     pid = photo_id(upload(client, pot))
     keep = photo_id(upload(client, pot))
     assert forget(client, pid).status_code == 200
     assert [row["id"] for row in strip(client, pot).json()["photos"]] == [keep]
-    assert not (store / pot / f"{pid}.jpg").exists()
-    assert (store / pot / f"{keep}.jpg").exists()
+    assert not (photos / pot / f"{pid}.jpg").exists()
+    assert (photos / pot / f"{keep}.jpg").exists()
     assert fetch(client, pid).status_code == 404
 
 
@@ -354,12 +337,12 @@ def test_deleting_twice_is_refused_rather_than_pretended(client):
     assert "no such photo" in again.text
 
 
-def test_a_row_whose_file_is_already_gone_can_still_be_deleted(client, store):
+def test_a_row_whose_file_is_already_gone_can_still_be_deleted(client, photos):
     """A volume that will not give up the bytes is not a reason to keep
     showing a picture somebody asked to remove."""
     pot = make_pot(client)
     pid = photo_id(upload(client, pot))
-    (store / pot / f"{pid}.jpg").unlink()
+    (photos / pot / f"{pid}.jpg").unlink()
     assert forget(client, pid).status_code == 200
     assert strip(client, pot).json()["photos"] == []
 
@@ -452,7 +435,7 @@ def test_a_photo_store_under_an_unmounted_data_is_refused(tmp_path, monkeypatch)
 # Two photographs that want the same id
 
 
-def test_a_taken_id_is_given_up_rather_than_overwritten(client, store, monkeypatch):
+def test_a_taken_id_is_given_up_rather_than_overwritten(client, photos, monkeypatch):
     """The dangerous half of a collision: writing the file first and
     finding out from the INSERT would destroy the picture already at that
     path, an earlier photograph whose row would then point at nothing."""
@@ -471,7 +454,7 @@ def test_a_taken_id_is_given_up_rather_than_overwritten(client, store, monkeypat
     assert not any(row["missing"] for row in strip(client, pot).json()["photos"])
 
 
-def test_an_id_whose_row_outlived_its_file_is_also_given_up(client, store, monkeypatch):
+def test_an_id_whose_row_outlived_its_file_is_also_given_up(client, photos, monkeypatch):
     """The other way two ids collide: the file is gone but the row is not,
     what a half-restored backup leaves. The new picture must not take that
     row's id and must not touch that row."""
@@ -479,7 +462,7 @@ def test_an_id_whose_row_outlived_its_file_is_also_given_up(client, store, monke
     minted = iter(["photo-aaaaaaaa", "photo-aaaaaaaa", "photo-bbbbbbbb"])
     monkeypatch.setattr(butler, "new_photo_id", lambda: next(minted))
     first = photo_id(upload(client, pot))
-    (store / pot / f"{first}.jpg").unlink()  # the file, not the row
+    (photos / pot / f"{first}.jpg").unlink()  # the file, not the row
     second = photo_id(upload(client, pot))
     monkeypatch.undo()
     assert second == "photo-bbbbbbbb"

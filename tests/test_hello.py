@@ -10,22 +10,9 @@ import subprocess
 import tomllib
 
 import pytest
-from fastapi.testclient import TestClient
 
 import butler
-from butler import create_app
-
-TOKEN = "test-token"
-
-
-@pytest.fixture
-def db(tmp_path):
-    return tmp_path / "butler.db"
-
-
-@pytest.fixture
-def client(db):
-    return TestClient(create_app(db_path=str(db), token=TOKEN))
+from conftest import TOKEN
 
 
 def hello(client, token=TOKEN):

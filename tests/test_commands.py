@@ -3,24 +3,10 @@
 import sqlite3
 
 import pytest
-from fastapi.testclient import TestClient
 
 import butler
 from butler import cap_for, create_app, parse_command, parse_report
-
-TOKEN = "test-token"
-
-
-@pytest.fixture
-def db(tmp_path):
-    return tmp_path / "butler.db"
-
-
-@pytest.fixture
-def client(db):
-    return TestClient(
-        create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900)
-    )
+from conftest import TOKEN
 
 
 def report(client, body, token=TOKEN):

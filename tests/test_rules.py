@@ -9,44 +9,15 @@ from fastapi.testclient import TestClient
 
 import butler
 from butler import create_app, in_quiet, parse_quiet, parse_report
+from conftest import TOKEN, make_pot, post
 
-TOKEN = "test-token"
 DRY = 11000  # pct 12 with the calibration below
 WET = 8000  # pct 50
 
 
 @pytest.fixture
-def db(tmp_path):
-    return tmp_path / "butler.db"
-
-
-@pytest.fixture
-def client(db):
-    # quiet="0-0": the tests must not care what time it is
-    return TestClient(
-        create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900, quiet="0-0")
-    )
-
-
-def make_pot(client, drop=None, **over):
-    fields = {
-        "name": "basil",
-        "controller": 0,
-        "channel": 0,
-        "outlet": 3,
-        "dry_raw": 12000,
-        "wet_raw": 4000,
-        "target_low_pct": 30,
-        "target_high_pct": 60,
-        "dose_ml": 100,
-        "mode": "auto",
-    } | over
-    if drop:
-        del fields[drop]
-    body = " ".join(f"{k}={v}" for k, v in fields.items())
-    answer = client.post("/pot", content=body, headers={"X-Token": TOKEN})
-    assert answer.status_code == 200, answer.text
-    return answer.text.split()[0].removeprefix("pot=")
+def settings():
+    return {"quiet": "0-0"}  # the tests must not care what time it is
 
 
 def report(client, raw=DRY, safe=True, extra="", token=TOKEN):
@@ -78,10 +49,6 @@ def commands(db):
         return con.execute(
             "SELECT id, state, source, ml, cap_s, outlet FROM commands ORDER BY id"
         ).fetchall()
-
-
-def post(client, path, body, token=TOKEN):
-    return client.post(path, content=body, headers={"X-Token": token})
 
 
 # --------------------------------------------------------------------------- #

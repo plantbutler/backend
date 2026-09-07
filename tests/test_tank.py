@@ -18,66 +18,29 @@ from butler import (
     create_app,
     parse_report,
 )
+from conftest import (
+    TOKEN,
+    age_controller,
+    capturing,
+    health,
+    keys,
+    make_pot,
+    post,
+    report,
+    run_sql,
+    taps,
+    tick,
+    word_since,
+)
 
-TOKEN = "test-token"
 DRY = 11000  # pct 12 with make_pot's calibration
 WET = 8000  # pct 50
 
 
 @pytest.fixture
-def db(tmp_path):
-    return tmp_path / "butler.db"
-
-
-@pytest.fixture
-def sent():
-    return []
-
-
-@pytest.fixture
-def app(db, sent):
-    return create_app(
-        db_path=str(db),
-        token=TOKEN,
-        next_s=60,
-        cmd_ttl_s=900,
-        quiet="0-0",
-        send=lambda alert: sent.append(alert) or True,
-        ping=lambda: True,
-    )
-
-
-@pytest.fixture
-def client(app):
-    return TestClient(app)
-
-
-def post(client, path, body):
-    return client.post(path, content=body, headers={"X-Token": TOKEN})
-
-
-def report(client, body):
-    answer = post(client, "/report", body)
-    assert answer.status_code == 200, answer.text
-    return answer
-
-
-def health(client, controller=0):
-    entries = client.get("/health").json()["controllers"]
-    return next(c for c in entries if c["controller"] == controller)
-
-
-def tick(app, now=None):
-    return app.state.tick(now)
-
-
-def keys(sent):
-    return [a.key for a in sent if a.message is not None]
-
-
-def run_sql(db, sql, *params):
-    with sqlite3.connect(db) as con:
-        return con.execute(sql, params).fetchall()
+def settings(sent, pinged):
+    # quiet="0-0": the tests must not care what time it is
+    return {"quiet": "0-0"} | capturing(sent, pinged)
 
 
 # --------------------------------------------------------------------------- #
@@ -190,25 +153,6 @@ def test_a_pot_cannot_be_saved_with_a_dose_the_board_would_refuse(client):
 # --------------------------------------------------------------------------- #
 
 
-def make_pot(client, **over):
-    fields = {
-        "name": "basil",
-        "controller": 0,
-        "channel": 0,
-        "outlet": 3,
-        "dry_raw": 12000,
-        "wet_raw": 4000,
-        "target_low_pct": 30,
-        "target_high_pct": 60,
-        "dose_ml": 100,
-        "mode": "auto",
-    } | over
-    body = " ".join(f"{k}={v}" for k, v in fields.items())
-    answer = post(client, "/pot", body)
-    assert answer.status_code == 200, answer.text
-    return answer.text.split()[0].removeprefix("pot=")
-
-
 def dry_reports(client, n=5, extra=""):
     """n dry reports with the safety fields the rules need; no t=, so none
     is a retry of another. Returns the last response text."""
@@ -256,11 +200,6 @@ def test_no_pos_page_before_a_board_has_ever_said_pos_ok(app, client, sent):
 # --------------------------------------------------------------------------- #
 # Retirement
 # --------------------------------------------------------------------------- #
-
-
-def age_controller(db, seconds):
-    with sqlite3.connect(db) as con:
-        con.execute("UPDATE controllers SET last_seen = last_seen - ?", (seconds,))
 
 
 def test_parse_controller_wants_both_fields_once():
@@ -824,15 +763,6 @@ def learn_the_tank(app, client, db, sent, size):
 
 def rules_water(db):
     return run_sql(db, "SELECT id FROM commands WHERE source = 'rules'")
-
-
-def taps(db):
-    return [ts for (ts,) in run_sql(db, "SELECT ts FROM refills ORDER BY ts, rowid")]
-
-
-def word_since(db):
-    """When the float's word last changed, 1 -> 0 or 0 -> 1."""
-    return run_sql(db, "SELECT float_word_since FROM status WHERE controller = 0")[0][0]
 
 
 def rise(db):

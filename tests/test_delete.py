@@ -9,40 +9,15 @@ import sqlite3
 import time
 
 import pytest
-from fastapi.testclient import TestClient
 
-from butler import create_app
+from conftest import TOKEN, post
 
-TOKEN = "test-token"
 DRY, WET = 9000, 4000
 
 
 @pytest.fixture
-def db(tmp_path):
-    return tmp_path / "butler.db"
-
-
-@pytest.fixture
-def photos(tmp_path):
-    return tmp_path / "photos"
-
-
-@pytest.fixture
-def client(db, photos):
-    return TestClient(
-        create_app(
-            db_path=str(db),
-            token=TOKEN,
-            next_s=60,
-            cmd_ttl_s=900,
-            quiet="0-0",  # the tests must not care what time it is
-            photos_dir=str(photos),
-        )
-    )
-
-
-def post(client, path, body):
-    return client.post(path, content=body, headers={"X-Token": TOKEN})
+def settings():
+    return {"quiet": "0-0"}  # the tests must not care what time it is
 
 
 def pot(client, body):
