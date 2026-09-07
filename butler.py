@@ -424,6 +424,29 @@ def add_columns(con: sqlite3.Connection) -> list[str]:
     return added
 
 
+def name_standing_latches(con: sqlite3.Connection) -> int:
+    """Put its reason on a `latch:<c>` row from before the row carried one.
+
+    The page has named the reason since 0.18.0; the row kept none until
+    spec D14 (d) made the two disagreeing — a standing latch renamed by
+    D12's overwrite — the tick's cue to page again. Read as "the reason
+    changed", a row with no reason would page every latched board once
+    more on the first tick after the upgrade, for a fault nobody touched.
+    The reason the latch has now is the one the row gets: what the old
+    page named is written nowhere, and a latch renamed between the two
+    upgrades goes untold rather than every latch told twice. Runs at every
+    startup and touches nothing twice: a named row is left alone, and so
+    is a cleared one, which the next latch overwrites with its own reason.
+    Returns how many rows it named.
+    """
+    with con:
+        return con.execute(
+            "UPDATE alerts SET detail = (SELECT latch_reason FROM status "
+            "WHERE 'latch:' || controller = alerts.key) "
+            "WHERE key LIKE 'latch:%' AND cleared_ts IS NULL AND detail IS NULL"
+        ).rowcount
+
+
 def migrate(con: sqlite3.Connection, db_path: str) -> bool:
     """The one-time rebuild of `pots`, run at startup. Returns True if it ran.
 
@@ -2352,6 +2375,9 @@ def create_app(
         # already in the new shape, so migrate() sees no `controller`
         # column on pots and returns immediately.
         migrate(bootstrap, str(db))
+        named = name_standing_latches(bootstrap)
+        if named:
+            print(f"named {named} standing latch(es)", file=sys.stderr)
 
     def connect() -> sqlite3.Connection:
         con = sqlite3.connect(db, timeout=5)

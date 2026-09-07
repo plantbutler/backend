@@ -663,6 +663,40 @@ def test_a_renamed_latch_pages_again_with_its_new_words(app, client, db, sent):
     assert alerts(client) == ["latch:0"]
 
 
+def test_a_latch_standing_through_the_upgrade_is_named_and_not_paged_again(client, db):
+    """A latch: row from before the row carried its reason has none, and
+    read as "the reason changed" it would page every latched board once
+    more on the first tick after the upgrade, for a fault nobody touched.
+    The upgrade puts the latch's own reason on the row instead: the ticks
+    after it are quiet, and a rename after that pages, as it should. The
+    stamp is the old page's, not the upgrade's (spec D14 d)."""
+    report(client, "c=0 ch0=1 float=1 pos=ok ch207=1")  # latched, by the code
+    run_sql(  # the row the tick wrote before it carried the reason
+        db,
+        "INSERT INTO alerts (key, raised_ts, cleared_ts, detail) "
+        "VALUES ('latch:0', 1000, NULL, NULL)",
+    )
+    sent = []
+    upgraded = create_app(
+        db_path=str(db),
+        token=TOKEN,
+        next_s=60,
+        cmd_ttl_s=900,
+        quiet="0-0",
+        send=lambda alert: sent.append(alert) or True,
+        ping=lambda: True,
+    )
+    assert run_sql(db, "SELECT raised_ts, detail FROM alerts WHERE key = 'latch:0'") == [
+        (1000, "contra")
+    ]
+    tick(upgraded)
+    tick(upgraded)
+    assert keys(sent) == []  # nothing about the fault changed
+    report(TestClient(upgraded), "c=0 ch0=1 float=1 pos=ok ch207=1 err=resetmid")
+    tick(upgraded)
+    assert keys(sent) == ["latch:0"] and "type dry off on the board" in sent[0].message
+
+
 def test_the_latch_pages_once_and_resume_clears_row_and_page(app, client, db, sent):
     report(client, "c=0 ch0=1 float=1 pos=ok ch207=1 err=contra")
     tick(app)
@@ -1493,6 +1527,9 @@ def test_the_helpers_read_the_origin_the_size_the_tap_and_the_float(app, db):
         assert state() == "ok"  # 200 + 10 %: at the line
         pumped(1, 1002)
         assert state() == ("over", 221, 200, 1000)
+        con.execute("UPDATE status SET float_firm = NULL")  # full, said once
+        assert state() == "ok"  # over waits for the firm word, and NULL is not it
+        con.execute("UPDATE status SET float_firm = 1")
         con.execute("UPDATE status SET float_rise = 1002")  # rose after the tap...
         assert origin() == (1000, "tap")  # ...with no drop since it: the tap's own fill
         con.execute("UPDATE refills SET drop_ts = 1002 WHERE float_ok = 1")
