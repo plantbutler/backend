@@ -1,6 +1,6 @@
 """The tank has a size: what the float said at the tap, the counter, the
 samples the float closes, the median, the page each sample earns, and what
-/health says about them (spec D1-D5, D8 and D9's three read-only fields)."""
+/health says about them."""
 
 import sqlite3
 import time
@@ -103,9 +103,8 @@ def age(db, seconds):
             "UPDATE tank_samples SET ts = ts - ?, refill_ts = refill_ts - ?",
             (seconds, seconds),
         )
-        # The pages too, the ticker's own bookkeeping rows excepted (they
-        # are its clock): a tap clears `over:` only when it is later than
-        # the raise, and a raise from this same second must be able to be.
+        # meta: rows excepted, they're the ticker's own clock; a tap must
+        # be able to clear `over:` from the same second as the raise.
         con.execute(
             "UPDATE alerts SET raised_ts = raised_ts - ?, cleared_ts = cleared_ts - ? "
             "WHERE key NOT LIKE 'meta:%'",
@@ -243,16 +242,14 @@ def vm_steps(con, fetch):
 
 
 # --------------------------------------------------------------------------- #
-# The tap snapshots the float (spec D2)
+# The tap snapshots the float
 # --------------------------------------------------------------------------- #
 
 
 def test_a_tap_remembers_what_the_float_said(client, db):
     """The board's last real word, not the latest report's float_ok,
-    which one report that omits float= blanks: a tap made under a row
-    reading "float ?" is a tap all the same, and must not be one that
-    counts for nothing. NULL only for a board that has never said
-    float= (spec D2, thrice)."""
+    which a report that omits float= blanks: a tap made under "float ?"
+    still counts. NULL only for a board that never said float=."""
     assert post(client, "/refill", "c=0").status_code == 200  # never reported
     report(client, "c=0 ch0=1 float=1")
     assert post(client, "/refill", "c=0").status_code == 200
@@ -268,7 +265,7 @@ def test_a_tap_remembers_what_the_float_said(client, db):
 
 
 # --------------------------------------------------------------------------- #
-# The counter (spec D3)
+# The counter
 # --------------------------------------------------------------------------- #
 
 
@@ -299,14 +296,12 @@ def test_the_counter_is_acked_water_sent_after_the_tap(client, db):
 def test_the_counter_starts_at_the_latest_tap_that_saw_the_float_or_the_rise(
     client, db
 ):
-    """The base is the latest tap whose snapshot is not NULL; the float's
-    latest rise is the origin only once the word has gone 1 -> 0 after that
-    tap (its drop_ts) and rose later. A tap the board never saw is no
-    origin — a month of untapped top-ups behind it is not a measurement —
-    and without one the float's rises count for nothing. A float that
-    went 1 -> 0 -> 1 since the tap is a tank refilled by someone who
-    forgot to tap: the counter restarts at the rise instead of calling the
-    float stuck; the same second is the tap's (spec D3, amended twice)."""
+    """The base is the latest tap whose snapshot is not NULL. The rise
+    becomes the origin only once the word has dropped after that tap and
+    risen again later; a tap the board never saw is no origin, so untapped
+    top-ups before it count for nothing. A float that goes 1 -> 0 -> 1
+    since the tap means someone refilled without tapping: the counter
+    restarts at the rise. A tie on the same second goes to the tap."""
     assert origin(db) is None  # nothing said, nothing tapped
     assert post(client, "/refill", "c=0").status_code == 200  # never sent float=
     age(db, 60)
@@ -369,11 +364,10 @@ def test_the_counter_starts_at_the_latest_tap_that_saw_the_float_or_the_rise(
 
 
 def test_the_firm_word_starts_null_and_null_is_no_edge(client, db):
-    """The first report that carries float= sets nothing firm: the firm
-    word is what two consecutive float-carrying reports agree on, and
-    starts NULL. NULL is never an edge — the firm word becoming 1 out of
-    NULL is no rise, becoming 0 out of NULL is no drop, and a forced
-    report confirming it forces nothing (spec D14 c)."""
+    """The firm word is what two consecutive float-carrying reports agree
+    on, and starts NULL. NULL is never an edge: becoming 1 out of NULL is
+    no rise, becoming 0 is no drop, and a forced report confirming it
+    forces nothing."""
     report(client, "c=0 ch0=1 float=1")
     assert firm(db) is None and rise(db) is None
     report(client, "c=0 ch0=1 float=1")  # the next agrees: the word is firm...
@@ -404,10 +398,9 @@ def test_the_firm_word_starts_null_and_null_is_no_edge(client, db):
 
 def test_the_forced_flag_is_the_last_firm_drops(client, db):
     """float_forced says whether the firm word's last drop came with
-    ch207=1, and only the next firm drop writes it again: the firm word
-    coming back out of a forced 0 stamps no rise and leaves the flag —
-    nothing reads it between a rise and the next drop, so a clearing
-    there had no effect and is gone (spec D4, D14 c)."""
+    ch207=1; only the next firm drop overwrites it. Coming back out of a
+    forced 0 stamps no rise, so nothing between a rise and the next drop
+    ever reads the flag."""
     full(client)
     since = tap(client, db)
     dose(client, 100, flow=100)
@@ -432,8 +425,7 @@ def test_the_forced_flag_is_the_last_firm_drops(client, db):
 def test_a_rise_before_any_drop_after_the_tap_leaves_the_tap(client, db):
     """A 0 -> 1 with no drop after the tap is the tap's own refill arriving
     on the wire after a tap made at empty: the tap stays the origin, and
-    the run it starts closes on the tap — the ordinary "tank empty, fill,
-    tap" run, which the first wording lost (spec D3, D4, amended twice)."""
+    the run it starts closes on the tap."""
     full(client)
     empty(client)  # ran dry
     age(db, FLAP_WINDOW_S + 1)
@@ -452,12 +444,12 @@ def test_a_rise_before_any_drop_after_the_tap_leaves_the_tap(client, db):
 
 
 def test_a_tap_between_the_two_sightings_of_empty_is_after_the_run(client, db):
-    """The drop is confirmed a report after the word fell, and a person
-    who saw the tank empty, filled it and tapped inside that beat made a
-    tap the run did not start from: the drop and the sample are the
-    earlier tap's, where the word fell, the new tap keeps NULL, and the
-    pour reaching the float is not a rise past a drop — the new tap stays
-    the origin, and its own run is the next sample (spec D2, D4, thrice)."""
+    """The drop is confirmed a report after the word fell. A tap made
+    inside that beat — the tank seen empty, refilled and tapped before
+    the second sighting confirms — did not start the run: the drop and
+    sample are the earlier tap's, the new tap keeps NULL, and the pour
+    reaching the float is no rise past a drop. The new tap becomes the
+    origin, and its own run is the next sample."""
     full(client)
     tap(client, db)
     dose(client, 200, flow=200)
@@ -478,14 +470,12 @@ def test_a_tap_between_the_two_sightings_of_empty_is_after_the_run(client, db):
 
 
 def test_one_sighting_of_empty_between_two_of_full_moves_nothing(client, db):
-    """The wire's word is one glitch to 0 by design (safety.cpp fails the
-    word on any of three samples), so the tank is measured on the firm
-    word — two consecutive reports that carry float= agreeing — and a
-    slosh at report time neither closes the sample early nor hands the
-    origin to its recovery: no drop, no sample, no rise, the counter
-    where it was. Two sightings stamp the drop where the word fell and
-    close the sample on the water counted at the second, the dose handed
-    on the first included (spec D3, D4, thrice)."""
+    """The board's raw word can glitch to 0 on any one bad sample
+    (safety.cpp), so the tank is measured on the firm word: two
+    consecutive float= reports agreeing. A slosh at report time closes no
+    sample and moves no origin. Two sightings stamp the drop where the
+    word fell and close the sample on the water counted through the
+    confirming report."""
     full(client)
     since = tap(client, db)
     dose(client, 100, flow=90)
@@ -515,12 +505,10 @@ def test_one_sighting_of_empty_between_two_of_full_moves_nothing(client, db):
 
 def test_a_glitch_report_delivered_twice_confirms_nothing(client, db):
     """The firmware retries a report with the body kept when the response
-    is lost, and the retry is the same report, not the next one: a
+    is lost: the retry is the same report, not the next one, so a
     one-glitch sighting delivered twice must not agree with itself into
     the firm word. The duplicate check on (controller, t) runs before the
-    status upsert and the edge step, not only before the readings, so a
-    retried report changes nothing about the float (spec D4, four
-    times)."""
+    status upsert and the edge step, not only before the readings."""
     full(client)
     since = tap(client, db)
     dose(client, 100, flow=100)
@@ -541,17 +529,11 @@ def test_a_glitch_report_delivered_twice_confirms_nothing(client, db):
 
 
 def test_the_firm_words_clocks_are_where_the_word_moved(client, db):
-    """The firm word's clocks — the drop on its tap, the rise — are the
-    word's own: where it moved, not where the next report confirmed it.
-    On a board the two agreeing reports are a beat apart, and the report
-    that raises the word hands its queued dose with the move's clock — a
-    clock set at the confirmation would put that dose before the rise and
-    off the counter. The tests around this one confirm inside a second,
-    where the two are one number; here a beat sits between, on the drop
-    and on the rise. And one sighting moves neither clock: there is no
-    rise yet — the first firm full, out of NULL, is none — and none until
-    the next report agrees; a rise stamped at the sighting would be the
-    fall's clock, not the word's (spec D3, D4, thrice, D14 c)."""
+    """The firm word's clocks — the drop's tap, the rise — are where the
+    word itself moved, not where the next report confirmed it: a clock
+    set at confirmation would put a dose handed on the raising report
+    before the rise and off the counter. One sighting moves neither
+    clock, since there is no rise yet to stamp."""
     full(client)
     tap(client, db)
     report(client, "c=0 ch0=1 float=0")  # the word fell here...
@@ -571,16 +553,14 @@ def test_the_firm_words_clocks_are_where_the_word_moved(client, db):
 
 
 def test_a_slosh_after_an_untapped_refill_moves_neither_rise_nor_counter(client, db):
-    """Once the origin is a rise — the tank ran down and someone refilled
-    it without tapping — the raw word sloshing at the line is no edge of
-    the firm word, and the counter must not move on it. Empty again, a
-    0 -> 1 -> 0 is no rise: the origin stays the rise and the water since
-    it stays on the counter, rather than restarting at the slosh with the
-    run's water laundered. Full again, a 1 -> 0 -> 1 that the next report
-    confirms is no rise either: the rise is where the firm word rose, not
-    where a glitch recovered. The rise's guard is two conditions — the
-    last word agreeing with this one, the firm word not already full —
-    and each slosh gets past one of them alone (spec D3, thrice)."""
+    """Once the origin is a rise (the tank ran down and was refilled
+    without tapping), a raw slosh at the line is no edge of the firm word
+    and must not move the counter. A 0 -> 1 -> 0 empties again with no
+    rise: the origin stays the rise, or the run's water would be
+    laundered. A confirmed 1 -> 0 -> 1 is no rise either — the rise is
+    where the firm word rose, not where a glitch recovered. The rise's
+    guard is two conditions (the last word agreeing with this one, and
+    the firm word not already full), and each slosh defeats only one."""
     full(client)
     tap(client, db)
     dose(client, 100, flow=100)
@@ -615,16 +595,14 @@ def test_a_slosh_after_an_untapped_refill_moves_neither_rise_nor_counter(client,
 
 
 def test_a_forced_zero_is_not_a_drop(client, db):
-    """A contra forces the board's word to 0 on every report until
-    `clear contra` is typed: "float OK, zero pulses", a fault and not the
-    tank. Stamped as the tap's drop, the word coming back after `clear
-    contra` read as a rise past it — an untapped refill — and the counter
-    restarted with the run's water laundered and its sample lost. So a
-    report carrying ch207=1 stamps nothing, the forced 0 is remembered
-    (status.float_forced), and the firm word coming back out of it is no
-    rise: the tap stays the origin through the contra, the resume and the
-    clear, and the run's later real drain closes its sample on all the
-    water since the tap (spec §1, D3, D4, four times)."""
+    """A contra forces the board's word to 0 on every report until `clear
+    contra` is typed: "float OK, zero pulses" is a fault, not the tank
+    draining. Stamped as the tap's drop, the word coming back after
+    `clear contra` would read as an untapped-refill rise and launder the
+    run's water. So ch207=1 stamps no drop, the forced 0 is remembered
+    (status.float_forced), and the firm word's return out of it is no
+    rise: the tap stays the origin through the contra, the resume and
+    the clear."""
     full(client)
     since = tap(client, db)
     dose(client, 100, flow=100)
@@ -645,11 +623,10 @@ def test_a_forced_zero_is_not_a_drop(client, db):
 
 
 def test_clear_contra_after_a_tap_at_the_forced_zero_leaves_the_tap(client, db):
-    """A contra forces the board's word to 0; the human taps, resumes and
-    types `clear contra`, and the word comes back to 1. That is no rise —
-    the word comes back out of a forced 0 — and the forced 0 stamped no
-    drop on either tap, so the tap stays the origin and the run it starts
-    is a sample (spec §1, D3 amended twice, then thrice, four times)."""
+    """A contra forces the word to 0; the human taps, resumes and types
+    `clear contra`, and the word returns to 1. That is no rise, and the
+    forced 0 stamped no drop on either tap, so the tap stays the origin
+    and the run it starts is a sample."""
     full(client)
     tap(client, db)
     dose(client, 100, flow=100)
@@ -671,16 +648,13 @@ def test_clear_contra_after_a_tap_at_the_forced_zero_leaves_the_tap(client, db):
 
 
 def test_a_contra_once_the_tank_is_empty_forces_nothing(client, db):
-    """The forced 0 is remembered on the firm drop that arrives with
-    ch207=1 — the report that confirms the drop, and that one alone. A
-    contra that comes later, the word already firmly 0 after a real
-    drain, is a fault over an empty tank and not what emptied it: the
-    drop closed its sample unforced and stays so. Remembered as forced,
-    the untapped refill after `clear contra` would stamp no rise — the
-    word "came back out of a forced 0" — and the counter would keep the
-    tap for its origin with the run already sampled on it, a false
-    stuck-at-full page a few doses into a fresh tank (spec D3, D4, four
-    times)."""
+    """The forced flag is set only on the firm drop's confirming report
+    when it carries ch207=1 — not on a contra that arrives later, once
+    the word is already firmly 0 after a real drain. That later contra is
+    a fault over an already-empty tank, not what emptied it, so the drop
+    stays unforced. Marking it forced would make the next untapped refill
+    stamp no rise, leaving the counter stuck on the old tap and a false
+    stuck-at-full page a few doses into a fresh tank."""
     full(client)
     since = tap(client, db)
     dose(client, 100, flow=100)
@@ -697,15 +671,14 @@ def test_a_contra_once_the_tank_is_empty_forces_nothing(client, db):
 
 
 def test_a_contra_after_an_untapped_refill_keeps_the_rise(client, db):
-    """The contra latch is what forces the word to 0, so a firm 1 -> 0
-    arriving with ch207=1 is remembered as forced, and the firm 0 -> 1
-    that ends it — `clear contra` typed — stamps no rise. The second
-    review found that rise became the origin whenever the tap's drop_ts
-    was already set, an untapped refill's run being exactly that: the
-    counter restarted at the clear with the run's water laundered. A real
-    drain after the clear is the untapped refill's second, no sample; and
-    that drain is the firm word's last, unforced, so the rise after it
-    counts (spec D3, D4, four times, D14 c)."""
+    """The contra latch forces the word to 0, so a firm 1 -> 0 arriving
+    with ch207=1 is remembered as forced, and the firm 0 -> 1 that ends
+    it — `clear contra` typed — stamps no rise. Without that, the rise
+    would become the origin whenever the tap's drop_ts was already set —
+    exactly the case for an untapped refill's run — restarting the
+    counter and laundering the run's water. A real drain after the clear
+    is that refill's second drain, so it takes no sample; the drain after
+    it is the firm word's next unforced one, and its rise counts."""
     full(client)
     tap(client, db)
     dose(client, 100, flow=100)
@@ -738,9 +711,9 @@ def test_a_contra_after_an_untapped_refill_keeps_the_rise(client, db):
 
 def test_a_report_without_float_moves_no_rise(client, db):
     """A report that says nothing about the float neither rises nor
-    falls: the rise the float had stands through it, and none is invented
-    when it says the same word again — the word's own clock, not
-    float_since, which such a report restarts (spec D3, amended)."""
+    falls: the existing rise stands through it, and none is invented when
+    the same word repeats. The rise is the word's own clock, not
+    float_since, which a silent report restarts."""
     full(client)
     since = tap(client, db)
     dose(client, 150, flow=150)
@@ -764,9 +737,9 @@ def test_a_report_without_float_moves_no_rise(client, db):
 
 
 def test_a_dose_typed_before_the_tap_and_handed_after_it_counts(client, db):
-    """The counter's side of the tap is the board's, sent_ts — when it was
-    handed the dose — not the phone's created_ts: water typed before the
-    tap and pumped after it left the full tank (spec D3)."""
+    """The counter reads sent_ts — when the board was handed the dose —
+    not created_ts, when it was typed: water typed before the tap but
+    pumped after it left the full tank."""
     report(client, "c=0 ch0=1 float=1")
     answer = post(client, "/command", "c=0 water=3 ml=70")
     assert answer.status_code == 200, answer.text
@@ -783,11 +756,11 @@ def test_a_dose_typed_before_the_tap_and_handed_after_it_counts(client, db):
 
 def test_a_dose_handed_on_the_report_that_raises_the_float_counts(client, db):
     """The report that first says full after empty is the rise, once the
-    next agrees, and it hands whatever was queued with its own clock: that
-    dose pumps after it was handed, from the refilled tank. A counter
-    strict about the origin's second lost it for ever, and so would a
-    rise stamped where it was confirmed, a beat later, rather than where
-    the word rose (spec D3, amended, then thrice)."""
+    next report agrees, and it hands whatever was queued with the rise's
+    own clock: that dose pumps from the refilled tank. A counter strict
+    about being after the origin's second would lose it, and so would a
+    rise stamped where it was confirmed rather than where the word
+    actually rose."""
     full(client)
     tap(client, db)
     empty(client)  # ran down
@@ -810,16 +783,15 @@ def test_a_dose_handed_on_the_report_that_raises_the_float_counts(client, db):
 
 
 def test_a_dose_handed_in_the_taps_own_second_counts(client, db):
-    """The tank was filled before the human tapped, and the dose pumps
-    after it was handed: a hand-off in the tap's second left the full
-    tank (spec D3, amended)."""
+    """The tank was filled before the human tapped: a dose handed off in
+    the tap's own second still left from the full tank."""
     report(client, "c=0 ch0=1 float=1")
     age(db, 60)
     cmd_id = hand(client, 60)
     since = tap(client, db)
     ack(client, cmd_id, flow=60)
-    # Pinned to the tap's second by hand — whether the hand-off and the
-    # tap land in one second is the wall clock's business. At, not after.
+    # Pinned to the tap's second by hand: whether hand-off and tap land
+    # in one second is the wall clock's business. At, not after.
     run_sql(db, "UPDATE commands SET sent_ts = ? WHERE id = ?", since, cmd_id)
     assert health(client)["pumped_ml"] == 60
     run_sql(db, "UPDATE commands SET sent_ts = ? WHERE id = ?", since - 1, cmd_id)
@@ -828,9 +800,9 @@ def test_a_dose_handed_in_the_taps_own_second_counts(client, db):
 
 def test_a_stop_acked_with_a_count_is_not_water(client, db):
     """A stop's ack may carry flow_ml=: what flowed before the board
-    stopped, which the dose's own ack already counted. The ack step stamps
+    stopped, already counted by the dose's own ack. The ack step stamps
     it on the stop row like any other, so only the counter's kind = 'water'
-    keeps it out of pumped_ml and out of the sample (spec D3)."""
+    filter keeps it out of pumped_ml and the sample."""
     full(client)
     tap(client, db)
     dose(client, 100, flow=90)
@@ -848,7 +820,7 @@ def test_a_stop_acked_with_a_count_is_not_water(client, db):
 
 
 # --------------------------------------------------------------------------- #
-# Learning a sample (spec D4)
+# Learning a sample
 # --------------------------------------------------------------------------- #
 
 
@@ -876,10 +848,9 @@ def test_the_float_going_empty_closes_one_sample_per_tap(client, db):
     empty(client)
     assert samples(db) == [(taps(db)[0], 170)]
     assert drops(db)[-1] == word_since(db)
-    # Water flows and the float goes empty again on the same tap — but it
-    # rose after that tap's drop, so the tank was refilled by someone who
-    # did not say so, and how full it was is anybody's guess: a second
-    # drain stores nothing (spec D4, amended twice).
+    # Water flows and the float goes empty again on the same tap, but it
+    # rose after that tap's drop: refilled by someone who did not say so,
+    # how full it was is anybody's guess, so a second drain stores nothing.
     age(db, 60)
     full(client)
     assert origin(db)[1] == "rise"
@@ -897,14 +868,13 @@ def test_the_float_going_empty_closes_one_sample_per_tap(client, db):
 
 
 def test_a_bounce_while_the_firm_word_is_empty_is_no_drop(client, db):
-    """Once the firm word is at 0, the raw word bouncing 0 -> 1 -> 0 moves
-    the word's clock and nothing else: the report that agrees with the
-    bounce's fall is not the firm word going 1 -> 0 — it never left 0 —
-    so it stamps no tap and closes nothing. The gate is the firm word,
-    not the last report having said 0 as well: the bounce's fall is later
-    than a tap made at empty, and that gate alone hands the tap a drop it
-    never had and closes its run, still open, on the noise — the true
-    drain then stores nothing, being a second drain (spec D4, thrice)."""
+    """Once the firm word is at 0, a raw bounce 0 -> 1 -> 0 moves the
+    word's clock and nothing else: the firm word never left 0, so the
+    report agreeing with the bounce's fall stamps no drop and closes
+    nothing. The gate must be the firm word, not merely the last report
+    also having said 0 — that weaker gate would hand a tap made at empty
+    a drop it never had, close its still-open run on the noise, and then
+    treat the true drain as a second drain that stores nothing."""
     full(client)
     tap(client, db)
     dose(client, 100, flow=100)
@@ -943,9 +913,9 @@ def test_a_bounce_while_the_firm_word_is_empty_is_no_drop(client, db):
 
 
 def test_a_contra_report_or_a_standing_latch_closes_no_sample(client, db):
-    """ch207=1 is "float OK, zero pulses", and zero pulses is a dead meter,
-    a kinked tube, a dead pump or 12 V absent as often as anything about
-    the tank: a fault, not a measurement (spec §1, D4 amended)."""
+    """ch207=1 is "float OK, zero pulses" — a dead meter, a kinked tube,
+    a dead pump or 12 V absent as often as anything about the tank
+    itself: a fault, not a measurement."""
     full(client)
     tap(client, db)
     cmd_id = hand(client, 100)
@@ -954,10 +924,10 @@ def test_a_contra_report_or_a_standing_latch_closes_no_sample(client, db):
     assert health(client)["latched"]["reason"] == "contra"
     assert health(client)["pumped_ml"] == 90  # acked water is a fact
     assert samples(db) == [] and drops(db) == [None]  # a forced 0 is no drop
-    # A latch standing from before the edge — here the reset with the pump
-    # running, the float saying full throughout — closes none either: a
+    # A latch standing from before the edge — the reset with the pump
+    # running, float saying full throughout — closes no sample either: a
     # fault stood over the run. The drop is stamped all the same; the
-    # word under that latch is the float's own.
+    # word under a latch is still the float's own.
     assert post(client, "/resume", "c=0").status_code == 200
     full(client)
     tap(client, db)
@@ -977,13 +947,13 @@ def test_a_contra_report_or_a_standing_latch_closes_no_sample(client, db):
 
 
 def test_a_drain_under_a_resetmid_latch_is_a_drop_and_no_sample(client, db):
-    """The contra latch is what forces the word; a board that reset with
-    the pump running has a real float, and its tank running down under
-    that latch is a drop like any other. The latch blocks the sample —
-    a fault stood over the run — and not the stamp: left NULL, the
-    untapped refill after it would be no rise, and every dose since a tap
-    the tank demonstrably ran down from would stay on the counter until
-    the board was paged stuck at full (spec D3, D4, four times)."""
+    """Only the contra latch forces the word; a board that reset with the
+    pump running still has a real float, so its tank running down under
+    a resetmid latch is a drop like any other. The latch blocks the
+    sample — a fault stood over the run — but not the drop stamp: left
+    NULL, the next untapped refill would stamp no rise, and every dose
+    since a tap the tank demonstrably ran down from would stay on the
+    counter until the board was paged stuck at full."""
     full(client)
     tap(client, db)
     dose(client, 100, flow=100)
@@ -1018,11 +988,11 @@ def test_a_first_report_has_no_previous_float_and_closes_nothing(client, db):
 
 
 def test_a_report_without_float_hides_no_edge(client, db):
-    """The edge is read off the board's last real word: a report that omits
-    float= neither hides the crossing after it nor is one itself. Were
-    silence an edge, a heartbeat mid-dose would close the sample at the
-    water so far, and the true crossing's count would be dropped on the
-    tap's key (spec D4)."""
+    """The edge is read off the board's last real word: a report that
+    omits float= neither hides the crossing after it nor is one itself.
+    Were silence an edge, a heartbeat mid-dose would close the sample
+    early, and the true crossing's count would be dropped on the tap's
+    key."""
     full(client)
     tap(client, db)
     dose(client, 100, flow=90)
@@ -1082,7 +1052,7 @@ def test_a_retired_board_learns_nothing(client, db):
 
 
 # --------------------------------------------------------------------------- #
-# The size (spec D5)
+# The size
 # --------------------------------------------------------------------------- #
 
 
@@ -1117,10 +1087,9 @@ def test_tank_ml_is_the_median_of_the_last_five_and_none_under_two(db, app):
 
 
 def test_the_median_is_of_the_newest_five_not_the_five_largest():
-    """tank_ml is handed five at most (tank_history's LIMIT); the ticker
-    hands tank_median a sample and the five before it, and there the
-    window is the last five by time — the oldest leaves, however large
-    (spec D5)."""
+    """tank_ml is handed five at most (tank_history's LIMIT). The ticker
+    hands tank_median a sample plus the five before it, and the window is
+    the last five by time — the oldest leaves however large it was."""
     assert butler.tank_median([5000, 100, 100, 100, 3000, 3000]) == 100
 
 
@@ -1188,7 +1157,7 @@ def test_finding_the_unannounced_samples_costs_the_pending_few(db, app):
     """Every tick looks for the samples with no page yet, so that walk is
     bounded in SQLite to the pending ones plus one: the same steps over
     six hundred announced runs as over six, and more only with more
-    pending (spec D8)."""
+    pending."""
     with sqlite3.connect(db) as con:
 
         def fill(total, pending):
@@ -1216,7 +1185,7 @@ def test_finding_the_unannounced_samples_costs_the_pending_few(db, app):
 
 
 # --------------------------------------------------------------------------- #
-# What the app sees (spec D9, the read-only fields)
+# What the app sees
 # --------------------------------------------------------------------------- #
 
 
@@ -1274,10 +1243,10 @@ CREATE TABLE status (
 
 
 def test_an_existing_database_carries_the_floats_last_word_at_startup(db):
-    # The 0.18.0 shape of status: float_ok, no float_word. A tank sitting
-    # at full through the upgrade closes its sample on the first empty —
-    # from a tap made after it: the one from before saw nothing (it gets
-    # NULL) and starts no counter (spec D3).
+    # The pre-upgrade shape of status: float_ok, no float_word. A tank
+    # sitting at full through the upgrade closes its sample on the first
+    # empty — from a tap made after it: the one from before saw nothing
+    # (it gets NULL) and starts no counter.
     with sqlite3.connect(db) as con:
         con.executescript(
             OLD_STATUS
@@ -1323,8 +1292,7 @@ def test_the_carried_clocks_come_only_with_the_word(db):
     neither is a clock for it — a clock without a word would read as a
     float that has not moved since before any tap. A word of empty brings
     its clock and no rise (float_since is its fall); a word of full brings
-    both. The firm word is not carried: one report is not two (spec D3,
-    amended, then thrice, D14 c)."""
+    both. The firm word is not carried: one report is not two."""
     with sqlite3.connect(db) as con:
         con.executescript(
             OLD_STATUS
@@ -1350,7 +1318,7 @@ def test_the_firm_word_is_not_carried_at_the_upgrade(db):
     on, and the upgrade has one report to go on: NULL, whatever the word
     says. The carried word is the last float-carrying report's, so the
     first post-upgrade report that agrees with it is the second of two,
-    and makes it firm; one that disagrees leaves NULL (spec D14 c)."""
+    and makes it firm; one that disagrees leaves NULL."""
     with sqlite3.connect(db) as con:
         con.executescript(
             OLD_STATUS
@@ -1374,13 +1342,13 @@ def test_the_firm_word_is_not_carried_at_the_upgrade(db):
 
 
 def test_a_tank_already_empty_at_the_upgrade_starts_at_its_next_tap(db):
-    """A tap from 0.18.0 has no snapshot — the column arrives at the
+    """A pre-upgrade tap has no snapshot — the column arrives at the
     upgrade and the rows get NULL — so it never meant "full to the top"
     and is no origin: nothing is stamped on it, the tank empty at the
     upgrade or not, the counter is 0 whatever was pumped, and a size
     the board knew arms nothing. The float rising after is no origin
     either, since nothing dropped after a tap that counts. The first tap
-    after the upgrade starts everything (spec D2, D3, four times)."""
+    after the upgrade starts everything."""
     with sqlite3.connect(db) as con:
         con.executescript(
             OLD_STATUS
@@ -1419,7 +1387,7 @@ def test_a_tank_already_empty_at_the_upgrade_starts_at_its_next_tap(db):
 
 
 # --------------------------------------------------------------------------- #
-# Every sample is announced (spec D8)
+# Every sample is announced
 # --------------------------------------------------------------------------- #
 
 
@@ -1487,7 +1455,7 @@ def test_two_runs_waiting_on_one_tick_are_each_judged_as_they_closed(
     """A tick that finds two samples waiting (the ticker was down, or a
     send failed) judges the first against what the tank knew when it
     closed — nothing — not against the second, which had not happened
-    yet (spec D8)."""
+    yet."""
     full(client)
     tap(client, db)
     dose(client, 200, flow=200)
@@ -1534,9 +1502,9 @@ def test_a_sample_off_the_size_it_knew_is_a_warning(app, client, db, sent):
 def test_the_count_is_the_samples_the_size_rests_on(app, client, db, sent):
     """The size is the median of the last five, so the count beside it
     stops at five: past that, the oldest run has left the number, however
-    many the board has closed in its life (spec D5, D8). Left by age, not
-    by size: the sixth run's page is handed six samples where /health's
-    tank_ml is handed five, and the two must name the same tank."""
+    many the board has closed in its life. Left by age, not by size: the
+    sixth run's page is handed six samples where /health's tank_ml is
+    handed five, and the two must name the same tank."""
     full(client)
     for ml in (1000, 200, 200, 300, 300):
         run_the_tank_down(app, client, db, ml)

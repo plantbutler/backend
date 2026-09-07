@@ -81,7 +81,7 @@ def run_sql(db, sql, *params):
 
 
 # --------------------------------------------------------------------------- #
-# err= and pos_ok_seen (spec D8, D11's column)
+# err= and pos_ok_seen
 # --------------------------------------------------------------------------- #
 
 
@@ -98,9 +98,7 @@ def test_err_is_parsed_once_and_as_a_short_token():
 
 
 def test_an_i2c_refusal_lands_and_is_stored(client):
-    """The firmware's DOSE_REFUSED_I2C token is `i2c`, and err= is the
-    board's sticky last error: refused for its digit, one I2C refusal made
-    every later report a 400 until reboot (spec D13)."""
+    """The firmware's DOSE_REFUSED_I2C token is `i2c`."""
     report(client, "c=0 ch0=1 float=1 pos=ok err=i2c")
     assert health(client)["err"] == "i2c"
 
@@ -109,9 +107,8 @@ def test_the_last_err_is_kept_until_the_board_sends_another(client, db):
     report(client, "c=0 ch0=1 err=heap")
     first = health(client)
     assert first["err"] == "heap" and first["err_ts"] > 0
-    # The reports below land in the same second as the first, so a stamp
-    # rewritten on every report would equal the one that should have stayed
-    # put. Push it back a minute first, so kept and rewritten can differ.
+    # Same second as the first report: back the stamp up so kept and
+    # rewritten can differ.
     run_sql(db, "UPDATE status SET err_ts = err_ts - 60")
     stamp = first["err_ts"] - 60
     report(client, "c=0 ch0=1")
@@ -146,7 +143,7 @@ def test_health_carries_the_new_fields_with_their_defaults(client):
 
 
 def test_an_old_database_grows_the_columns_at_startup(db):
-    # The shape 0.17.0 left behind for the two tables that change.
+    # An old database's shape for the two tables that change.
     with sqlite3.connect(db) as con:
         con.executescript(
             """
@@ -171,7 +168,7 @@ def test_an_old_database_grows_the_columns_at_startup(db):
 
 
 # --------------------------------------------------------------------------- #
-# The dose ceiling is the board's (spec D10)
+# The dose ceiling is the board's
 # --------------------------------------------------------------------------- #
 
 
@@ -189,7 +186,7 @@ def test_a_pot_cannot_be_saved_with_a_dose_the_board_would_refuse(client):
 
 
 # --------------------------------------------------------------------------- #
-# The daily cap counts water the board acknowledged (spec D9)
+# The daily cap counts water the board acknowledged
 # --------------------------------------------------------------------------- #
 
 
@@ -228,10 +225,9 @@ def commands(db):
 def test_a_dose_the_board_never_acknowledged_is_not_charged_to_the_day(client, db):
     make_pot(client, cooldown_h=0, daily_cap_ml=150)
     assert "cmd=1 water=3 ml=100" in dry_reports(client)  # handed on the fifth
-    # No ack: cmd 1 expires, never acked. Before this change its phantom
-    # 100 ml counted, 100 + 100 > 150, and the pot went thirsty for the day
-    # on a response that never arrived. The window is already five dry
-    # readings deep, so the rules take the freed slot on this very report.
+    # No ack: cmd 1 expires and its 100 ml is never charged to the day. The
+    # window is already five dry readings deep, so the rules take the freed
+    # slot on this very report.
     unacked = report(client, f"c=0 ch0={DRY} float=1 pos=ok")
     assert "cmd=2 water=3 ml=100" in unacked.text
     assert commands(db) == [(1, "expired", None), (2, "sent", None)]
@@ -241,7 +237,7 @@ def test_a_dose_the_board_never_acknowledged_is_not_charged_to_the_day(client, d
 
 
 # --------------------------------------------------------------------------- #
-# pos: waits for a board that has ever known its position (spec D11)
+# pos: waits for a board that has ever known its position
 # --------------------------------------------------------------------------- #
 
 
@@ -258,7 +254,7 @@ def test_no_pos_page_before_a_board_has_ever_said_pos_ok(app, client, sent):
 
 
 # --------------------------------------------------------------------------- #
-# Retirement (spec D7)
+# Retirement
 # --------------------------------------------------------------------------- #
 
 
@@ -368,7 +364,7 @@ def test_a_retired_board_pages_nothing_whatever_its_reports_say(app, client, db,
     assert health(client)["float"] == 0
     # Back in service, the board's standing trouble is heard at once — the
     # stuck float excepted, which waits behind the latch and behind the
-    # board's own ch207 (spec D7).
+    # board's own ch207.
     post(client, "/controller", "c=0 retired=0")
     tick(app)
     assert sorted(keys(sent)) == ["float:0", "latch:0", "pos:0"]
@@ -424,7 +420,7 @@ def test_a_retired_boards_lost_dose_is_not_judged_while_it_is_retired(app, clien
 
 
 # --------------------------------------------------------------------------- #
-# The durable latch (spec D2-D4)
+# The durable latch
 # --------------------------------------------------------------------------- #
 
 
@@ -439,7 +435,7 @@ def test_the_board_latches_the_backend_through_ch207_or_the_resetmid_edge(client
     assert health(client, 1)["latched"] is None
     report(client, "c=2 ch0=1 float=1 pos=ok err=resetmid")
     assert health(client, 2)["latched"]["reason"] == "resetmid"
-    # An empty tank is not a latch (D2's deviation): the rules refuse on it.
+    # An empty tank is not a latch: the rules refuse on it.
     report(client, "c=3 ch0=1 float=1 pos=ok")
     report(client, "c=3 ch0=1 float=0 pos=ok")
     assert health(client, 3)["latched"] is None
@@ -502,10 +498,8 @@ def test_the_latch_outlives_the_board_forgetting_it(client, db):
 
 def test_the_latch_keeps_its_first_stamp_and_names_its_newest_reason(client, db):
     report(client, "c=0 ch0=1 float=1 pos=ok ch207=1")
-    # The reports below land in the same second as the first, so a stamp
-    # rewritten on every latching report would equal the one that should
-    # have stayed put. Push it back a minute first, so kept and rewritten
-    # can differ.
+    # Same second as the first report: back the stamp up so kept and
+    # rewritten can differ.
     run_sql(db, "UPDATE status SET latched_ts = latched_ts - 60")
     stamp = health(client)["latched"]["since"]
     report(client, "c=0 ch0=1 float=1 pos=ok ch207=1")  # the board still says so
@@ -513,7 +507,7 @@ def test_the_latch_keeps_its_first_stamp_and_names_its_newest_reason(client, db)
     # A second fault on top: `since` stays when the trouble began, and the
     # reason is the newest, the one to fix — a board that reset with the
     # pump running is latched dry on the firmware, and `clear contra`
-    # would not touch that (spec D12, four times).
+    # would not touch that.
     report(client, "c=0 ch0=1 float=1 pos=ok err=resetmid")
     assert health(client)["latched"] == {"since": stamp, "reason": "resetmid"}
     answer = post(client, "/command", "c=0 water=3 ml=50")
@@ -539,9 +533,9 @@ def test_a_reset_under_a_standing_contra_names_the_contra_first(client, db):
     # one applies, contra, then dry, then resetmid: the contra's step
     # comes first, and the stamp is the one the trouble began with. A
     # board with ch211 on the wire carries the reset as the dry level,
-    # which names the latch once `clear contra` is typed (test_latches);
-    # on an older board the edge is seen this once, under the contra, and
-    # `clear contra` and the resume close the whole thing (spec A2).
+    # which names the latch once `clear contra` is typed; on an older
+    # board the edge is seen this once, under the contra, and `clear
+    # contra` and the resume close the whole thing.
     report(client, "c=0 ch0=1 float=0 pos=ok ch207=1")
     run_sql(db, "UPDATE status SET latched_ts = latched_ts - 60")
     stamp = health(client)["latched"]["since"]
@@ -583,7 +577,7 @@ def test_the_latch_names_the_boards_word_for_its_reason(app, client, db, sent):
     contradiction latch alone. The 409 and the page spell the step from
     one map keyed by the reason, so a person is not sent to type the
     wrong thing — and a reason the map does not know gets the contra
-    words, as the app's map does (spec D12)."""
+    words, as the app's map does."""
     assert butler.LATCH_STEP == {
         "contra": "type clear contra on the board",
         "dry": "type dry off on the board",
@@ -625,12 +619,11 @@ def test_the_latch_names_the_boards_word_for_its_reason(app, client, db, sent):
 
 def test_a_renamed_latch_pages_again_with_its_new_words(app, client, db, sent):
     """The latch: row's detail is the reason its page named, and a
-    standing latch whose reason changed — D12's overwrite: the board
-    reset under a contra and `clear contra` was typed, leaving the dry
-    level the reason — pages again with the new words, floor or no
-    floor: a person told "clear contra" must also be told "dry off". Once
-    per name: the tick after that is quiet, and the row is one row (spec
-    D14 d, A2)."""
+    standing latch whose reason changed — here, the board reset under a
+    contra and `clear contra` was typed, leaving the dry level the
+    reason — pages again with the new words, floor or no floor: a person
+    told "clear contra" must also be told "dry off". Once per name: the
+    tick after that is quiet, and the row is one row."""
     report(client, "c=0 ch0=1 float=1 pos=ok ch207=1")
     tick(app)
     assert keys(sent) == ["latch:0"] and "type clear contra" in sent[0].message
@@ -662,7 +655,7 @@ def test_a_latch_standing_through_the_upgrade_is_named_and_not_paged_again(clien
     more on the first tick after the upgrade, for a fault nobody touched.
     The upgrade puts the latch's own reason on the row instead: the ticks
     after it are quiet, and a rename after that pages, as it should. The
-    stamp is the old page's, not the upgrade's (spec D14 d)."""
+    stamp is the old page's, not the upgrade's."""
     report(client, "c=0 ch0=1 float=1 pos=ok ch207=1")  # latched, by the code
     run_sql(  # the row the tick wrote before it carried the reason
         db,
@@ -713,7 +706,7 @@ def test_the_latch_pages_once_and_resume_clears_row_and_page(app, client, db, se
 
 
 # --------------------------------------------------------------------------- #
-# Refills, and the float judged against the tank's size (spec D6, D7)
+# Refills, and the float judged against the tank's size
 # --------------------------------------------------------------------------- #
 
 
@@ -809,8 +802,8 @@ def full(client):
 def learn_the_tank(app, client, db, sent, size):
     """Two runs of `size` ml, each ended by the float — saying empty on
     the dose's ack and still a flap window on — and a flap window apart:
-    the tank is known, and its two announcements are ticked away (they
-    are test_tank_size's subject). Returns the line `over` starts past."""
+    the tank is known, and its two announcements are ticked away. Returns
+    the line `over` starts past."""
     full(client)
     for _ in range(TANK_SAMPLES_TO_ARM):
         tap(client, db)
@@ -894,7 +887,7 @@ def test_over_counts_from_the_rise_when_the_float_moved_since_the_tap(
     counter restarts at the rise instead of calling it stuck twenty
     millilitres later, and the page says since when. A second drain keeps
     the rise as the origin and stores no second sample: nobody said that
-    refill was full (spec D3, D4, D6, amended twice)."""
+    refill was full."""
     learn_the_tank(app, client, db, sent, 200)
     tap(client, db)
     dose(client, 150)
@@ -937,7 +930,7 @@ def test_over_waits_behind_the_latch_and_the_boards_own_ch207(app, client, db, s
     """A report carrying ch207=1 is "float OK, zero pulses": a fault, and
     the latch page already says what to do. The board keeps sending it
     until `clear contra` is typed, so a /resume before that must not page
-    the same fault as a stuck float (spec §1, D6 amended twice)."""
+    the same fault as a stuck float."""
     learn_the_tank(app, client, db, sent, 200)
     tap(client, db)
     dose(client, 250)
@@ -958,8 +951,7 @@ def test_over_waits_behind_the_latch_and_the_boards_own_ch207(app, client, db, s
 def test_a_dead_float_waits_behind_the_boards_own_ch207(app, client, db, sent):
     """The forced 0 of a contra is not a float that failed to rise: a
     /resume before `clear contra` pages nothing as dead until a report
-    without ch207=1 says the word is the float's own again (spec D7,
-    amended twice)."""
+    without ch207=1 says the word is the float's own again."""
     report(client, "c=0 ch0=1 float=1 pos=ok")
     report(client, "c=0 ch0=1 float=0 pos=ok ch207=1")
     tick(app)
@@ -1021,7 +1013,7 @@ def test_a_float_that_goes_empty_past_the_size_is_a_float_that_works(
     still says full over a run a tenth past the median, and the raw word
     already says empty — no over, not for one beat, since the page would
     stand until a tap; the next report agrees, and a float that reads
-    empty is a float that works (spec D6, D14 a)."""
+    empty is a float that works."""
     learn_the_tank(app, client, db, sent, 200)
     tap(client, db)
     dose(client, 150)
@@ -1044,7 +1036,7 @@ def test_over_reads_the_firm_word_in_the_beat_before_the_rise(app, client, db, s
     median paged "presumed stuck" there and dried the rules until a tap;
     on the firm word that beat is a float still firmly empty, the rules
     water, and the confirmation moves the origin to the rise with the
-    counter at the dose handed in its second (spec D14 a)."""
+    counter at the dose handed in its second."""
     make_pot(client, cooldown_h=0, daily_cap_ml=100_000)
     learn_the_tank(app, client, db, sent, 200)
     tap(client, db)
@@ -1087,7 +1079,7 @@ def test_the_tap_clears_over_inline_and_sends_no_page(app, client, db, sent):
     the thing, so no "was refilled" page follows and the ticker has
     nothing to clear — and over_stands is raised-and-not-cleared, for the
     rules, /health and the phone's strip alike: a row standing is the
-    fact, whatever taps are on file (spec D14 b)."""
+    fact, whatever taps are on file."""
     learn_the_tank(app, client, db, sent, 200)
     tap(client, db)
     dose(client, 250)
@@ -1144,7 +1136,7 @@ def test_the_tap_needs_no_ntfy_to_clear_over(db, sent):
     ntfy being down — as often as anything — keeps no tank somebody just
     filled from being watered from: the rules, /health and the phone's
     strip honour the tap the moment it lands, as /resume does for the
-    latch, and the tick after it has nothing to send (spec D14 b)."""
+    latch, and the tick after it has nothing to send."""
     accepted = [True]
     app = create_app(
         db_path=str(db),
@@ -1181,7 +1173,7 @@ def test_over_holds_the_rules_through_a_float_bounce_until_the_tap(
     since the tap, is a rise: a fresh origin, a counter at 0, and the live
     predicate lets go. The page still stands, and the page is the fact —
     it was raised on a pump presumed stuck at full — so the rules stay dry
-    on it, as /health's over stays 1, until a tap answers it (spec D6)."""
+    on it, as /health's over stays 1, until a tap answers it."""
     make_pot(client, cooldown_h=0, daily_cap_ml=100_000)
     learn_the_tank(app, client, db, sent, 200)
     tap(client, db)
@@ -1216,7 +1208,7 @@ def test_a_tap_answers_the_row_standing_when_it_lands_whatever_the_clocks(
     the rules and /health alike, where a clear that compared the tap's
     second to the raise's left it standing. The page a tap was counted
     from cannot outlive it: raised after the tap, its counter started at
-    that tap and is not over (spec D14 b)."""
+    that tap and is not over."""
     make_pot(client, cooldown_h=0, daily_cap_ml=100_000)
     learn_the_tank(app, client, db, sent, 200)
     tap(client, db)
@@ -1241,7 +1233,7 @@ def test_a_report_that_omits_float_neither_hides_nor_makes_a_rise(
 ):
     """One report saying nothing about the float, then the same word again,
     is not the float moving: no rise is invented, the counter keeps what
-    it had, and a float stuck at full is still caught (spec D3, D6)."""
+    it had, and a float stuck at full is still caught."""
     learn_the_tank(app, client, db, sent, 200)
     since = tap(client, db)
     dose(client, 150)
@@ -1351,7 +1343,7 @@ def test_a_float_still_empty_its_minutes_after_the_tap_pages(app, client, db, se
     (tapped,) = taps(db)
     assert alert.priority == "high"
     # The board sent no ch210: its own float check did not trip, so the
-    # float is presumed stuck (the flap's own text is test_latches').
+    # float is presumed stuck.
     assert alert.message == (
         f"the float on board 0 still says empty 3 min after the refill at "
         f"{butler.hhmm(tapped)}: presumed stuck at empty, look at the magnet"
@@ -1394,7 +1386,7 @@ def test_a_float_still_empty_pages_through_a_report_that_omits_it(
 ):
     """A report that says nothing about the float, then the same word
     again, is not the float moving: its word last changed before the tap
-    still, and the page comes (spec D7)."""
+    still, and the page comes."""
     report(client, "c=0 ch0=1 float=1 pos=ok")
     report(client, "c=0 ch0=1 float=0 pos=ok")
     age(db, FLAP_WINDOW_S + 1)
@@ -1412,7 +1404,7 @@ def test_a_dead_float_is_judged_on_a_word_of_empty_not_on_silence(
     app, client, db, sent
 ):
     """The report that says nothing about the float is not one that says
-    empty: stale: waits for the word (spec D7)."""
+    empty: stale: waits for the word."""
     report(client, "c=0 ch0=1 float=1 pos=ok")
     report(client, "c=0 ch0=1 float=0 pos=ok")
     age(db, FLAP_WINDOW_S + 1)
@@ -1433,7 +1425,7 @@ def test_a_tap_that_never_saw_the_float_judges_nothing(app, client, db, sent):
     report(client, "c=0 ch0=1 float=0 pos=ok")
     age(db, FLAP_WINDOW_S + 1)
     tap(client, db)
-    run_sql(db, "UPDATE refills SET float_ok = NULL")  # a row from before 0.19.0
+    run_sql(db, "UPDATE refills SET float_ok = NULL")  # a refill that never saw the float
     age(db, PERSIST_S - 60)
     report(client, "c=0 ch0=1 float=0 pos=ok")
     tick(app)
@@ -1454,7 +1446,7 @@ def test_a_tap_that_never_saw_the_float_judges_nothing(app, client, db, sent):
 
 def test_a_dead_float_waits_behind_the_latch(app, client, db, sent):
     """A contra forces the board's word to 0, and the latch page already
-    says what to do (spec D7)."""
+    says what to do."""
     report(client, "c=0 ch0=1 float=1 pos=ok")
     report(client, "c=0 ch0=1 float=0 pos=ok ch207=1")
     age(db, FLAP_WINDOW_S + 1)
@@ -1472,8 +1464,8 @@ def test_a_dead_float_waits_behind_the_latch(app, client, db, sent):
 def test_a_stale_page_from_the_clock_rule_clears_when_the_float_says_full(
     app, client, db, sent
 ):
-    # 0.18.0 raised it off ch204 and a refill; neither says anything now,
-    # and the key is kept so it still clears through the same path.
+    # A stale:0 row inserted directly, as if raised another way: the key
+    # is kept so it still clears through the same path.
     report(client, "c=0 ch0=1 float=1 pos=ok")
     report(client, "c=0 ch0=1 float=0 pos=ok")
     run_sql(
