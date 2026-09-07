@@ -354,9 +354,9 @@ watering.
   does not exist refused without writing anything; 0.15.0 on 2026-09-04 turns `plant_type` into a
   closed set of six kinds, replaces the two free-text sizes with `pot_diameter_cm` and
   `plant_height_cm` and reads them as a water buffer and the demand on it, and answers `kind` from
-  GBIF's family so the dropdown opens pre-selected; 0.18.0 with the tank on 2026-09-06; 0.19.0 with the measured tank on 2026-09-07, verified live: eight columns added at startup, a fake board tapped, dosed and run down closed its first sample and announced it once, `float:` paged and cleared, and retiring the fake board silenced it): container
+  GBIF's family so the dropdown opens pre-selected; 0.18.0 with the tank on 2026-09-06; 0.19.0 with the measured tank on 2026-09-07; 0.20.0 with the latches on the wire the same day, verified live: three columns added at startup, a fake board sending `ch211=1` latched with reason `dry` and the 409 said `dry off`, `ch210=1` showed as `flap` on `/health`, and the fake board was resumed, retired and deleted): container
   `plantbutler`
-  on the NAS, port 9380, image `plantbutler-backend:0.19.0`, built on the NAS from the three files (`Dockerfile`, `butler.py`, `schema.sql`) copied over ssh into `/volume1/docker/plantbutler/build` (the NAS has no sftp, so `cat >` over ssh, not scp; docker is `sudo -n /usr/local/bin/docker`, the env is carried from the old container with `docker inspect` into a 0600 file that is shredded after `docker run`), database on `/volume1/docker/plantbutler/data`, secrets in `deploy.env` beside it
+  on the NAS, port 9380, image `plantbutler-backend:0.20.0`, built on the NAS from the three files (`Dockerfile`, `butler.py`, `schema.sql`) copied over ssh into `/volume1/docker/plantbutler/build` (the NAS has no sftp, so `cat >` over ssh, not scp; docker is `sudo -n /usr/local/bin/docker`, the env is carried from the old container with `docker inspect` into a 0600 file that is shredded after `docker run`), database on `/volume1/docker/plantbutler/data`, secrets in `deploy.env` beside it
   (600, not in git: the token, the ntfy topic, the healthchecks.io ping URL, the Trefle token),
   `-e TZ=Europe/Zurich` so BUTLER_QUIET means local night. Photographs share that volume —
   `/data/photos`, one directory per pot — so they are backed up or lost with the database rather
