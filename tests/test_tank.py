@@ -523,6 +523,44 @@ def test_a_latch_expires_what_was_waiting_and_refuses_new_water(client, db):
     assert post(client, "/command", "c=0 stop=1").status_code == 200
 
 
+def test_the_latch_names_the_boards_word_for_its_reason(app, client, sent):
+    """A board that reset with the pump running is latched dry on the
+    firmware, and only `dry off` clears that; `clear contra` clears the
+    contradiction latch alone. The 409 and the page spell the step from
+    one map keyed by the reason, so a person is not sent to type the
+    wrong thing (spec D12)."""
+    assert butler.LATCH_STEP == {
+        "contra": "type clear contra on the board",
+        "resetmid": "type dry off on the board",
+    }
+    report(client, "c=0 ch0=1 float=1 pos=ok err=resetmid")
+    answer = post(client, "/command", "c=0 water=3 ml=50")
+    assert answer.status_code == 409
+    assert answer.text.startswith("refused: board 0 stopped watering (resetmid since ")
+    assert answer.text.rstrip().endswith(
+        "check the tank, type dry off on the board, then resume"
+    )
+    tick(app)
+    assert keys(sent) == ["latch:0"]
+    assert sent[0].message == (
+        "board 0 stopped watering: it reset with the pump running — check the "
+        "tank, type dry off on the board, then resume in the app"
+    )
+    report(client, "c=1 ch0=1 float=1 pos=ok ch207=1")
+    answer = post(client, "/command", "c=1 water=3 ml=50")
+    assert answer.status_code == 409
+    assert answer.text.rstrip().endswith(
+        "check the tank, type clear contra on the board, then resume"
+    )
+    tick(app)
+    assert keys(sent) == ["latch:0", "latch:1"]
+    assert sent[1].message == (
+        "board 1 stopped watering: the float said full and the meter saw "
+        "nothing — check the tank, type clear contra on the board, then resume "
+        "in the app"
+    )
+
+
 def test_the_latch_pages_once_and_resume_clears_row_and_page(app, client, db, sent):
     report(client, "c=0 ch0=1 float=1 pos=ok ch207=1 err=contra")
     tick(app)

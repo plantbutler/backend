@@ -137,6 +137,15 @@ LATCH_TEXT = {
     "contra": "the float said full and the meter saw nothing",
     "resetmid": "it reset with the pump running",
 }
+# The board's own word for each, typed on its console. `clear contra` lifts
+# the contradiction latch and nothing else; a board that reset with the pump
+# running is latched dry on the firmware (noinit.cpp:43), and only `dry off`
+# clears that (cli.cpp:478). The 409, the latch page and the README spell the
+# step from this one map, so nobody is sent to type the wrong thing.
+LATCH_STEP = {
+    "contra": "type clear contra on the board",
+    "resetmid": "type dry off on the board",
+}
 MAX_RAW = 2**31  # 14-bit ADC today; headroom without letting 2**63 near sqlite
 # The board's own PB_DOSE_RIG_MAX_ML, and the two move together: a pot
 # above it is refused by the firmware with err=range, acked with flow_ml=0,
@@ -833,8 +842,21 @@ class Latched(Exception):
     def __init__(self, controller: int, since: int, reason: str):
         super().__init__(
             f"board {controller} stopped watering ({reason} since {hhmm(since)}): "
-            "check the tank, type clear contra on the board, then resume"
+            + latch_steps(reason)
         )
+
+
+def latch_steps(reason: str) -> str:
+    """What a person does about a latch, in order: look at the tank, type
+    the board's own word for the reason (LATCH_STEP), then /resume. The
+    one place the steps are spelt; the page adds where to resume (spec
+    D12)."""
+    return (
+        f"check the tank, {LATCH_STEP.get(reason, f'clear {reason} on the board')}, "
+        "then resume"
+    )
+
+
 
 
 def latch_reason(r: Report, prev_err: str | None) -> str | None:
@@ -4005,8 +4027,8 @@ def create_app(
                         "high",
                         "warning",
                         f"board {controller} stopped watering: "
-                        f"{LATCH_TEXT.get(reason, reason)} — check the tank, type "
-                        "clear contra on the board, then resume in the app",
+                        f"{LATCH_TEXT.get(reason, reason)} — {latch_steps(reason)} "
+                        "in the app",
                         mark(key),
                     )
                 )
