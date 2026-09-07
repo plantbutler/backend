@@ -3021,43 +3021,33 @@ def create_app(
                     "pos_ok_seen = CASE WHEN excluded.pos = 'ok' "
                     "THEN excluded.ts ELSE status.pos_ok_seen END, "
                     "float_word = COALESCE(excluded.float_word, status.float_word), "
-                    # The word's own clock, unlike float_since (float_ok's,
-                    # which a report that omits float= moves, and the
-                    # fields: rule counts from): it moves on 1 -> 0 and
-                    # 0 -> 1 and on nothing else, so the float's last move
-                    # is where it was after a report that said nothing. The
-                    # firm word is the word once this report and the last
-                    # that carried float= agree — one sighting is a glitch
-                    # by the board's own design; a report that says nothing
-                    # agrees with nothing (NULL IS 1 is false) and leaves it.
-                    # It starts NULL (the first report inserts none), and
-                    # NULL is never an edge: the firm word becoming 1 out of
-                    # it is no rise, becoming 0 no drop (the report path
-                    # below wants a firm 1 before), and nothing forced. Its
-                    # clocks are the two edges the tank is measured on and
-                    # no other: the rise here (the firm word going 0 -> 1)
-                    # and the drop the report path stamps on the tap below,
-                    # each where the word moved, not where it was confirmed
-                    # — the report that raises the word hands its queued
-                    # dose with that clock, and the counter must not lose
-                    # it. A firm drop arriving with ch207=1 is the contra
-                    # latch forcing the word, remembered as such
-                    # (float_forced): the firm word coming back out of a
-                    # forced 0 is `clear contra` typed, not a refill, so it
-                    # stamps no rise — stamped, that rise became the origin
-                    # whenever the tap's drop_ts was already set, and
-                    # laundered the counter of an untapped refill's run. The
-                    # flag is the last firm drop's and only the next firm
-                    # drop writes it: nothing reads it between a rise and
-                    # that drop, so a clearing on the rise had no effect and
-                    # there is none. Every SET reads the row before this
-                    # update, so float_word_since here is the move the
-                    # agreement confirms. ch207, ch210 and ch211 are this
-                    # report's, absent being 0: the board's own latches,
-                    # which it repeats while each stands; flap_since is
-                    # when the flap last tripped, 0 -> 1, the clock a tap
-                    # must be later than to answer it, kept through the
-                    # level and left where it was when the flap lets go.
+                    # float_word_since is the word's own clock, unlike
+                    # float_since (float_ok's, which a report omitting float=
+                    # moves and the fields: rule counts from): it moves on
+                    # 1 -> 0 and 0 -> 1 and nothing else, so a report that
+                    # said nothing leaves the float's last move where it was.
+                    # The firm word is the word once this report and the last
+                    # that carried float= agree — one sighting is a glitch by
+                    # the board's own design, and a report that says nothing
+                    # agrees with nothing (NULL IS 1 is false). It starts
+                    # NULL, and NULL is never an edge: out of it, becoming 1
+                    # is no rise and becoming 0 no drop.
+                    #
+                    # Its two clocks are the only edges the tank is measured
+                    # on: the rise here, and the drop the report path stamps
+                    # on the tap below, each where the word MOVED rather than
+                    # where it was confirmed — the report that raises the word
+                    # hands its queued dose with that clock, and the counter
+                    # must not lose it. A firm drop arriving with ch207=1 is
+                    # the contra latch forcing the word, remembered as
+                    # float_forced, so the word coming back out of a forced 0
+                    # is `clear contra` typed rather than a refill and stamps
+                    # no rise: stamped, it would become the origin and launder
+                    # the counter of an untapped refill's run. Every SET reads
+                    # the row before this update. ch207, ch210 and ch211 are
+                    # this report's, absent being 0; flap_since is when the
+                    # flap last tripped, the clock a tap must be later than to
+                    # answer it, left where it was when the flap lets go.
                     "float_word_since = CASE WHEN excluded.float_word IS NULL "
                     "OR status.float_word IS excluded.float_word "
                     "THEN status.float_word_since ELSE excluded.ts END, "
@@ -3099,15 +3089,13 @@ def create_app(
                 )
                 reason = latch_reason(r, prev_err)
                 if reason is not None:
-                    # `since` is set once, never refreshed while the latch
-                    # stands: when the trouble began. The reason is the
-                    # newest fault's — the one to fix — and a fault the
-                    # board merely repeats is not newer than the one named;
-                    # after a resume, a latch still standing re-pages with
-                    # its own words. A
-                    # dose still waiting would pour into a tank nobody has
-                    # looked at, so it goes the way burial sends one; a
-                    # 'sent' one is with the board, whose own latch holds.
+                    # `since` is set once and never refreshed while the latch
+                    # stands: it is when the trouble began. The reason is the
+                    # newest fault's — the one to fix — and a fault the board
+                    # merely repeats is not a newer one. A dose still waiting
+                    # would pour into a tank nobody has looked at, so it is
+                    # expired; a 'sent' one is with the board, whose own latch
+                    # holds it.
                     con.execute(
                         "UPDATE status SET latched_ts = COALESCE(latched_ts, ?), "
                         "latch_reason = ? WHERE controller = ?",
@@ -3125,21 +3113,18 @@ def create_app(
                         (now, r.flow_ml, r.ack, r.controller),
                     )
                 if tap is not None and tap[2] is None:
-                    # The float went empty for the first time since the
-                    # tap, and this report confirms it: stamped on the tap
-                    # where the word fell, so a rise from here on is a
-                    # refill nobody said was full and a later drop is a
-                    # second drain of it. Then the water the meter counted
-                    # since the tap is one measurement of the tank — after
-                    # the ack step, because the dose that drained it acks
-                    # on the sighting or on this one. One per tap — a float
-                    # bouncing at the line adds nothing after its first
-                    # crossing — and nothing on zero: a tank drained by
-                    # something the meter never saw is not a measurement.
-                    # No sample while the board's latch stands — a fault
-                    # stood over the run — nor for a retired board, whose
-                    # reports still land but which learns nothing; the
-                    # drop is a fact either way (spec D1, D4).
+                    # The float went empty for the first time since the tap
+                    # and this report confirms it: stamped on the tap where
+                    # the word fell, so a rise from here is a refill nobody
+                    # said was full and a later drop is a second drain of it.
+                    # The water the meter counted since the tap is then one
+                    # measurement of the tank — after the ack step, because
+                    # the dose that drained it acks on the sighting or on this
+                    # one. One per tap, and nothing on zero: a tank drained by
+                    # something the meter never saw is not a measurement. No
+                    # sample while the board's latch stands, a fault having
+                    # stood over the run, nor for a retired board; the drop is
+                    # a fact either way.
                     since, rowid, _ = tap
                     con.execute(
                         "UPDATE refills SET drop_ts = ? WHERE rowid = ?",
@@ -3157,8 +3142,11 @@ def create_app(
                             (now, r.controller, since, pumped),
                         )
             # A command still 'sent' after the ack step was handed on an
-            # earlier response and this report did not ack it: the board
-            # does not have it. Gone, per the module docstring.
+            # earlier response and this report did not ack it, so either that
+            # response was lost or the board dropped it — both mean the board
+            # does not have it. Expired, never re-handed: re-handing a
+            # watering command the board might still execute is how a plant
+            # drowns. Whoever wants water asks again.
             con.execute(
                 "UPDATE commands SET state = 'expired' "
                 "WHERE controller = ? AND state = 'sent'",
@@ -3210,9 +3198,9 @@ def create_app(
                 # would file the water under the pot that no longer holds it.
                 #
                 # Both cost more than a wrong name. A dose the pot half of
-                # the cooldown cannot see is a dose the HOSE floor stops
-                # covering the moment that pot is rewired, so both layers of
-                # DECISIONS #7 go at once and the plant is watered twice.
+                # the cooldown cannot see is one the HOSE floor stops covering
+                # the moment that pot is rewired, so both watering floors go
+                # at once and the plant is watered twice.
                 owner = con.execute(
                     "SELECT pot_id FROM pot_mappings "
                     "WHERE controller = ? AND outlet IS ? AND to_ts IS NULL "
@@ -3259,9 +3247,8 @@ def create_app(
             if busy:
                 return 0, busy
             # Whom this dose is for. A manual command names a hose, not a
-            # pot, so the pot is the one on that hose right now — the same
-            # answer the read-time join used to compute, decided once here
-            # instead. A stop has no outlet and stamps NULL, and so does a
+            # pot, so the pot is whoever is on that hose right now, decided
+            # once here. A stop has no outlet and stamps NULL, and so does a
             # hose nobody is on.
             owner = (
                 con.execute(
@@ -3355,17 +3342,18 @@ def create_app(
             )
 
     def record_refill(controller: int) -> int:
-        """The tap means "full to the top". The board's last real word on
-        the float goes on the row — float_word, not float_ok, which one
-        report that omits float= blanks: a tap made under a row reading
-        "float ?" must not be a tap that counts for nothing — NULL only
-        for a board that has never sent float= (and then the tap judges
-        nothing), read under the write lock so a report cannot slip
-        between the look and the insert (spec D2). And the tap answers
-        over:<c>: the row is cleared here, in the tap's own transaction,
-        as /resume clears latch:<c> — the person did the thing, so no
-        page says so, and the rules, /health and the phone let go the
-        moment it lands (spec D14)."""
+        """A human refilled this board's tank. Returns the tap's timestamp.
+
+        The tap means "full to the top", and the board's last real word on the
+        float goes on the row: float_word rather than float_ok, which one
+        report omitting float= blanks — a tap made under a row reading
+        "float ?" must not be a tap that counts for nothing. NULL only for a
+        board that has never sent float=, and then the tap judges nothing.
+        Read under the write lock, so no report can slip between the look and
+        the insert. The tap also answers over:<c>, cleared here in the tap's
+        own transaction as /resume clears latch:<c>: the person did the thing,
+        so the rules, /health and the phone let go the moment it lands.
+        """
         now = int(time.time())
         with connect() as con:
             con.execute("BEGIN IMMEDIATE")
@@ -3427,14 +3415,13 @@ def create_app(
     def delete_pot(pot_id: str) -> None:
         """Erase a pot and everything that is only about it.
 
-        The opposite of the graveyard, and deliberately not reachable from
-        the same request: the graveyard keeps the record and frees the
-        hardware, this keeps nothing. It overturns the command log's
-        "never pruned" rule for exactly one reason — the owner asked for
-        the plant to be gone — and it costs something real, recorded in
-        DECISIONS: a deleted pot's doses stop floating the hose-keyed
-        cooldown and cap floors, so the next pot on that hose can be
-        watered sooner than #5 would like, for up to a day.
+        The opposite of the graveyard, and deliberately not reachable from the
+        same request: the graveyard keeps the record and frees the hardware,
+        this keeps nothing. It overturns the command log's "never pruned" rule
+        for one reason — the owner asked for the plant to be gone — and it
+        costs something real: a deleted pot's doses stop floating the
+        hose-keyed cooldown and cap floors, so for up to a day the next pot on
+        that hose can be watered sooner than the dry direction wants.
 
         Order is forced by reachability, not by foreign keys — there are
         none in this database and nothing cascades. The verdicts and the
@@ -3533,11 +3520,11 @@ def create_app(
                     # nobody asked for.
                     raise ValueError(f"no pot {pot_id}")
             else:
-                # No id is a create, always. Looking the name up here is what
-                # made a create silently edit whatever pot already answered to
-                # it — and the app's own check against that cannot see a pot
-                # added from another phone, or added while its list sat idle.
-                # The name clash below refuses it instead.
+                # No id is a create, always. Looking the name up here would
+                # make a create silently edit whatever pot already answers to
+                # it, and the app's own check against that cannot see a pot
+                # added from another phone or while its list sat idle. The
+                # name clash below refuses it instead.
                 row = None
             current = (
                 dict(zip(POT_COLUMNS, row))
@@ -3584,11 +3571,9 @@ def create_app(
                 raise ValueError(f"the name {name} is taken by pot {clash[0]}")
             if merged["controller"] is not None:
                 # Two pots on one sensor or one hose is a config error that
-                # would misread or miswater — refuse loudly. Asked whatever
-                # this pot's own status is: the point is the OTHER pot, and
-                # a graveyard pot has already let go of its window, so this
-                # clause is now the second line of defence rather than the
-                # first.
+                # would misread or miswater. Asked whatever this pot's own
+                # status is, since the point is the OTHER pot; burying is what
+                # unplugs, so this is the second line of defence.
                 for col in ("channel", "outlet"):
                     if merged[col] is None:
                         continue
