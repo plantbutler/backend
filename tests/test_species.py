@@ -1,7 +1,6 @@
 """What does this plant want: the taxonomy hop, the care source, and the
 band the two of them deliberately do not decide."""
 
-import json
 import sqlite3
 import time
 
@@ -20,15 +19,13 @@ from butler import (
     size_shifts,
     sole_match,
     Taxon,
-    create_app,
     normalise_species,
-    parse_advice,
     pick_species,
     read_gbif,
     read_trefle,
     target_band,
 )
-from conftest import TOKEN
+from conftest import auth, by_name, count, make_app, make_pot, post, run_sql
 
 
 class Sources:
@@ -143,21 +140,17 @@ BASIL = {
 }
 
 
+def age_cache(db, table, days):
+    """That cache row was written `days` ago, so the TTL has a chance to bite."""
+    run_sql(db, f"UPDATE {table} SET fetched_ts = ?", int(time.time()) - days * 86400)
+
+
 def app(db, sources=None, trefle_token="trefle-token"):
-    return TestClient(
-        create_app(
-            db_path=str(db),
-            token=TOKEN,
-            next_s=60,
-            cmd_ttl_s=900,
-            trefle_token=trefle_token,
-            fetch=sources,
-        )
-    )
+    return TestClient(make_app(db, trefle_token=trefle_token, fetch=sources))
 
 
 def look(client, q):
-    answer = client.get("/species", params={"q": q}, headers={"X-Token": TOKEN})
+    answer = client.get("/species", params={"q": q}, headers=auth())
     assert answer.status_code == 200, answer.text
     return answer.json()
 
@@ -510,7 +503,7 @@ def test_species_needs_the_token(db):
 
 def test_species_refuses_an_empty_or_giant_query(db):
     client = app(db, Sources(BASIL))
-    head = {"X-Token": TOKEN}
+    head = auth()
     assert client.get("/species", params={"q": "  "}, headers=head).status_code == 400
     long = client.get("/species", params={"q": "a" * 200}, headers=head)
     assert long.status_code == 400
@@ -547,8 +540,7 @@ def test_a_name_cached_without_a_family_is_asked_again(db):
     before = sources.hits("gbif")
 
     # A month on, and GBIF has learnt the family in the meantime.
-    with sqlite3.connect(db) as con:
-        con.execute("UPDATE species_names SET fetched_ts = ?", (int(time.time()) - 31 * 86400,))
+    age_cache(db, "species_names", 31)
     sources.answers = {**BASIL, "gbif": gbif(family="Lamiaceae")}
     assert look(client, "Ocimum_basilicum")["kind"] == "herb"
     assert sources.hits("gbif") == before + 1
@@ -562,8 +554,7 @@ def test_a_re_ask_that_cannot_reach_gbif_keeps_the_name_it_had(db):
     client = app(db, sources)
     assert look(client, "Ocimum_basilicum")["accepted"] == "Ocimum basilicum"
 
-    with sqlite3.connect(db) as con:
-        con.execute("UPDATE species_names SET fetched_ts = ?", (int(time.time()) - 31 * 86400,))
+    age_cache(db, "species_names", 31)
     sources.answers = {**BASIL, "gbif": None}  # the source is down
     answer = look(client, "Ocimum_basilicum")
     assert answer["accepted"] == "Ocimum basilicum"
@@ -577,8 +568,7 @@ def test_a_complete_row_is_never_asked_again(db):
     client = app(db, sources)
     look(client, "Ocimum_basilicum")
     before = sources.hits("gbif")
-    with sqlite3.connect(db) as con:
-        con.execute("UPDATE species_names SET fetched_ts = ?", (int(time.time()) - 400 * 86400,))
+    age_cache(db, "species_names", 400)
     assert look(client, "Ocimum_basilicum")["kind"] == "herb"
     assert sources.hits("gbif") == before
 
@@ -646,8 +636,7 @@ def test_a_name_service_that_is_down_is_not_a_plant_that_does_not_exist(db):
     assert answer["matched"] == "unavailable"
     assert "not answering" in answer["note"]
     # And nothing was written down, so a later lookup asks again.
-    with sqlite3.connect(db) as con:
-        assert con.execute("SELECT count(*) FROM species_names").fetchone()[0] == 0
+    assert count(db, "species_names") == 0
 
 
 def test_a_care_source_that_is_down_leaves_the_name_resolved(db):
@@ -769,11 +758,9 @@ def test_a_cached_miss_is_asked_again_a_month_later(db):
     sources = Sources({"gbif": gbif("Ficus lyrata"), "species/search": {"data": []}})
     client = app(db, sources)
     look(client, "Ficus lyrata")
-    with sqlite3.connect(db) as con:
-        con.execute(
-            "UPDATE species_care SET fetched_ts = ?",
-            (int(time.time()) - CARE_MISS_TTL_S - 1,),
-        )
+    run_sql(
+        db, "UPDATE species_care SET fetched_ts = ?", int(time.time()) - CARE_MISS_TTL_S - 1
+    )
     look(client, "Ficus lyrata")
     assert sources.hits("species/search") == 2
 
@@ -795,25 +782,10 @@ def test_a_species_that_resolves_but_carries_nothing_says_which(db):
 # --- the offer at the pot ------------------------------------------------
 
 
-def make_pot(client, **fields):
-    body = " ".join(f"{k}={v}" for k, v in fields.items())
-    answer = client.post("/pot", content=body, headers={"X-Token": TOKEN})
-    # The 200 first: a refusal's text splits into a plausible id too, and a
-    # test that then asks about it passes for the wrong reason.
-    assert answer.status_code == 200, answer.text
-    return answer.text.split()[0].removeprefix("pot=")
-
-
-def garden(client):
-    answer = client.get("/pots", headers={"X-Token": TOKEN})
-    assert answer.status_code == 200, answer.text
-    return {p["name"]: p for p in answer.json()["pots"]}
-
-
 def test_a_pot_with_no_band_is_offered_one(db):
     client = app(db, Sources(BASIL))
-    make_pot(client, name="basil", plant_type="herb", soil="sandy")
-    advice = garden(client)["basil"]["advice"]
+    make_pot(client, bare=True, name="basil", plant_type="herb", soil="sandy")
+    advice = by_name(client)["basil"]["advice"]
     assert advice["kind"] == "target"
     assert advice["low"] < advice["high"]
     assert "herb" in advice["why"] and "sandy soil" in advice["why"]
@@ -821,59 +793,50 @@ def test_a_pot_with_no_band_is_offered_one(db):
 
 def test_the_offer_goes_quiet_once_the_numbers_are_the_offered_ones(db):
     client = app(db, Sources(BASIL))
-    pot = make_pot(client, name="basil", plant_type="herb")
-    advice = garden(client)["basil"]["advice"]
-    client.post(
+    pot = make_pot(client, bare=True, name="basil", plant_type="herb")
+    advice = by_name(client)["basil"]["advice"]
+    post(
+        client,
         "/pot",
-        content=f"id={pot} target_low_pct={advice['low']} "
-        f"target_high_pct={advice['high']}",
-        headers={"X-Token": TOKEN},
+        f"id={pot} target_low_pct={advice['low']} target_high_pct={advice['high']}",
     )
-    assert garden(client)["basil"]["advice"] is None
+    assert by_name(client)["basil"]["advice"] is None
 
 
 def test_a_refused_offer_stays_refused(db):
     client = app(db, Sources(BASIL))
-    pot = make_pot(client, name="basil", plant_type="herb")
-    assert garden(client)["basil"]["advice"] is not None
-    refuse = client.post(
-        "/advice", content=f"pot={pot} kind=target dismiss=1", headers={"X-Token": TOKEN}
-    )
+    pot = make_pot(client, bare=True, name="basil", plant_type="herb")
+    assert by_name(client)["basil"]["advice"] is not None
+    refuse = post(client, "/advice", f"pot={pot} kind=target dismiss=1")
     assert refuse.status_code == 200, refuse.text
-    assert garden(client)["basil"]["advice"] is None
+    assert by_name(client)["basil"]["advice"] is None
 
 
 def test_a_different_offer_is_a_new_question(db):
     client = app(db, Sources(BASIL))
-    pot = make_pot(client, name="basil", plant_type="herb")
-    client.post(
-        "/advice", content=f"pot={pot} dismiss=1", headers={"X-Token": TOKEN}
-    )
-    assert garden(client)["basil"]["advice"] is None
+    pot = make_pot(client, bare=True, name="basil", plant_type="herb")
+    post(client, "/advice", f"pot={pot} dismiss=1")
+    assert by_name(client)["basil"]["advice"] is None
     # A repot changes the numbers, so the refusal no longer covers them.
-    client.post(
-        "/pot", content=f"id={pot} pot_diameter_cm=10", headers={"X-Token": TOKEN}
-    )
-    assert garden(client)["basil"]["advice"] is not None
+    post(client, "/pot", f"id={pot} pot_diameter_cm=10")
+    assert by_name(client)["basil"]["advice"] is not None
 
 
 def test_a_buried_pot_is_not_nagged(db):
     client = app(db, Sources(BASIL))
-    pot = make_pot(client, name="basil", plant_type="herb")
-    client.post("/pot", content=f"id={pot} status=graveyard", headers={"X-Token": TOKEN})
-    assert garden(client)["basil"]["advice"] is None
+    pot = make_pot(client, bare=True, name="basil", plant_type="herb")
+    post(client, "/pot", f"id={pot} status=graveyard")
+    assert by_name(client)["basil"]["advice"] is None
 
 
 def test_advice_only_dismisses(db):
     client = app(db, Sources(BASIL))
-    pot = make_pot(client, name="basil", plant_type="herb")
+    pot = make_pot(client, bare=True, name="basil", plant_type="herb")
     for body in (f"pot={pot}", f"pot={pot} dismiss=0", f"pot={pot} kind=dose dismiss=1"):
-        answer = client.post("/advice", content=body, headers={"X-Token": TOKEN})
+        answer = post(client, "/advice", body)
         assert answer.status_code == 400, body
-    assert client.post("/advice", content="dismiss=1").status_code == 401
-    unknown = client.post(
-        "/advice", content="pot=pot-nope dismiss=1", headers={"X-Token": TOKEN}
-    )
+    assert post(client, "/advice", "dismiss=1", token=None).status_code == 401
+    unknown = post(client, "/advice", "pot=pot-nope dismiss=1")
     assert unknown.status_code == 400
 
 
@@ -890,8 +853,8 @@ def test_the_garden_finds_the_care_under_the_name_the_pot_actually_stores(db):
     )
     client = app(db, sources)
     look(client, "Sansevieria trifasciata")  # typed the old name
-    make_pot(client, name="snake", species="Dracaena_trifasciata")  # stored the new one
-    care = garden(client)["snake"]["care"]
+    make_pot(client, bare=True, name="snake", species="Dracaena_trifasciata")  # stored the new one
+    care = by_name(client)["snake"]["care"]
     assert care is not None and care["light"] == 4
 
 
@@ -899,7 +862,7 @@ def test_the_garden_carries_what_was_looked_up_without_asking_again(db):
     sources = Sources(BASIL)
     client = app(db, sources)
     look(client, "Ocimum basilicum")
-    make_pot(client, name="basil", species="Ocimum_basilicum")
-    care = garden(client)["basil"]["care"]
+    make_pot(client, bare=True, name="basil", species="Ocimum_basilicum")
+    care = by_name(client)["basil"]["care"]
     assert care["light"] == 7 and care["common_name"] == "Basil"
     assert sources.hits("gbif") == 1  # the garden asks nobody

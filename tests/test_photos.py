@@ -14,23 +14,13 @@ from fastapi.testclient import TestClient
 
 import butler
 from butler import PHOTO_CAP, create_app
-from conftest import TOKEN
+from conftest import TOKEN, auth, garden, make_pot, minted
 
 
 # A one-pixel JPEG, near enough: the backend checks the first three bytes
 # and never opens the image, so the rest only has to be bytes.
 JPEG = b"\xff\xd8\xff\xe0" + b"plant" * 20 + b"\xff\xd9"
 PNG = b"\x89PNG\r\n\x1a\n" + b"plant" * 20
-
-
-def auth(token=TOKEN):
-    return {} if token is None else {"X-Token": token}
-
-
-def make_pot(client, body="name=basil"):
-    answer = client.post("/pot", content=body, headers=auth())
-    assert answer.status_code == 200, answer.text
-    return answer.text.split()[0].removeprefix("pot=")
 
 
 def upload(client, pot_id, blob=JPEG, token=TOKEN, query=""):
@@ -40,8 +30,7 @@ def upload(client, pot_id, blob=JPEG, token=TOKEN, query=""):
 
 
 def photo_id(answer):
-    assert answer.status_code == 200, answer.text
-    return answer.text.split()[0].removeprefix("photo=")
+    return minted(answer, "photo")
 
 
 def strip(client, pot_id, token=TOKEN, query=""):
@@ -61,7 +50,7 @@ def forget(client, pid, token=TOKEN):
 
 
 def test_a_photograph_goes_up_and_comes_back_byte_for_byte(client):
-    pot = make_pot(client)
+    pot = make_pot(client, bare=True)
     pid = photo_id(upload(client, pot))
     got = fetch(client, pid)
     assert got.status_code == 200
@@ -73,7 +62,7 @@ def test_a_photograph_goes_up_and_comes_back_byte_for_byte(client):
 
 
 def test_the_strip_lists_what_was_uploaded(client):
-    pot = make_pot(client, "name=basil species=Ocimum_basilicum")
+    pot = make_pot(client, bare=True, species="Ocimum_basilicum")
     pid = photo_id(upload(client, pot, query="&w=1600&h=1200"))
     answer = strip(client, pot).json()
     assert answer["pot"] == pot
@@ -88,7 +77,7 @@ def test_the_strip_lists_what_was_uploaded(client):
 
 
 def test_the_newest_picture_is_first(client):
-    pot = make_pot(client)
+    pot = make_pot(client, bare=True)
     first = photo_id(upload(client, pot))
     second = photo_id(upload(client, pot))
     listed = [row["id"] for row in strip(client, pot).json()["photos"]]
@@ -98,15 +87,15 @@ def test_the_newest_picture_is_first(client):
 
 
 def test_a_pot_sees_only_its_own_pictures(client):
-    basil = make_pot(client, "name=basil")
-    fern = make_pot(client, "name=fern")
+    basil = make_pot(client, bare=True)
+    fern = make_pot(client, bare=True, name="fern")
     mine = photo_id(upload(client, basil))
     upload(client, fern)
     assert [row["id"] for row in strip(client, basil).json()["photos"]] == [mine]
 
 
 def test_the_file_lands_under_the_pot_s_own_directory(client, photos):
-    pot = make_pot(client)
+    pot = make_pot(client, bare=True)
     pid = photo_id(upload(client, pot))
     assert (photos / pot / f"{pid}.jpg").read_bytes() == JPEG
     # nothing half-written is left beside it
@@ -117,7 +106,7 @@ def test_the_species_of_the_day_is_stamped_on_the_picture(client):
     """A pot outlives its plant: the strip draws the break where one plant
     ended and the next began from what the pot said it was at the time,
     since there is no replant event."""
-    pot = make_pot(client, "name=windowsill species=Ocimum_basilicum")
+    pot = make_pot(client, bare=True, name="windowsill", species="Ocimum_basilicum")
     upload(client, pot)
     client.post(
         "/pot", content=f"id={pot} species=Monstera_deliciosa", headers=auth()
@@ -133,7 +122,7 @@ def test_the_species_of_the_day_is_stamped_on_the_picture(client):
 
 @pytest.mark.parametrize("token", [None, "wrong"])
 def test_every_photo_route_wants_the_token(client, token):
-    pot = make_pot(client)
+    pot = make_pot(client, bare=True)
     pid = photo_id(upload(client, pot))
     assert upload(client, pot, token=token).status_code == 401
     assert strip(client, pot, token=token).status_code == 401
@@ -144,7 +133,7 @@ def test_every_photo_route_wants_the_token(client, token):
 
 
 def test_a_wrong_token_cannot_tell_a_real_photo_id_from_a_made_up_one(client):
-    pot = make_pot(client)
+    pot = make_pot(client, bare=True)
     pid = photo_id(upload(client, pot))
     assert fetch(client, pid, token="wrong").text == fetch(
         client, "photo-00000000", token="wrong"
@@ -164,7 +153,7 @@ def test_a_photograph_of_a_pot_that_does_not_exist_is_refused(client, photos):
 
 
 def test_only_a_jpeg_gets_in(client):
-    pot = make_pot(client)
+    pot = make_pot(client, bare=True)
     answer = upload(client, pot, blob=PNG)
     assert answer.status_code == 400
     assert "not a JPEG" in answer.text
@@ -172,12 +161,12 @@ def test_only_a_jpeg_gets_in(client):
 
 
 def test_an_empty_body_is_not_a_photograph(client):
-    pot = make_pot(client)
+    pot = make_pot(client, bare=True)
     assert upload(client, pot, blob=b"").status_code == 400
 
 
 def test_a_picture_bigger_than_the_cap_is_refused(client):
-    pot = make_pot(client)
+    pot = make_pot(client, bare=True)
     fat = JPEG + b"\x00" * PHOTO_CAP
     answer = upload(client, pot, blob=fat)
     assert answer.status_code == 413
@@ -198,7 +187,7 @@ def test_no_pot_at_all_is_refused(client):
 
 
 def test_a_pot_given_twice_is_refused(client):
-    pot = make_pot(client)
+    pot = make_pot(client, bare=True)
     answer = client.post(
         f"/photo?pot={pot}&pot={pot}", content=JPEG, headers=auth()
     )
@@ -208,13 +197,13 @@ def test_a_pot_given_twice_is_refused(client):
 
 @pytest.mark.parametrize("query", ["&w=0", "&w=99999", "&w=big", "&h=-1"])
 def test_an_impossible_size_is_refused(client, query):
-    pot = make_pot(client)
+    pot = make_pot(client, bare=True)
     assert upload(client, pot, query=query).status_code == 400
 
 
 @pytest.mark.parametrize("limit", ["0", "501", "lots", "-1"])
 def test_an_impossible_limit_is_refused(client, limit):
-    pot = make_pot(client)
+    pot = make_pot(client, bare=True)
     assert strip(client, pot, query=f"&limit={limit}").status_code == 400
 
 
@@ -222,12 +211,12 @@ def test_the_biggest_limit_the_refusal_names_can_actually_be_asked_for(client):
     """`_int_in`'s top is exclusive, so a named maximum needs a +1 to mean
     what its own refusal says; without this the off-by-one is invisible,
     since 501 is refused either way."""
-    pot = make_pot(client)
+    pot = make_pot(client, bare=True)
     assert strip(client, pot, query="&limit=500").status_code == 200
 
 
 def test_the_limit_pages_and_says_there_is_more(client):
-    pot = make_pot(client)
+    pot = make_pot(client, bare=True)
     for _ in range(3):
         upload(client, pot)
     answer = strip(client, pot, query="&limit=2").json()
@@ -270,7 +259,7 @@ def test_a_delete_of_something_that_is_not_an_id_is_refused(client):
 def test_a_row_whose_file_has_gone_is_listed_as_missing_not_served(client, photos):
     """What a database restored from a newer backup than the volume looks
     like: said out loud rather than served as a picture that will not load."""
-    pot = make_pot(client)
+    pot = make_pot(client, bare=True)
     pid = photo_id(upload(client, pot))
     (photos / pot / f"{pid}.jpg").unlink()
     (row,) = strip(client, pot).json()["photos"]
@@ -285,7 +274,7 @@ def test_a_file_no_row_knows_about_is_invisible(client, photos):
     """The other direction — a crash between the two writes, or a volume
     restored from a newer backup than the database: the strip is built
     from rows, never from the directory."""
-    pot = make_pot(client)
+    pot = make_pot(client, bare=True)
     orphan = photos / pot
     orphan.mkdir(parents=True, exist_ok=True)
     (orphan / "photo-deadbeef.jpg").write_bytes(JPEG)
@@ -298,7 +287,7 @@ def test_a_failed_row_write_takes_its_file_with_it(client, db, photos, monkeypat
     be minted deliberately rather than by a crash — the table is taken away
     while the file is on disk and the row that was about to point at it
     never lands."""
-    pot = make_pot(client)
+    pot = make_pot(client, bare=True)
     real = butler.store.write_new_file
 
     def then_break(path, blob):
@@ -321,7 +310,7 @@ def test_a_failed_row_write_takes_its_file_with_it(client, db, photos, monkeypat
 
 
 def test_deleting_takes_the_row_and_the_file(client, photos):
-    pot = make_pot(client)
+    pot = make_pot(client, bare=True)
     pid = photo_id(upload(client, pot))
     keep = photo_id(upload(client, pot))
     assert forget(client, pid).status_code == 200
@@ -332,7 +321,7 @@ def test_deleting_takes_the_row_and_the_file(client, photos):
 
 
 def test_deleting_twice_is_refused_rather_than_pretended(client):
-    pot = make_pot(client)
+    pot = make_pot(client, bare=True)
     pid = photo_id(upload(client, pot))
     assert forget(client, pid).status_code == 200
     again = forget(client, pid)
@@ -343,7 +332,7 @@ def test_deleting_twice_is_refused_rather_than_pretended(client):
 def test_a_row_whose_file_is_already_gone_can_still_be_deleted(client, photos):
     """A volume that will not give up the bytes is not a reason to keep
     showing a picture somebody asked to remove."""
-    pot = make_pot(client)
+    pot = make_pot(client, bare=True)
     pid = photo_id(upload(client, pot))
     (photos / pot / f"{pid}.jpg").unlink()
     assert forget(client, pid).status_code == 200
@@ -378,7 +367,7 @@ def test_the_write_lock_is_not_held_across_the_disk_write(client, db, monkeypatc
         wrote.append(len(blob))
         real(path, blob)
 
-    pot = make_pot(client)
+    pot = make_pot(client, bare=True)
     monkeypatch.setattr(butler.store, "write_new_file", slow)
     answer = upload(client, pot)
     monkeypatch.undo()
@@ -389,7 +378,7 @@ def test_the_write_lock_is_not_held_across_the_disk_write(client, db, monkeypatc
 def test_two_uploads_at_once_both_land(client):
     """Two phones, or one impatient thumb: ids are minted per upload, so
     neither may overwrite the other's file or row."""
-    pot = make_pot(client)
+    pot = make_pot(client, bare=True)
     answers = []
     lock = threading.Lock()
 
@@ -416,7 +405,7 @@ def test_two_uploads_at_once_both_land(client):
 def test_the_store_sits_beside_the_database_by_default(tmp_path):
     db = tmp_path / "here" / "butler.db"
     client = TestClient(create_app(db_path=str(db), token=TOKEN))
-    pot = make_pot(client)
+    pot = make_pot(client, bare=True)
     pid = photo_id(upload(client, pot))
     assert (tmp_path / "here" / "photos" / pot / f"{pid}.jpg").exists()
 
@@ -444,7 +433,7 @@ def test_a_taken_id_is_given_up_rather_than_overwritten(client, photos, monkeypa
     """The dangerous half of a collision: writing the file first and
     finding out from the INSERT would destroy the picture already at that
     path, an earlier photograph whose row would then point at nothing."""
-    pot = make_pot(client)
+    pot = make_pot(client, bare=True)
     minted = iter(["photo-aaaaaaaa", "photo-aaaaaaaa", "photo-bbbbbbbb"])
     monkeypatch.setattr(butler.schema, "new_photo_id", lambda: next(minted))
     first = photo_id(upload(client, pot, blob=JPEG))
@@ -463,7 +452,7 @@ def test_an_id_whose_row_outlived_its_file_is_also_given_up(client, photos, monk
     """The other way two ids collide: the file is gone but the row is not,
     what a half-restored backup leaves. The new picture must not take that
     row's id and must not touch that row."""
-    pot = make_pot(client)
+    pot = make_pot(client, bare=True)
     minted = iter(["photo-aaaaaaaa", "photo-aaaaaaaa", "photo-bbbbbbbb"])
     monkeypatch.setattr(butler.schema, "new_photo_id", lambda: next(minted))
     first = photo_id(upload(client, pot))
@@ -476,7 +465,7 @@ def test_an_id_whose_row_outlived_its_file_is_also_given_up(client, photos, monk
 
 
 def test_an_id_that_cannot_be_minted_is_a_try_again_and_not_a_500(client, monkeypatch):
-    pot = make_pot(client)
+    pot = make_pot(client, bare=True)
     monkeypatch.setattr(butler.schema, "new_photo_id", lambda: "photo-aaaaaaaa")
     photo_id(upload(client, pot))
     answer = upload(client, pot)
@@ -488,7 +477,7 @@ def test_an_id_that_cannot_be_minted_is_a_try_again_and_not_a_500(client, monkey
 def test_only_one_of_two_racing_deletes_says_ok(client):
     """A bare SELECT takes no lock, so both callers can see the row; the
     DELETE is what decides between them."""
-    pot = make_pot(client)
+    pot = make_pot(client, bare=True)
     pid = photo_id(upload(client, pot))
     codes = []
     lock = threading.Lock()
@@ -513,22 +502,16 @@ def test_an_empty_photos_dir_falls_back_like_an_empty_db_path(tmp_path):
     refusal on the way."""
     db = tmp_path / "here" / "butler.db"
     client = TestClient(create_app(db_path=str(db), token=TOKEN, photos_dir=""))
-    pot = make_pot(client)
+    pot = make_pot(client, bare=True)
     pid = photo_id(upload(client, pot))
     assert (tmp_path / "here" / "photos" / pot / f"{pid}.jpg").exists()
-
-
-def garden(client):
-    answer = client.get("/pots", headers=auth())
-    assert answer.status_code == 200, answer.text
-    return answer.json()["pots"]
 
 
 def test_the_garden_carries_the_newest_picture_for_the_thumbnail(client, db):
     """/pots carries the id only — the bytes come from GET /photo/<id> and
     the app caches those — and the newest one, since that's the portrait
     that says what the plant looks like now."""
-    pot_id = make_pot(client)
+    pot_id = make_pot(client, bare=True)
     assert garden(client)[0]["photo"] is None, "nothing photographed yet"
 
     first = photo_id(upload(client, pot_id))
@@ -543,8 +526,8 @@ def test_the_garden_carries_the_newest_picture_for_the_thumbnail(client, db):
 
 
 def test_a_thumbnail_belongs_to_its_own_pot(client, db):
-    basil = make_pot(client)
-    mint = make_pot(client, "name=mint")
+    basil = make_pot(client, bare=True)
+    mint = make_pot(client, bare=True, name="mint")
     shot = photo_id(upload(client, basil))
 
     by_name = {p["id"]: p["photo"] for p in garden(client)}

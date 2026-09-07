@@ -7,34 +7,39 @@ once refused."""
 
 import sqlite3
 
+import pytest
 from fastapi.testclient import TestClient
 
 import butler
 from butler import FLAP_WINDOW_S, PERSIST_S, SOAK_S, create_app
 from conftest import (
+    DRY,
     TOKEN,
+    WET,
+    age,
+    alerts,
+    capturing,
+    dose,
+    dry_reports,
     health,
     keys,
+    learn_the_tank,
     make_pot,
     origin,
     post,
     report,
+    rules_water,
     run_sql,
+    tap,
     taps,
     tick,
 )
-from test_tank import (  # the tank's own moves, and the app it builds
-    DRY,
-    WET,
-    age,
-    alerts,
-    dose,
-    dry_reports,
-    learn_the_tank,
-    rules_water,
-    settings,  # noqa: F401 — a fixture: the same app the tank's tests get
-    tap,
-)
+
+
+@pytest.fixture
+def settings(sent, pinged):
+    # quiet="0-0": the tests must not care what time it is
+    return {"quiet": "0-0"} | capturing(sent, pinged)
 
 
 def flap_since(db):

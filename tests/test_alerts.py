@@ -22,7 +22,9 @@ from butler import (
     post_ntfy,
 )
 from conftest import (
+    DRY,
     TOKEN,
+    WET,
     age_controller,
     capturing,
     keys,
@@ -32,9 +34,6 @@ from conftest import (
     run_sql,
     tick,
 )
-
-DRY = 11000  # pct 12 with the calibration below
-WET = 8000  # pct 50
 
 
 def build_app(db, sent, pinged, **over):

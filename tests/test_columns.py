@@ -13,7 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from butler import add_columns, create_app
-from conftest import TOKEN
+from conftest import TOKEN, columns, run_sql
 
 
 # The pre-upgrade shape: pots already keyed on `pot-xxxxxx`, wiring already
@@ -72,13 +72,6 @@ def old(tmp_path):
     con.commit()
     con.close()
     return path
-
-
-def columns(path, table):
-    con = sqlite3.connect(path)
-    got = [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
-    con.close()
-    return got
 
 
 def test_the_columns_arrive_and_the_old_ones_stay(old):
@@ -146,11 +139,9 @@ def test_the_cached_names_gain_a_family_they_can_be_refilled_with(old):
     client = TestClient(create_app(db_path=str(old), token=TOKEN))
     assert client.get("/pots").status_code == 200
     assert "family" in columns(old, "species_names")
-    con = sqlite3.connect(old)
-    (family,) = con.execute(
-        "SELECT family FROM species_names WHERE query = 'ocimum basilicum'"
-    ).fetchone()
-    con.close()
+    ((family,),) = run_sql(
+        old, "SELECT family FROM species_names WHERE query = ?", "ocimum basilicum"
+    )
     # the ALTER cannot invent what GBIF was never asked for, so the carried
     # row starts empty rather than wrong; taxon_for treats a resolved row
     # with no family as stale, not a hit, so a later lookup fills it in

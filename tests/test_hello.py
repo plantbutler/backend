@@ -12,12 +12,11 @@ import tomllib
 import pytest
 
 import butler
-from conftest import TOKEN
+from conftest import TOKEN, auth
 
 
 def hello(client, token=TOKEN):
-    headers = {"X-Token": token} if token is not None else {}
-    return client.get("/hello", headers=headers)
+    return client.get("/hello", headers=auth(token))
 
 
 def test_the_right_token_gets_the_version(client):

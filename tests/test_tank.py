@@ -13,28 +13,35 @@ from butler import (
     FLAP_WINDOW_S,
     PERSIST_S,
     REALERT_FLOOR_S,
-    TANK_SAMPLES_TO_ARM,
-    TANK_TOLERANCE_PCT,
     create_app,
     parse_report,
 )
 from conftest import (
+    DRY,
     TOKEN,
+    age,
     age_controller,
+    alerts,
     capturing,
+    dose,
+    dry_reports,
+    full,
     health,
     keys,
+    learn_the_tank,
     make_pot,
     post,
+    refill,
     report,
+    rise,
+    rules_water,
     run_sql,
+    still_empty,
+    tap,
     taps,
     tick,
     word_since,
 )
-
-DRY = 11000  # pct 12 with make_pot's calibration
-WET = 8000  # pct 50
 
 
 @pytest.fixture
@@ -151,15 +158,6 @@ def test_a_pot_cannot_be_saved_with_a_dose_the_board_would_refuse(client):
 # --------------------------------------------------------------------------- #
 # The daily cap counts water the board acknowledged
 # --------------------------------------------------------------------------- #
-
-
-def dry_reports(client, n=5, extra=""):
-    """n dry reports with the safety fields the rules need; no t=, so none
-    is a retry of another. Returns the last response text."""
-    text = ""
-    for _ in range(n):
-        text = report(client, f"c=0 ch0={DRY} float=1 pos=ok {extra}".strip()).text
-    return text
 
 
 def commands(db):
@@ -647,131 +645,6 @@ def test_the_latch_pages_once_and_resume_clears_row_and_page(app, client, db, se
 # --------------------------------------------------------------------------- #
 # Refills, and the float judged against the tank's size
 # --------------------------------------------------------------------------- #
-
-
-def refill(client):
-    """The human taps "refilled" on board 0; the tap's ts."""
-    answer = post(client, "/refill", "c=0")
-    assert answer.status_code == 200, answer.text
-    return int(answer.text.removeprefix("refill=").strip())
-
-
-def age(db, seconds):
-    """Everything so far happened `seconds` earlier, relations kept: the
-    tests run inside one second, a dose handed in an origin's own second
-    is counted as after it, and two float=0 sightings inside the flap
-    window are one float flapping, not two runs of the tank."""
-    with sqlite3.connect(db) as con:
-        con.execute(
-            "UPDATE refills SET ts = ts - ?, drop_ts = drop_ts - ?", (seconds, seconds)
-        )
-        con.execute(
-            "UPDATE commands SET created_ts = created_ts - ?, "
-            "sent_ts = sent_ts - ?, acked_ts = acked_ts - ?",
-            (seconds, seconds, seconds),
-        )
-        con.execute(
-            "UPDATE tank_samples SET ts = ts - ?, refill_ts = refill_ts - ?",
-            (seconds, seconds),
-        )
-        con.execute(
-            "UPDATE status SET float_since = float_since - ?, "
-            "float_word_since = float_word_since - ?, float_rise = float_rise - ?, "
-            "float_seen = float_seen - ?, float_bad = float_bad - ?, "
-            "float_bad_prev = float_bad_prev - ?, flap_since = flap_since - ?",
-            (seconds,) * 7,
-        )
-        # The pages too, the ticker's own bookkeeping rows excepted (they
-        # are its clock): a tap clears `over:` only when it is later than
-        # the raise, and a raise from this same second must be able to be.
-        con.execute(
-            "UPDATE alerts SET raised_ts = raised_ts - ?, cleared_ts = cleared_ts - ? "
-            "WHERE key NOT LIKE 'meta:%'",
-            (seconds, seconds),
-        )
-        # The page a sample earned is keyed on its tap, so it moves with it:
-        # left behind, the sample would look unannounced and page again.
-        for (key,) in con.execute(
-            "SELECT key FROM alerts WHERE key LIKE 'tank:%'"
-        ).fetchall():
-            head, refill_ts = key.rsplit(":", 1)
-            con.execute(
-                "UPDATE alerts SET key = ? WHERE key = ?",
-                (f"{head}:{int(refill_ts) - seconds}", key),
-            )
-
-
-def tap(client, db):
-    """The human says the tank is full, a minute ago; the tap's ts as it
-    stands after that."""
-    ts = refill(client)
-    age(db, 60)
-    return ts - 60
-
-
-def dose(client, ml, float_ok=1):
-    """A manual dose, handed on one report and acked with the meter's count
-    on the next, whose float= says `float_ok` — one sighting, which on
-    empty is not yet the word the tank is measured on (still_empty is)."""
-    answer = post(client, "/command", f"c=0 water=3 ml={ml}")
-    assert answer.status_code == 200, answer.text
-    cmd_id = int(answer.text.strip().removeprefix("cmd="))
-    handed = report(client, "c=0 ch0=1 float=1 pos=ok").text
-    assert f"cmd={cmd_id} water=3 ml={ml}" in handed
-    report(client, f"c=0 ch0=1 float={float_ok} pos=ok ack={cmd_id} flow_ml={ml}")
-
-
-def still_empty(client, db):
-    """A flap window on, the float still says empty: the sighting that
-    confirms an earlier one — a dose's ack, a first report of empty — so
-    the firm word drops, far enough from it that the two are the tank's
-    run and not a float flapping at the line, which is the float: rule's
-    subject and would page here."""
-    age(db, FLAP_WINDOW_S + 1)
-    report(client, "c=0 ch0=1 float=0 pos=ok")
-
-
-def full(client):
-    """The float says full, twice: one sighting is not yet the word the
-    tank is measured on, and the rise is the firm word's."""
-    report(client, "c=0 ch0=1 float=1 pos=ok")
-    report(client, "c=0 ch0=1 float=1 pos=ok")
-
-
-def learn_the_tank(app, client, db, sent, size):
-    """Two runs of `size` ml, each ended by the float — saying empty on
-    the dose's ack and still a flap window on — and a flap window apart:
-    the tank is known, and its two announcements are ticked away. Returns
-    the line `over` starts past."""
-    full(client)
-    for _ in range(TANK_SAMPLES_TO_ARM):
-        tap(client, db)
-        dose(client, size, float_ok=0)
-        still_empty(client, db)
-        age(db, FLAP_WINDOW_S + 1)
-        full(client)
-    assert health(client)["tank_ml"] == size
-    tick(app)
-    assert [k.split(":")[0] for k in keys(sent)] == ["tank"] * TANK_SAMPLES_TO_ARM
-    # Both waited for this one tick, and each is judged as it closed: the
-    # first knew nothing yet, the second knew the first.
-    assert sent[0].message.endswith(f"(tank size learning, 1 of {TANK_SAMPLES_TO_ARM})")
-    assert sent[1].message.endswith(f"(tank {size} ml over {TANK_SAMPLES_TO_ARM} samples)")
-    sent.clear()
-    return size * (100 + TANK_TOLERANCE_PCT) // 100
-
-
-def rules_water(db):
-    return run_sql(db, "SELECT id FROM commands WHERE source = 'rules'")
-
-
-def rise(db):
-    """When the float's word last went 0 -> 1."""
-    return run_sql(db, "SELECT float_rise FROM status WHERE controller = 0")[0][0]
-
-
-def alerts(client):
-    return [a["key"] for a in client.get("/health").json()["alerts"]]
 
 
 def test_a_refill_is_recorded_and_shown(client, db):
