@@ -21,7 +21,7 @@ thing here. `fake_device.py` drives the whole wire without a board, and
 # runs it — so the version lives here. A test holds it to pyproject.toml.
 # Above the imports because routes/service.py reads it back for GET /hello,
 # and this file's own imports are what pull that module in.
-VERSION = "0.20.0"
+VERSION = "0.21.0"
 
 
 import asyncio
