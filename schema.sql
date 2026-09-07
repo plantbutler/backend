@@ -1,15 +1,15 @@
--- The whole database. Additive only: new tables and indexes arrive as new
--- CREATE IF NOT EXISTS lines with the pitch that needs them (no migrations
--- framework, per the plan's no-gos). Raw counts are kept forever; percentages
--- are derived at read time and never stored.
+-- The whole database. Additive only: a new table or index is a new
+-- CREATE IF NOT EXISTS line, and a new COLUMN goes in the CREATE *and* in
+-- butler.ADDED_COLUMNS, because IF NOT EXISTS is additive about tables alone
+-- and never reaches a database the CREATE already ran on. Raw counts are kept
+-- for ever; percentages are derived at read time and never stored.
 --
--- One exception exists, and only one: butler.migrate() rebuilds `pots` at
--- startup to retype its primary key and move the wiring into pot_mappings,
--- which no CREATE IF NOT EXISTS can do. It runs once per database, in one
--- transaction, and leaves <db>.pre-identity.bak behind. Anything else that
--- needs a shape change on a live database is a new table, not a second one
--- of those.
+-- One exception exists: butler.migrate() rebuilds `pots` at startup to retype
+-- its primary key and move the wiring into pot_mappings, which no
+-- CREATE IF NOT EXISTS can do. Anything else needing a shape change on a live
+-- database is a new table, not a second one of those.
 
+-- Every reading the boards have ever sent, never pruned.
 CREATE TABLE IF NOT EXISTS readings (
   ts         INTEGER NOT NULL,  -- server arrival time, unix seconds
   controller INTEGER NOT NULL,  -- c= in the report, the board's own number
@@ -20,13 +20,10 @@ CREATE TABLE IF NOT EXISTS readings (
                                 -- reboot, so values recur; retry dedup is a
                                 -- time-windowed check in the app instead.
   pot_id     TEXT               -- whose reading it is, stamped as the row
-                                -- lands from the pot_mappings window then in
-                                -- force. NULL when nothing was mapped there
-                                -- (an environment channel, or a socket
-                                -- nobody has claimed). Never recomputed: the
-                                -- board sends a channel, and which plant sat
-                                -- on it at 04:00 is not a fact the board can
-                                -- be asked about later.
+                                -- lands from the window then in force, never
+                                -- recomputed. NULL when nothing was mapped
+                                -- there: an environment channel, or a socket
+                                -- nobody has claimed.
 );
 
 CREATE INDEX IF NOT EXISTS readings_by_channel
@@ -41,20 +38,13 @@ CREATE INDEX IF NOT EXISTS readings_by_uptime
 CREATE INDEX IF NOT EXISTS readings_by_pot
   ON readings (pot_id, ts);
 
--- Command hand-off (cycle 1 stretch). One slot per controller, not a job
--- system: queued -> sent (handed once, in a report response) -> acked, or
--- expired (no ack on the next report, or nobody collected it in time).
--- The command log doubles as the watering history, so rows are never pruned.
--- The one exception is a pot the owner has erased: POST /pot/delete removes
--- its commands with everything else of its. See DECISIONS.md.
-
--- AUTOINCREMENT, and it earns its keep: without it `id` is a rowid alias
--- and sqlite hands a deleted command's id straight back out. POST /pot/delete
--- makes that reachable, and a recycled id inherits the erased pot's verdict
--- and its `dose:<id>` judgement ledger row — so a stranger's verdict labels a
--- new dose, and a real dose is never judged at all. The delete removes both
--- of those anyway; this is the belt to that pair of braces, and the only one
--- of the two a race with the alert ticker cannot get past.
+-- One command slot per controller, and the watering history: never pruned,
+-- except by POST /pot/delete taking an erased pot's rows with it.
+--
+-- AUTOINCREMENT, and it earns its keep: without it `id` is a rowid alias and
+-- sqlite hands a deleted command's id straight back out. A recycled id would
+-- inherit the erased pot's verdict and its `dose:<id>` judgement row, so a
+-- stranger's verdict labels a new dose and a real dose is never judged.
 CREATE TABLE IF NOT EXISTS commands (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   created_ts INTEGER NOT NULL,
@@ -64,14 +54,13 @@ CREATE TABLE IF NOT EXISTS commands (
   ml         INTEGER,           -- water only: dose
   cap_s      INTEGER,           -- water only: hard seconds cap
   state      TEXT    NOT NULL,  -- 'queued' -> 'sent' -> 'acked' | 'expired'
-  source     TEXT    NOT NULL,  -- who queued it ('manual' until rules exist)
+  source     TEXT    NOT NULL,  -- 'manual' | 'rules'
   sent_ts    INTEGER,
   acked_ts   INTEGER,
   flow_ml    INTEGER,           -- what the board says actually flowed
-  pot_id     TEXT               -- whom the dose was made for, stamped when
-                                -- the row is written. NULL for a stop, and
-                                -- for a hose no pot was on. The board is
-                                -- still handed an outlet, not a pot.
+  pot_id     TEXT               -- whom the dose was for, stamped when the
+                                -- board is handed it. NULL for a stop, and
+                                -- for a hose no pot was on.
 );
 
 CREATE INDEX IF NOT EXISTS commands_open
@@ -80,30 +69,18 @@ CREATE INDEX IF NOT EXISTS commands_open
 CREATE INDEX IF NOT EXISTS commands_by_pot
   ON commands (pot_id, sent_ts);
 
--- One row per controller that has ever reported or been configured:
--- heartbeat (last_seen) and the per-controller report interval override
--- (next_s, NULL means the BUTLER_NEXT_S default).
-
+-- One row per controller that has ever reported or been configured.
 CREATE TABLE IF NOT EXISTS controllers (
   controller INTEGER PRIMARY KEY,
   last_seen  INTEGER NOT NULL,  -- 0 = configured but never heard from
-  next_s     INTEGER,
+  next_s     INTEGER,           -- report interval override; NULL = the default
   retired    INTEGER NOT NULL DEFAULT 0  -- 1: a board that is gone; reports
                                          -- still land, nothing pages or waters
 );
 
--- Pots, plants and calibration (cycle 2). One row per pot: the two
--- calibration numbers, the Planta-style descriptive fields, and the knobs
--- the watering rules read. Percentages are derived at read time from
--- (dry_raw, wet_raw) and never stored, so recalibrating reinterprets
--- history instead of losing it.
-
--- The id is a random `pot-xxxxxx`, stable for the life of the pot, and the
--- only thing anything else keys on; the name is a nickname and may be
--- edited. The physical wiring is NOT here: it lives in pot_mappings with a
--- validity window, so remapping reinterprets history instead of misfiling
--- it, exactly as recalibration reinterprets percentages.
-
+-- One row per pot. Its wiring is NOT here — that is pot_mappings, with a
+-- window — so remapping reinterprets history rather than misfiling it,
+-- exactly as recalibration reinterprets percentages.
 CREATE TABLE IF NOT EXISTS pots (
   id              TEXT    PRIMARY KEY,      -- pot-3f9a21, minted once
   name            TEXT    NOT NULL UNIQUE,  -- nickname, editable
@@ -114,9 +91,9 @@ CREATE TABLE IF NOT EXISTS pots (
   soil            TEXT,     -- one of butler.SOIL_SHIFTS, or NULL for "not said"
   dry_raw         INTEGER,  -- calibration: raw count bone dry
   wet_raw         INTEGER,  -- calibration: raw count soaked
-  target_low_pct  INTEGER,  -- the ideal moisture range
+  target_low_pct  INTEGER,
   target_high_pct INTEGER,
-  dose_ml         INTEGER,  -- for the rules pitch
+  dose_ml         INTEGER,
   mode            TEXT    NOT NULL DEFAULT 'manual',  -- manual|learning|auto
   cooldown_h      INTEGER,
   daily_cap_ml    INTEGER,
@@ -124,10 +101,8 @@ CREATE TABLE IF NOT EXISTS pots (
 );
 
 -- Where a pot was wired, and when. Exactly one open row per pot (to_ts IS
--- NULL) is its mapping now; a remap closes the open row and opens another.
--- from_ts 0 means "since before this table existed", which is what the
--- rebuild writes, so the whole of history stays attributed.
-
+-- NULL) is its mapping now; a remap closes that row and opens another in the
+-- same second, and from_ts 0 means "since before this table existed".
 CREATE TABLE IF NOT EXISTS pot_mappings (
   pot_id     TEXT    NOT NULL,
   controller INTEGER,  -- which board its sensor reports from
@@ -146,14 +121,10 @@ CREATE INDEX IF NOT EXISTS pot_mappings_by_channel
 CREATE INDEX IF NOT EXISTS pot_mappings_by_outlet
   ON pot_mappings (controller, outlet, from_ts);
 
--- Every reader that wants "the pot as it is wired right now" reads this and
--- gets the column shape the pots table used to have.
---
--- Dropped and recreated on every start rather than IF NOT EXISTS. A view
--- holds no data — it is derived, like a percentage — so rebuilding it costs
--- nothing, and IF NOT EXISTS would leave a database that predates a column
--- serving the old shape forever with nothing to say it had.
-
+-- Every reader that wants "the pot as it is wired right now" reads this.
+-- Dropped and recreated on every start rather than IF NOT EXISTS: a view holds
+-- no data, and IF NOT EXISTS would leave a database that predates a column
+-- serving the old shape for ever with nothing to say it had.
 DROP VIEW IF EXISTS pots_now;
 CREATE VIEW pots_now AS
 SELECT p.id, p.name, p.species,
@@ -164,11 +135,8 @@ SELECT p.id, p.name, p.species,
   FROM pots p
   LEFT JOIN pot_mappings m ON m.pot_id = p.id AND m.to_ts IS NULL;
 
--- Rules that water (cycle 2). Proposals live in the commands table as
--- state 'proposed' (source 'rules'); verdicts are the learning log — one
--- human judgement per executed dose, the dataset adaptive dosing will one
--- day fit on. Never pruned.
-
+-- The learning log: one human judgement per executed dose. Never pruned.
+-- Proposals are not here — they are commands in state 'proposed'.
 CREATE TABLE IF NOT EXISTS verdicts (
   command_id INTEGER PRIMARY KEY,  -- one verdict per dose; re-verdict replaces
   ts         INTEGER NOT NULL,
@@ -178,137 +146,88 @@ CREATE TABLE IF NOT EXISTS verdicts (
 CREATE INDEX IF NOT EXISTS commands_by_outlet
   ON commands (controller, outlet, sent_ts);
 
--- Tell me when it's wrong (cycle 2). `status` is each controller's latest
--- safety fields, with a `since` per value so a float bouncing at the
--- waterline or a manifold homing at boot must persist before it alarms.
--- `alerts` is the alerting state, one row per condition or judgement,
--- overwritten in place: which conditions are raised now, when a cleared one
--- may sound again, which doses are already judged. State, not history —
--- ntfy keeps no archive and neither does this (a no-go in the pitch).
-
+-- Each controller's latest safety fields, with a clock per value so a float
+-- bouncing at the waterline or a manifold homing at boot must persist before
+-- it alarms.
 CREATE TABLE IF NOT EXISTS status (
   controller     INTEGER PRIMARY KEY,
   ts             INTEGER NOT NULL,  -- when the latest report landed
   float_ok       INTEGER,           -- float= in that report, NULL if not sent
-  float_since    INTEGER,           -- when float_ok last changed value, NULL
+  float_since    INTEGER,           -- when float_ok last changed, NULL
                                     -- included: the fields: rule's clock
   pos            TEXT,              -- pos= in that report, NULL if not sent
-  pos_since      INTEGER,           -- when pos last changed value
+  pos_since      INTEGER,
   float_seen     INTEGER,           -- last time float= arrived at all: its
-                                    -- vanishing afterwards is its own alarm,
-                                    -- and the stuck-at-empty rule waits for
-                                    -- one PERSIST_S after the tap
+                                    -- vanishing afterwards is its own alarm
   pos_seen       INTEGER,
   float_bad      INTEGER,           -- the last two float=0 sightings: two
   float_bad_prev INTEGER,           -- inside FLAP_WINDOW_S raise, so a float
                                     -- flapping at the waterline still pages
   pos_bad        INTEGER,           -- same, for pos=unknown
   pos_bad_prev   INTEGER,
-  err            TEXT,              -- err= in the latest report that carried one:
-  err_ts         INTEGER,           -- the board's last safety error, and when
-  latched_ts     INTEGER,           -- the durable half of the board's contradiction
-  latch_reason   TEXT,              -- latch: 'contra' | 'resetmid' (the dry latch,
-                                    -- ch211, or err= turning to resetmid on a
-                                    -- board that sends no ch211), NULL when not
+  err            TEXT,              -- the board's last safety error, and when
+  err_ts         INTEGER,           -- it last CHANGED: the board repeats it
+  latched_ts     INTEGER,           -- the backend's own latch: when it began,
+  latch_reason   TEXT,              -- and which fault, one of butler.LATCH_TEXT
   pos_ok_seen    INTEGER,           -- last pos=ok ever seen; pos: pages only after one
-  float_word     INTEGER,           -- the board's last word on the float, kept
-                                    -- across a report that omits float= (which
-                                    -- blanks float_ok): the tap snapshots it,
-                                    -- and the firm word below is two of these
-                                    -- in a row agreeing, so a report that said
-                                    -- nothing must not hide a sighting
+  float_word     INTEGER,           -- the board's last real word on the float,
+                                    -- kept across a report that omits float=
+                                    -- (which blanks float_ok): a report that
+                                    -- said nothing must not hide a sighting
   float_word_since INTEGER,         -- when the word last changed, 1 -> 0 or
-                                    -- 0 -> 1 and on nothing else: the
-                                    -- stuck-at-empty rule's clock (a word that
-                                    -- changed after the tap is a float that
-                                    -- moved); a report that said nothing moves
-                                    -- float_since, never this
+                                    -- 0 -> 1 and nothing else: the
+                                    -- stuck-at-empty rule's clock
   float_rise     INTEGER,           -- when the firm word last went 0 -> 1: the
-                                    -- tank's counter restarts here once the word
-                                    -- has gone 1 -> 0 since the tap
-                                    -- (refills.drop_ts) and risen later — a tank
-                                    -- run down and refilled by someone who
-                                    -- forgot to tap
-  contra         INTEGER NOT NULL DEFAULT 0,  -- ch207 in the latest report, absent
-                                    -- being 0: the board's own contradiction
-                                    -- latch stands until `clear contra` is typed,
-                                    -- and over: and stale: keep quiet while it does
-  float_firm     INTEGER,           -- the word once two consecutive reports that
-                                    -- carry float= agree: one sighting is a
-                                    -- glitch by the board's own design, and the
-                                    -- edges the tank is measured on — the drop
-                                    -- that closes a sample (refills.drop_ts),
-                                    -- the rise that restarts the counter
-                                    -- (float_rise) — are this word's, each
-                                    -- stamped where the word moved, not where
-                                    -- the next report confirmed it, so a dose
-                                    -- handed as the float rose is on the counter.
-                                    -- NULL until two agree (the first report
-                                    -- sets nothing firm, the upgrade carries
-                                    -- none), and NULL is never an edge. The
-                                    -- stuck-at-full rule reads this word
+                                    -- tank's counter restarts here once the
+                                    -- word has dropped since the tap
+                                    -- (refills.drop_ts) and risen later
+  contra         INTEGER NOT NULL DEFAULT 0,  -- ch207 in the latest report:
+                                    -- the board's contradiction latch, which
+                                    -- over: and stale: keep quiet under
+  float_firm     INTEGER,           -- the word once two consecutive reports
+                                    -- carrying float= agree; one sighting is a
+                                    -- glitch by the board's own design. Both
+                                    -- edges the tank is measured on are this
+                                    -- word's, each stamped where the word
+                                    -- MOVED. NULL is never an edge
   float_forced   INTEGER NOT NULL DEFAULT 0, -- the firm word's last drop came
-                                    -- with ch207=1: the contra latch forcing
-                                    -- the word, not the tank. The firm word
-                                    -- coming back out of it is `clear contra`
-                                    -- typed, no rise (float_rise stays); only
-                                    -- the next firm drop writes this again
-  flap           INTEGER NOT NULL DEFAULT 0,  -- ch210 in the latest report, absent
-                                    -- being 0: the board's float check tripped
-                                    -- (three float refusals in a row force its
-                                    -- word to 0 until a dose is granted). Why
-                                    -- float= is 0, when it is: the stale: page
-                                    -- says so, and a tap answers it for one dose
+                                    -- with ch207=1: the latch forcing the
+                                    -- word, so the word coming back out of it
+                                    -- is `clear contra` typed and no rise
+  flap           INTEGER NOT NULL DEFAULT 0,  -- ch210 in the latest report:
+                                    -- three float refusals in a row force the
+                                    -- board's word to 0 until a dose is
+                                    -- granted. Why float= is 0, when it is
   flap_since     INTEGER,           -- when flap last went 0 -> 1: the tap that
                                     -- answers it is later than this
-  dry            INTEGER NOT NULL DEFAULT 0   -- ch211 in the latest report, absent
-                                    -- being 0: the board's dry latch, set by a
-                                    -- reset with a dose in flight and cleared
-                                    -- only by `dry off` — the level that latches
-                                    -- the backend under the resetmid words, as
-                                    -- ch207 does under contra's
+  dry            INTEGER NOT NULL DEFAULT 0   -- ch211 in the latest report:
+                                    -- the board held dry, released only by
+                                    -- `dry off` at its console
 );
 
--- A refill is a human event (pitch "Trust the tank"): the app says so, the
--- board cannot, and the tap means "full to the top". The tank's counter
--- starts at the latest one per controller that saw the float, or at the
--- float's latest rise once the word has gone 1 -> 0 since that tap and
--- risen later (a tank run down and refilled by someone who forgot to
--- tap); the stuck-at-empty rule reads the latest one, snapshot and all.
--- Read on every report and every tick, hence the index.
+-- A refill is a human event: the app says so, the board cannot, and the tap
+-- means "full to the top". Read on every report and every tick, hence the
+-- index.
 CREATE TABLE IF NOT EXISTS refills (
   ts         INTEGER NOT NULL,  -- server time when the human said so
   controller INTEGER NOT NULL,
   float_ok   INTEGER,           -- the board's last real word on the float at
-                                -- the tap (status.float_word, which a report
-                                -- that omits float= leaves alone); NULL when
-                                -- the board had never sent float= (and on the
-                                -- rows from before this column), and then
-                                -- the tap judges nothing and starts no
-                                -- counter
+                                -- the tap. NULL when it had never sent
+                                -- float=, and then the tap judges nothing and
+                                -- starts no counter
   drop_ts    INTEGER            -- the first time the firm word went 1 -> 0
-                                -- after this tap, sample or not — unless the
-                                -- report carried ch207=1 (the contra latch
-                                -- forcing the word: a fault, not a drop);
-                                -- NULL until then, and NULL on the rows from
-                                -- before this column, which no origin starts
-                                -- from. The run a tap starts closes on this
-                                -- drop and no later one, and a rise counts
-                                -- only past it
+                                -- after this tap, unless that report carried
+                                -- ch207=1 (the latch forcing the word: a
+                                -- fault, not a drop). The run this tap
+                                -- started closes here and no later, and a
+                                -- rise counts only past it
 );
 
 CREATE INDEX IF NOT EXISTS refills_by_controller ON refills (controller, ts);
 
--- The tank has a size, and it is measured: one row the first time the
--- float's firm word went empty after the tap that saw it full, with water
--- on the counter since, `ml` being the acked water handed out between the
--- two as of the report that confirmed the drop — on a board neither
--- latched nor sending ch207=1 nor retired (the drop is stamped under any
--- latch but the contra's own report; the sample waits). A second drain after an
--- untapped refill stores nothing: nobody said that refill was full. One
--- per tap — a float bouncing at the waterline adds nothing after its
--- first crossing — hence the UNIQUE; the size is the median of the last
--- few by ts, hence the index.
+-- One measurement of a tank: the acked water handed out between a tap that saw
+-- the float full and the firm word going empty. One per tap, hence the UNIQUE;
+-- the size is the median of the last few by ts, hence the index.
 CREATE TABLE IF NOT EXISTS tank_samples (
   ts         INTEGER NOT NULL,  -- the report that confirmed the float empty
   controller INTEGER NOT NULL,
@@ -319,6 +238,9 @@ CREATE TABLE IF NOT EXISTS tank_samples (
 
 CREATE INDEX IF NOT EXISTS tank_samples_by_controller ON tank_samples (controller, ts);
 
+-- The alerting state, one row per condition or judgement, overwritten in
+-- place: what is raised now, when a cleared one may sound again, which doses
+-- are already judged. State, not history — ntfy keeps no archive either.
 CREATE TABLE IF NOT EXISTS alerts (
   key        TEXT PRIMARY KEY,  -- silent:<c> | sensor:<c>:<ch> | float:<c> |
                                 -- pos:<c> | fields:<kind>:<c> | dose:<id> |
@@ -336,31 +258,23 @@ CREATE TABLE IF NOT EXISTS alerts (
                                 -- latch renamed while standing pages again
 );
 
--- What does this plant want? (cycle 2). Two caches, because the two hops
--- have different lifetimes: many spellings resolve to one accepted name,
--- and one accepted name has one answer from the care source. Both keep the
--- date they were fetched, so an answer can always be told from a fresh one.
-
--- The taxonomy hop, GBIF. `query` is what the user typed, normalised;
--- `accepted` is the binomial to ask a care source about, NULL when GBIF
--- recognised nothing (or only a genus, which is not enough to look up).
-
+-- The taxonomy hop. Many spellings resolve to one accepted name, which is why
+-- this cache is separate from the care one; `fetched_ts` is what tells a stale
+-- answer from a fresh one.
 CREATE TABLE IF NOT EXISTS species_names (
   query      TEXT PRIMARY KEY,  -- lowercased, whitespace-collapsed typing
   fetched_ts INTEGER NOT NULL,
-  accepted   TEXT,
+  accepted   TEXT,              -- the binomial to ask a care source about;
+                                -- NULL when nothing, or only a genus, matched
   rank       TEXT,              -- SPECIES, GENUS, ... as GBIF reports it
   matched    TEXT NOT NULL,     -- exact | fuzzy | genus | none
   family     TEXT               -- what the plant-kind guess is read from
 );
 
--- The care source's answer for one accepted binomial. `found = 0` is a
--- real answer and is cached too: Trefle's houseplant coverage is empty,
--- not thin, so "nothing known" is the common case and must not re-ask on
--- every screen open. Nothing here is a watering number — Trefle has none
--- (soil_humidity was NULL for every species probed on 2026-09-04). The
--- target band comes from the local table, and only from there.
-
+-- The care source's answer for one accepted binomial. `found = 0` is a real
+-- answer and is cached too, since houseplant coverage is empty rather than
+-- thin. No watering number is here: the care source carries no watering
+-- regime, and the target band comes from butler.target_band alone.
 CREATE TABLE IF NOT EXISTS species_care (
   species     TEXT PRIMARY KEY,  -- the accepted binomial, lowercased
   fetched_ts  INTEGER NOT NULL,
@@ -375,11 +289,9 @@ CREATE TABLE IF NOT EXISTS species_care (
   image_url   TEXT
 );
 
--- A target band the user said no to. One row per pot and kind, overwritten
--- in place — state, not history, like `alerts`. The fingerprint is the
--- numbers that were refused: propose something different (a new season, a
--- repot, a different soil) and it is a new offer, so it is raised again.
-
+-- A target band the user said no to, overwritten in place. The fingerprint is
+-- the numbers refused, so a different offer — a new season, a repot, another
+-- soil — is a new question and is asked again.
 CREATE TABLE IF NOT EXISTS advice_dismissed (
   pot_id      TEXT    NOT NULL,
   kind        TEXT    NOT NULL,  -- 'target'
@@ -388,34 +300,20 @@ CREATE TABLE IF NOT EXISTS advice_dismissed (
   PRIMARY KEY (pot_id, kind)
 );
 
--- The fuzzy half of the lookup. GBIF only knows scientific names, so
--- "basil", "peace lily" and "tomatoe" resolve to nothing there; Trefle's own
--- search matches common names and tolerates a typo, and its results already
--- carry a picture, which is how a person confirms they found their plant.
--- One row per typing, since that is what was searched for.
-
+-- The fuzzy half of the lookup: GBIF knows scientific names only, so "basil"
+-- and "tomatoe" resolve to nothing there. One row per typing, since that is
+-- what was searched for.
 CREATE TABLE IF NOT EXISTS species_search (
   query      TEXT PRIMARY KEY,
   fetched_ts INTEGER NOT NULL,
   candidates TEXT NOT NULL  -- JSON array of {name, common, image, slug}
 );
 
--- A picture of the plant, over time (cycle 2). The bytes live on the
--- bind-mounted volume beside this database, one file per row, and this
--- table is the truth: a photograph is listed, served and deleted by its
--- row, and the directory is never read to decide what exists.
---
--- That settles the two reachable inconsistencies in opposite directions,
--- on purpose. A file no row knows about is invisible and harmless — it is
--- what a crash between the two writes leaves behind, and what a database
--- restored from an older backup than the volume leaves behind. A row whose
--- file has gone is the other way round, cannot be hidden, and is reported
--- as `missing` rather than served as a broken image.
---
--- `species` is what the pot said it was when the picture was taken. A pot
--- outlives its plant, and this is what lets the strip draw the break where
--- one plant ended and the next began without inventing a replant event.
-
+-- One row per photograph, and this table is the truth: a picture is listed,
+-- served and deleted by its row, and the directory beside the database is
+-- never read to decide what exists. So a file no row knows about is invisible
+-- and harmless, while a row whose file has gone is reported as `missing`
+-- rather than served as a broken image.
 CREATE TABLE IF NOT EXISTS photos (
   id      TEXT PRIMARY KEY,  -- photo-3f9a21b4, minted once; the filename too
   pot_id  TEXT    NOT NULL,
@@ -423,7 +321,9 @@ CREATE TABLE IF NOT EXISTS photos (
   bytes   INTEGER NOT NULL,
   w       INTEGER,           -- what the phone says it downscaled to
   h       INTEGER,
-  species TEXT
+  species TEXT               -- what the pot said it was when this was taken:
+                             -- a pot outlives its plant, and this draws the
+                             -- break in the strip without a replant event
 );
 
 CREATE INDEX IF NOT EXISTS photos_by_pot ON photos (pot_id, ts);
