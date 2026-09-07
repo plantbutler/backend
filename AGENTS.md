@@ -131,7 +131,8 @@ watering.
   next report's `ack=<id> flow_ml=`; a no-ack report or the TTL expires it. Expired is gone —
   ask again. The commands table is never pruned: it doubles as the watering history.
 - **The tank (0.18.0, pitch "Trust the tank").** The board's `err=` is stored on `status` (last
-  value, and `err_ts` = when it last *changed*: the board repeats its last error on every report).
+  value — a short token, digits included, since the I2C refusal's is `i2c` — and `err_ts` = when
+  it last *changed*: the board repeats its last error on every report).
   `ch207=1` latches the backend, and so does `err=` *turning to* `resetmid` — an edge, never a
   level, and `err=contra` never latches: `err=` is sticky and `clear contra` on the console never
   touches it, so a level would re-latch a resumed board forever. A latch: `water_rules` goes dry,
@@ -139,7 +140,9 @@ watering.
   the re-alert floor — until `POST /resume`, the human's half, which the app offers beside the
   board's own word for the reason — `LATCH_STEP`, the one map the 409 and the `latch:<c>` page
   spell the steps from: `clear contra` for a contra, `dry off` for a board that reset with the
-  pump running, which the firmware latches dry and `clear contra` does not touch. The float
+  pump running, which the firmware latches dry and `clear contra` does not touch, the contra
+  words for a reason neither knows. A second fault landing while the latch stands overwrites
+  the reason and keeps the stamp: the newest fault is the one to fix. The float
   going empty does not latch: the rules already refuse on it. `POST /refill` records a human
   refill, and the tap means "full to the top": the row snapshots `status.float_word`, the
   board's last real word (a report that omits `float=` blanks `float_ok`, and a tap made under
@@ -148,8 +151,9 @@ watering.
   base for anything), or the float's latest rise (`status.float_rise` — the word's own clock,
   which a report that omits `float=` leaves alone, where `float_since` is `float_ok`'s and the
   `fields:` rule's) once the word has gone 1 → 0 since that tap (the tap's `drop_ts`, stamped
-  by the report path on the firm word's first drop after it — never under the latch, a `ch207=1`
-  report included: a forced 0 is not a drop) and risen strictly later: a float that went
+  by the report path on the firm word's first drop after it — not on a `ch207=1` report, the
+  contra latch being what forces the word: a forced 0 is not a drop; a drain under any other
+  latch is) and risen strictly later: a float that went
   1 → 0 → 1 since the tap is a tank refilled by someone who forgot to tap; a rise with no drop
   since the tap is the tap's own refill reaching the float, a `clear contra` after a tap, the
   manual dose lifting the flap, and the tap stands; one that said nothing once has not moved;
@@ -174,11 +178,19 @@ watering.
   run) and closes a `tank_samples` row with the water on the counter since the tap as of the
   confirming report — on that drop and no later one: one per tap, `INSERT OR IGNORE`, nothing
   on zero pumped, nothing on a second drain after an untapped refill (nobody said that refill
-  was full), neither stamp nor sample while the latch stands — a `ch207=1` report sets it first:
-  "float OK, zero pulses" is a fault, not a drop, and stamped it let `clear contra` read as a
-  rise that laundered the counter — and no sample for a retired board. The rise (`float_rise`)
-  is the firm word's too, stamped where the word rose rather than where the next report
-  confirmed it, so the dose handed as the float rose stays on the counter. `tank_ml()` is the
+  was full), no stamp on a `ch207=1` report — the contra latch is what forces the word: "float
+  OK, zero pulses" is a fault, not a drop, and stamped it let `clear contra` read as a rise that
+  laundered the counter — while under any other latch the drop is stamped and only the sample
+  waits, and no sample for a retired board. A firm drop that came with `ch207=1` is remembered
+  (`status.float_forced`), and the firm word coming back out of it stamps no rise and clears
+  the flag, so `clear contra` is never the origin — not even when the tap's `drop_ts` was
+  already set, an untapped refill's run being exactly that. The duplicate check on
+  `(controller, t)` runs before the status upsert and the edge, not only before the readings:
+  the firmware retries with the body kept, and a retried glitch must not confirm itself. The
+  rise (`float_rise`) is the firm word's too, stamped where the word rose rather than where
+  the next report confirmed it, so the dose handed as the float rose stays on the counter. No
+  carry at the upgrade: a 0.18.0 tap has a NULL snapshot and is no origin, so the first tap
+  after the upgrade starts everything. `tank_ml()` is the
   median of the last `TANK_MEDIAN_OF` (5) samples, `None` under `TANK_SAMPLES_TO_ARM` (2). The
   float is judged against that volume, never a clock: `tank_state()` answers "over" when more
   than the size plus `TANK_TOLERANCE_PCT` (10) has been pumped since the origin and the float
@@ -340,8 +352,7 @@ pot_id)` — the command log is the watering history, never pruned EXCEPT by `PO
 stored. `schema.sql` stays additive, but `CREATE TABLE IF NOT EXISTS` is additive about tables
 only — a column appended to a CREATE that already ran never reaches an existing database — so a new
 column goes in the CREATE *and* in `butler.ADDED_COLUMNS`, which ALTERs it in at startup and can
-carry a value over from an old column (`source`, row by row) or, once every column is in, from
-another table (`carry`: `refills.drop_ts` on a tank already empty at the upgrade). `pots_now` is
+carry a value over from an old column (`source`, row by row). `pots_now` is
 dropped and recreated on every start for the same reason; it holds no data, and a view over a
 column the table has not got yet parses fine and then fails on every read. Air temperature and
 light ride the same readings table as extra channels (the sensor kit

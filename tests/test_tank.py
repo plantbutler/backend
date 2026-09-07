@@ -87,6 +87,7 @@ def run_sql(db, sql, *params):
 
 def test_err_is_parsed_once_and_as_a_short_token():
     assert parse_report("c=0 ch0=1 err=contra").err == "contra"
+    assert parse_report("c=0 ch0=1 err=i2c").err == "i2c"  # the board's DOSE_REFUSED_I2C
     assert parse_report("c=0 ch0=1").err is None
     with pytest.raises(ValueError, match="err= given twice"):
         parse_report("c=0 ch0=1 err=range err=heap")
@@ -94,6 +95,14 @@ def test_err_is_parsed_once_and_as_a_short_token():
         parse_report("c=0 ch0=1 err=Contra")
     with pytest.raises(ValueError, match="err="):
         parse_report("c=0 ch0=1 err=" + "x" * 17)
+
+
+def test_an_i2c_refusal_lands_and_is_stored(client):
+    """The firmware's DOSE_REFUSED_I2C token is `i2c`, and err= is the
+    board's sticky last error: refused for its digit, one I2C refusal made
+    every later report a 400 until reboot (spec D13)."""
+    report(client, "c=0 ch0=1 float=1 pos=ok err=i2c")
+    assert health(client)["err"] == "i2c"
 
 
 def test_the_last_err_is_kept_until_the_board_sends_another(client, db):
@@ -491,7 +500,7 @@ def test_the_latch_outlives_the_board_forgetting_it(client, db):
     assert commands(db) == []  # the rules stayed dry for the whole window
 
 
-def test_the_latch_keeps_its_first_stamp_and_reason_while_it_stands(client, db):
+def test_the_latch_keeps_its_first_stamp_and_names_its_newest_reason(client, db):
     report(client, "c=0 ch0=1 float=1 pos=ok ch207=1")
     # The reports below land in the same second as the first, so a stamp
     # rewritten on every latching report would equal the one that should
@@ -500,11 +509,22 @@ def test_the_latch_keeps_its_first_stamp_and_reason_while_it_stands(client, db):
     run_sql(db, "UPDATE status SET latched_ts = latched_ts - 60")
     stamp = health(client)["latched"]["since"]
     report(client, "c=0 ch0=1 float=1 pos=ok ch207=1")  # the board still says so
-    report(client, "c=0 ch0=1 float=1 pos=ok err=resetmid")  # a second fault on top
     assert health(client)["latched"] == {"since": stamp, "reason": "contra"}
-    # `since` is when the trouble began: resume ends this latch, and the
-    # next one is a new one, with its own onset and its own reason — here
-    # a fresh reset with the pump running, err= turning to resetmid again.
+    # A second fault on top: `since` stays when the trouble began, and the
+    # reason is the newest, the one to fix — a board that reset with the
+    # pump running is latched dry on the firmware, and `clear contra`
+    # would not touch that (spec D12, four times).
+    report(client, "c=0 ch0=1 float=1 pos=ok err=resetmid")
+    assert health(client)["latched"] == {"since": stamp, "reason": "resetmid"}
+    answer = post(client, "/command", "c=0 water=3 ml=50")
+    assert answer.status_code == 409
+    assert answer.text.startswith("refused: board 0 stopped watering (resetmid since ")
+    assert answer.text.rstrip().endswith(
+        "check the tank, type dry off on the board, then resume"
+    )
+    # Resume ends this latch, and the next one is a new one, with its own
+    # onset and its own reason — here a fresh reset with the pump running,
+    # err= turning to resetmid again.
     assert post(client, "/resume", "c=0").text == "resumed=0\n"
     report(client, "c=0 ch0=1 float=1 pos=ok err=none")
     report(client, "c=0 ch0=1 float=1 pos=ok err=resetmid")
@@ -523,12 +543,13 @@ def test_a_latch_expires_what_was_waiting_and_refuses_new_water(client, db):
     assert post(client, "/command", "c=0 stop=1").status_code == 200
 
 
-def test_the_latch_names_the_boards_word_for_its_reason(app, client, sent):
+def test_the_latch_names_the_boards_word_for_its_reason(app, client, db, sent):
     """A board that reset with the pump running is latched dry on the
     firmware, and only `dry off` clears that; `clear contra` clears the
     contradiction latch alone. The 409 and the page spell the step from
     one map keyed by the reason, so a person is not sent to type the
-    wrong thing (spec D12)."""
+    wrong thing — and a reason the map does not know gets the contra
+    words, as the app's map does (spec D12)."""
     assert butler.LATCH_STEP == {
         "contra": "type clear contra on the board",
         "resetmid": "type dry off on the board",
@@ -558,6 +579,12 @@ def test_the_latch_names_the_boards_word_for_its_reason(app, client, sent):
         "board 1 stopped watering: the float said full and the meter saw "
         "nothing — check the tank, type clear contra on the board, then resume "
         "in the app"
+    )
+    run_sql(db, "UPDATE status SET latch_reason = 'flap' WHERE controller = 1")
+    answer = post(client, "/command", "c=1 water=3 ml=50")
+    assert answer.status_code == 409
+    assert answer.text.rstrip().endswith(
+        "check the tank, type clear contra on the board, then resume"
     )
 
 

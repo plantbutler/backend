@@ -259,7 +259,8 @@ stopped itself — `ch207=1`, the float said full and the meter saw nothing, or 
 change counts) — which latches the butler too: no rule waters it and `POST /command` refuses a
 dose until `POST /resume`, and that one pages high every time, floor or no floor, naming the
 board's own word to type first (`clear contra`, or `dry off` after a reset mid-dose, which the
-board latches dry and `clear contra` does not touch); a float
+board latches dry and `clear contra` does not touch — the newest fault's word, when a second
+lands on a board still stopped); a float
 presumed stuck — still saying full after more than the tank holds (plus a tenth) has been pumped
 since the refill you recorded, or since the float last rose if it had gone empty since that tap (a
 tank run down and refilled by someone who forgot to tap restarts the count: the float demonstrably
@@ -275,8 +276,9 @@ dry on empty already; neither while the board's latch stands, nor while its last
 carried `ch207=1` (a resume before `clear contra` is typed lifts the one and not the other); and
 each time the float closes a measurement of the tank — what the meter counted between your tap
 and the first time the float said empty, twice running, after it, on a board neither latched nor
-sending `ch207=1` nor retired (the empty a contra forces is a fault, not a run's end, and a second
-run after a refill nobody said was full measures nothing), the
+sending `ch207=1` nor retired (the empty a contra forces is a fault, not a run's end, and the float
+coming back after `clear contra` is not a refill; a second run after a refill nobody said was full
+measures nothing), the
 tank's size being the median of the last five such runs (known after two), and a
 run more than a quarter off what it knew is a warning: a different tank, a clogging meter, or a
 tap that was not a fill. A

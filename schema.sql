@@ -231,7 +231,7 @@ CREATE TABLE IF NOT EXISTS status (
                                     -- being 0: the board's own contradiction
                                     -- latch stands until `clear contra` is typed,
                                     -- and over: and stale: keep quiet while it does
-  float_firm     INTEGER            -- the word once two consecutive reports that
+  float_firm     INTEGER,           -- the word once two consecutive reports that
                                     -- carry float= agree: one sighting is a
                                     -- glitch by the board's own design, and the
                                     -- edges the tank is measured on — the drop
@@ -241,6 +241,12 @@ CREATE TABLE IF NOT EXISTS status (
                                     -- stamped where the word moved, not where
                                     -- the next report confirmed it, so a dose
                                     -- handed as the float rose is on the counter
+  float_forced   INTEGER NOT NULL DEFAULT 0  -- the firm word's last drop came
+                                    -- with ch207=1: the contra latch forcing
+                                    -- the word, not the tank. The firm word
+                                    -- coming back out of it is `clear contra`
+                                    -- typed, no rise (float_rise stays), and
+                                    -- clears this
 );
 
 -- A refill is a human event (pitch "Trust the tank"): the app says so, the
@@ -262,11 +268,13 @@ CREATE TABLE IF NOT EXISTS refills (
                                 -- counter
   drop_ts    INTEGER            -- the first time the firm word went 1 -> 0
                                 -- after this tap, sample or not — unless the
-                                -- board forced the 0 (a ch207=1 report, or
-                                -- its latch standing: a fault, not a drop);
-                                -- NULL until then. The run a tap starts closes
-                                -- on this drop and no later one, and a rise
-                                -- counts only past it
+                                -- report carried ch207=1 (the contra latch
+                                -- forcing the word: a fault, not a drop);
+                                -- NULL until then, and NULL on the rows from
+                                -- before this column, which no origin starts
+                                -- from. The run a tap starts closes on this
+                                -- drop and no later one, and a rise counts
+                                -- only past it
 );
 
 CREATE INDEX IF NOT EXISTS refills_by_controller ON refills (controller, ts);
@@ -275,7 +283,8 @@ CREATE INDEX IF NOT EXISTS refills_by_controller ON refills (controller, ts);
 -- float's firm word went empty after the tap that saw it full, with water
 -- on the counter since, `ml` being the acked water handed out between the
 -- two as of the report that confirmed the drop — on a board neither
--- latched nor sending ch207=1 nor retired. A second drain after an
+-- latched nor sending ch207=1 nor retired (the drop is stamped under any
+-- latch but the contra's own report; the sample waits). A second drain after an
 -- untapped refill stores nothing: nobody said that refill was full. One
 -- per tap — a float bouncing at the waterline adds nothing after its
 -- first crossing — hence the UNIQUE; the size is the median of the last
