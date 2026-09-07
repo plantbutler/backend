@@ -1,10 +1,9 @@
-"""Latches on the wire (0.20.0): the board's flap and dry latches arrive
-as ch210 and ch211 beside ch207's contra, the backend latches on levels
-(the dry one with reason `dry`, the reset's edge consulted beside it),
-/health and the stale page tell the flap apart, and a tap answers the
-flap for one dose — a try that waits out no refusal's cooldown and is
-paged for only once refused (spec 2026-09-07-latches-on-the-wire,
-sections 2 and 5)."""
+"""Latches on the wire: the board's flap and dry latches arrive as ch210
+and ch211 beside ch207's contra, the backend latches on levels (the dry
+one with reason `dry`, the reset's edge consulted beside it), /health and
+the stale page tell the flap apart, and a tap answers the flap for one
+dose — a try that waits out no refusal's cooldown and is paged for only
+once refused."""
 
 import sqlite3
 
@@ -69,7 +68,7 @@ def pages(sent, key):
 
 
 # --------------------------------------------------------------------------- #
-# The dry latch is a level (spec D1)
+# The dry latch is a level
 # --------------------------------------------------------------------------- #
 
 
@@ -79,7 +78,7 @@ def test_ch211_latches_the_backend_dry_as_ch207_latches_contra(app, client, db, 
     as ch211, a level like ch207, and latches the backend with reason
     `dry` and its own words: the 409, the page, the queued dose expired,
     and the level re-asserting the latch on every report until the human
-    resumes (spec D1, A2)."""
+    resumes."""
     assert post(client, "/command", "c=0 water=3 ml=50").status_code == 200
     report(client, "c=0 ch0=1 float=1 pos=ok ch211=1")
     latched = health(client)["latched"]
@@ -134,7 +133,7 @@ def test_both_levels_name_contra_first_and_the_dry_latch_after_the_resume(
     every report, ch207=1 and ch211=1 (and err=resetmid, sticky). The
     contra is the reason: its step comes first. Once `clear contra` is
     typed and ch207 goes, the dry level still stands, and after the
-    resume it latches again with its own words (spec D1, A2)."""
+    resume it latches again with its own words."""
     report(client, "c=0 ch0=1 float=1 pos=ok ch207=1 ch211=1 err=resetmid")
     assert health(client)["latched"]["reason"] == "contra"
     answer = post(client, "/command", "c=0 water=3 ml=50")
@@ -174,8 +173,8 @@ def test_clear_contra_under_both_levels_renames_the_standing_latch(app, client, 
     still on the wire overwrites the reason, keeps the stamp, and the
     page comes again with the new words, floor or no floor — a person
     told "clear contra" must also be told "dry off". And a contra
-    landing under a dry latch takes the name back: its step comes first
-    (spec D1, D14 d)."""
+    landing under a dry latch takes the name back: its step comes
+    first."""
     report(client, "c=0 ch0=1 float=1 pos=ok ch207=1 ch211=1")
     tick(app)
     assert keys(sent) == ["latch:0"] and "type clear contra" in sent[0].message
@@ -205,7 +204,7 @@ def test_the_resetmid_edge_is_consulted_on_every_report(client):
     one whose `dry off` was typed before its first post-reset report —
     read as "not dry, nothing to see", that reset hid for good. One that
     carries ch211=1 latches on the level, `dry` before `resetmid`,
-    whatever err= does; and a sticky err= is no edge (spec A2)."""
+    whatever err= does; and a sticky err= is no edge."""
     report(client, "c=0 ch0=1 float=1 pos=ok err=range")
     report(client, "c=0 ch0=1 float=1 pos=ok err=resetmid")
     assert health(client)["latched"]["reason"] == "resetmid"
@@ -226,12 +225,12 @@ def test_the_resetmid_edge_is_consulted_on_every_report(client):
 def test_dry_off_typed_before_the_first_post_reset_report_latches_on_the_edge(
     app, client, sent
 ):
-    """Bring-up 7c, exactly: the board resets with the pump running and
-    `dry off` is typed at the console before its first report after the
-    reset. That report carries ch211=0 and err=resetmid — no level, the
-    edge alone — and the edge latches, with the reset's own words in the
-    409 and on the page; the board's next reports repeat the error, and
-    after the resume the latch stays down (spec A2)."""
+    """The board resets with the pump running and `dry off` is typed at
+    the console before its first report after the reset. That report
+    carries ch211=0 and err=resetmid — no level, the edge alone — and
+    the edge latches, with the reset's own words in the 409 and on the
+    page; the board's next reports repeat the error, and after the
+    resume the latch stays down."""
     report(client, "c=0 ch0=1 float=1 pos=ok ch211=0")
     report(client, "c=0 ch0=1 float=1 pos=ok ch211=0 err=resetmid")
     latched = health(client)["latched"]
@@ -263,8 +262,7 @@ def test_a_contra_alone_on_a_board_that_says_it_is_not_dry_latches_contra(
     ch211=0: the contra alone, on a board saying it is not dry. It
     latches contra with the contra words, the level re-asserts it, and
     `clear contra` typed — ch207 going, ch211 still 0 — leaves the latch
-    standing under its name until the human resumes, and down after
-    (spec D1, A2)."""
+    standing under its name until the human resumes, and down after."""
     report(client, "c=0 ch0=1 float=1 pos=ok ch207=1 ch211=0")
     latched = health(client)["latched"]
     assert latched["reason"] == "contra" and latched["since"] > 0
@@ -300,7 +298,7 @@ def test_a_dead_float_waits_behind_the_boards_own_dry_level(app, client, db, sen
     `dry off` is typed lifts the backend's latch and not the board's,
     which keeps saying ch211=1, and the latch page already says what to
     do — no stale: page while the level stands. The tick after a report
-    without it pages the float as before (spec A2)."""
+    without it pages the float as before."""
     report(client, "c=0 ch0=1 float=1 pos=ok")
     report(client, "c=0 ch0=1 float=0 pos=ok ch211=1")
     tick(app)
@@ -321,7 +319,7 @@ def test_a_dead_float_waits_behind_the_boards_own_dry_level(app, client, db, sen
 def test_over_waits_behind_the_boards_own_dry_level(app, client, db, sent):
     """The same gate for the dangerous page: resumed with ch211=1 still
     on the wire, the board is the latch page's business, not a stuck
-    float's, until `dry off` is typed (spec A2)."""
+    float's, until `dry off` is typed."""
     learn_the_tank(app, client, db, sent, 200)
     tap(client, db)
     dose(client, 250)
@@ -346,7 +344,7 @@ def test_status_keeps_the_boards_three_latches_from_its_latest_report(client, db
 
 
 # --------------------------------------------------------------------------- #
-# The flap is told apart (spec D2)
+# The flap is told apart
 # --------------------------------------------------------------------------- #
 
 
@@ -393,7 +391,7 @@ def test_the_stale_page_names_the_flap_when_the_board_says_it_tripped(
     the person to do what they just did: nothing. Refused, the tap is
     spent, and the page says what tripped and what to do. No pot on this
     board: the try is a human's, and queued is what keeps the page
-    waiting (spec D2, A1, A5)."""
+    waiting."""
     tapped = stuck_at_empty_after_a_tap(client, db, "ch210=1")
     assert post(client, "/command", "c=0 water=3 ml=50").status_code == 200
     tick(app)
@@ -426,7 +424,7 @@ def test_the_stale_page_presumes_the_float_stuck_when_the_flap_is_down(
 
 
 # --------------------------------------------------------------------------- #
-# A tap answers the flap (spec D3)
+# A tap answers the flap
 # --------------------------------------------------------------------------- #
 
 
@@ -436,8 +434,8 @@ def test_a_tap_later_than_the_flap_buys_the_rules_one_dose(client, db):
     full, and the rules queue their next dose as they would. The board's
     own float check granted it: the flap resets, float=1 returns, the
     next dose goes on the word itself — and the tap stays the origin,
-    since the flap-forced 0 was a firm drop and no drop followed the tap
-    (spec D3)."""
+    since the flap-forced 0 was a firm drop and no drop followed the
+    tap."""
     make_pot(client, cooldown_h=0, daily_cap_ml=100_000)
     dry_reports(client, n=4)  # four dry readings, the float up, its word firm
     assert "cmd=" not in flapped(client)  # the fifth, under the flap, before any tap: dry
@@ -461,7 +459,7 @@ def test_a_tap_before_the_flap_tripped_answers_nothing(client, db):
     made before the flap tripped: it answers nothing, however much later
     than the word's own drop it came. The clock the tap is judged against
     is the flap's, status.flap_since, not the word's, status.float_since —
-    the one report where the two differ (spec D3)."""
+    the one report where the two differ."""
     make_pot(client, cooldown_h=0, daily_cap_ml=100_000)
     dry_reports(client, n=2)
     report(client, f"c=0 ch0={DRY} float=0 pos=ok")  # the word drops; no flap yet
@@ -479,7 +477,7 @@ def test_a_refused_try_leaves_the_rules_dry_until_the_next_tap(app, client, db, 
     """The board re-checks at dose time. Refused — the float is down —
     the dose acks with nothing and err=float, the flap stands, and the
     tap is spent: one dosefail page, the rules dry again until the next
-    tap, which buys the next try (spec D3)."""
+    tap, which buys the next try."""
     make_pot(client, cooldown_h=0, daily_cap_ml=100_000)
     dry_reports(client, n=4)
     assert "cmd=" not in flapped(client)
@@ -509,7 +507,7 @@ def test_a_refused_try_leaves_the_rules_dry_until_the_next_tap(app, client, db, 
 def test_a_manual_dose_under_the_flap_goes_and_spends_the_tap(client, db):
     """POST /command stays ungated: a human is at the phone and the
     board's own float check runs. Handed after the tap, it is the one
-    try the tap bought, whoever asked for it (spec D3)."""
+    try the tap bought, whoever asked for it."""
     make_pot(client, cooldown_h=0, daily_cap_ml=100_000)
     dry_reports(client, n=4)
     assert "cmd=" not in flapped(client)
@@ -529,7 +527,7 @@ def test_a_stop_handed_after_the_tap_does_not_spend_it(client, db):
     """Only water spends the tap. A stop sent between the tap and the
     flap's next report is the safe direction, not the try the tap bought:
     it holds the slot for one report, and once the board has acked it the
-    rules queue their dose as they would (spec D3)."""
+    rules queue their dose as they would."""
     make_pot(client, cooldown_h=0, daily_cap_ml=100_000)
     dry_reports(client, n=4)
     assert "cmd=" not in flapped(client)
@@ -549,7 +547,7 @@ def test_a_tap_in_the_flaps_own_second_answers_nothing(client, db):
     one second which came first is unknowable, and a tap made before the
     flap was on the wire answers nothing: the tie goes dry, which costs
     the human one more tap a minute on. Pinned by hand — whether the two
-    land in one second is the wall clock's business (spec D3)."""
+    land in one second is the wall clock's business."""
     make_pot(client, cooldown_h=0, daily_cap_ml=100_000)
     dry_reports(client, n=4)
     assert "cmd=" not in flapped(client)
@@ -566,11 +564,11 @@ def test_a_tap_in_the_flaps_own_second_answers_nothing(client, db):
 
 def test_a_tap_that_never_saw_the_float_answers_nothing(client, db):
     """A tap whose snapshot is NULL — made while the board had never said
-    float= (the rows 0.18.0 left behind are the same) — never meant "full
+    float= (older rows with no snapshot are the same) — never meant "full
     to the top", and is no base for anything: not the counter's, and not
     the flap's, however much later than flap_since it came. The board's
     first word makes the next tap one that saw the float, and that one
-    buys the try (spec D3)."""
+    buys the try."""
     make_pot(client, cooldown_h=0, daily_cap_ml=100_000)
     for _ in range(5):
         report(client, f"c=0 ch0={DRY} pos=ok ch210=1")  # tripped; float= never said
@@ -593,7 +591,7 @@ def test_water_handed_in_the_taps_own_second_spends_it(client, db):
     a dose handed in the tap's second was the try it bought: the tie goes
     dry, as the tap's own does — a strict comparison let a second report
     in that second hand a second try against the standing flap, the loop
-    the flap exists to stop. Pinned by hand (spec D3)."""
+    the flap exists to stop. Pinned by hand."""
     make_pot(client, cooldown_h=0, daily_cap_ml=100_000)
     dry_reports(client, n=4)
     assert "cmd=" not in flapped(client)
@@ -611,7 +609,7 @@ def test_water_handed_in_the_taps_own_second_spends_it(client, db):
 
 # --------------------------------------------------------------------------- #
 # The tap's try waits out no refusal's cooldown, and is paged for only
-# once refused (spec A1)
+# once refused
 # --------------------------------------------------------------------------- #
 
 
@@ -624,7 +622,7 @@ def test_the_taps_try_does_not_wait_out_the_refusals_cooldown(app, client, db, s
     refusal well inside the cooldown, and no stale page comes between.
     Refused, the ack spends the tap, the refusal cools the pot as before,
     and the tripped text pages on the next tick; the float saying full
-    afterwards is all normal (spec A1)."""
+    afterwards is all normal."""
     make_pot(client, cooldown_h=6, daily_cap_ml=100_000)
     assert "cmd=1 water=3 ml=100" in dry_reports(client)  # handed on the fifth
     for cmd_id in (1, 2):
@@ -680,8 +678,7 @@ def test_no_stale_page_while_the_taps_try_is_pending(app, client, db, sent):
     above its target waits — and until then the page would tell the
     person to refill and tap, which they just did. Skipped while the tap
     answers the flap and while its try is with the board: the float is
-    dead by every other measure, and nothing pages; refused, it does
-    (spec A1)."""
+    dead by every other measure, and nothing pages; refused, it does."""
     make_pot(client, cooldown_h=0, daily_cap_ml=100_000)
     report(client, f"c=0 ch0={WET} float=1 pos=ok")
     report(client, f"c=0 ch0={WET} float=1 pos=ok")
@@ -712,7 +709,7 @@ def test_the_flap_path_wants_the_boards_word_of_zero(client, db):
     """The flap forces the board's word to 0, and that word is what the
     tap answers: a report that omits float= under ch210=1 says nothing
     the tap can answer and hands no try — an omitted float= is dry here
-    as everywhere (spec A1)."""
+    as everywhere."""
     make_pot(client, cooldown_h=0, daily_cap_ml=100_000)
     dry_reports(client, n=4)
     assert "cmd=" not in flapped(client)
@@ -725,7 +722,6 @@ def test_the_flap_path_wants_the_boards_word_of_zero(client, db):
 
 # --------------------------------------------------------------------------- #
 # The page waits for a try that can come, not for one nobody will make
-# (spec A5)
 # --------------------------------------------------------------------------- #
 
 
@@ -736,7 +732,7 @@ def test_the_stale_page_waits_for_no_try_nobody_will_make(app, client, db, sent)
     pending, that silenced the page for good — the one thing meant to
     tell the person the flap still stands. The try is a human's on this
     board, and the page does not wait for one it cannot promise: it
-    comes at PERSIST_S, naming the flap (spec A5)."""
+    comes at PERSIST_S, naming the flap."""
     tapped = stuck_at_empty_after_a_tap(client, db, "ch210=1")
     with sqlite3.connect(db) as con:
         assert butler.float_dead(con, 0, butler.latest_refill(con, 0)) is not None
@@ -762,7 +758,7 @@ def test_a_learning_pots_proposal_is_not_a_try_the_page_waits_for(
     page for good and left the person the daily proposal nudge, which
     names no float. A proposal standing is not a try coming: the page
     comes at PERSIST_S, and the approval — the human's try — spends the
-    tap as any dose does and adds no page (spec A5)."""
+    tap as any dose does and adds no page."""
     make_pot(client, mode="learning", cooldown_h=0, daily_cap_ml=100_000)
     dry_reports(client, n=4)
     assert "cmd=" not in flapped(client)  # the fifth, under the flap, before any tap
@@ -805,10 +801,10 @@ def test_the_three_columns_are_in_the_create_and_in_added_columns():
 
 
 def test_an_existing_database_grows_the_three_columns_at_startup(db):
-    """The 0.19.0 shape of status is this one less the three. They arrive
-    at startup, absent being 0 — a board that has not reported since the
-    upgrade reads as never latched, never tripped — and NULL for a clock
-    nothing has started; the next report fills them in."""
+    """The old shape of status is this one less the three columns. They
+    arrive at startup, absent being 0 — a board that has not reported
+    since the upgrade reads as never latched, never tripped — and NULL
+    for a clock nothing has started; the next report fills them in."""
     TestClient(create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900))
     with sqlite3.connect(db) as con:
         for column in ("flap", "flap_since", "dry"):

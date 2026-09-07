@@ -70,9 +70,8 @@ def tick(app, now=None):
 
 
 def see_everything(app):
-    # Silence is measured from the later of last_seen and the butler's own
-    # observation start, so a test that backdates last_seen must backdate
-    # the observation window too.
+    # Silence is measured from the later of last_seen and the observation
+    # start, so backdating last_seen must also backdate the window.
     app.state.observed["since"] = 0
 
 
@@ -161,18 +160,17 @@ def plant_dose(
     outlet=3,
     channel=0,
 ):
-    """One executed dose and its readings, timestamps fully controlled.
+    """One executed dose and its readings, with fully controlled timestamps.
 
-    The command carries the stamp production would have written, and the
-    readings carry theirs: both are what the judgement reads."""
+    The command carries the stamp production would write, and the readings
+    carry theirs: both are what the judgement reads."""
     now = int(time.time())
     sent_ts = now - sent_ago
     acked_ts = None if acked_ago is None else now - acked_ago
     with sqlite3.connect(db) as con:
-        # A pot is wired before it is watered. make_pot stamps its mapping
-        # window milliseconds ago and the dose is planted well in the past,
-        # so the window has to move back with it, or the judgement cannot
-        # find which SENSOR the pot was on when the water went down.
+        # make_pot stamps its mapping window milliseconds ago, but the dose
+        # is planted well in the past, so the window must move back with it
+        # or the judgement can't find which sensor the pot was on.
         con.execute(
             "UPDATE pot_mappings SET from_ts = ? WHERE to_ts IS NULL AND from_ts > ?",
             (sent_ts - 10, sent_ts - 10),
@@ -239,7 +237,7 @@ def test_a_returning_controller_clears_once_and_reflaps_are_floored(
     age_controller(db, 700)
     tick(app, now)
 
-    report(client)  # it is back
+    report(client)
     tick(app, now)
     assert [a.key for a in sent] == ["silent:0", "silent:0"]
     assert sent[1].priority == "default"
@@ -446,7 +444,7 @@ def test_a_dead_sensor_channel_pages_while_the_controller_reports(
     make_pot(client, mode="manual")
     report(client)
     see_everything(app)
-    with sqlite3.connect(db) as con:  # the wire comes loose; the board go on
+    with sqlite3.connect(db) as con:  # the wire comes loose; the board goes on
         con.execute("UPDATE readings SET ts = ts - 700")
     tick(app, int(time.time()))
     assert keys(sent) == ["sensor:0:0"]
@@ -523,7 +521,7 @@ def test_a_dose_short_on_the_meter_alerts_high(app, client, db, sent):
 
 def test_a_dose_never_acknowledged_alerts_high_and_immediately(app, client, db, sent):
     make_pot(client)
-    plant_dose(db, state="expired", acked_ago=None, sent_ago=90)  # 90 s ago
+    plant_dose(db, state="expired", acked_ago=None, sent_ago=90)
     tick(app, int(time.time()))
     assert [a.key for a in sent] == ["dose:1"]  # no pointless soak wait
     assert sent[0].priority == "high"
@@ -585,7 +583,7 @@ def test_doses_older_than_a_day_are_history_not_news(app, client, db, sent):
 def test_correlated_dose_failures_page_once_per_controller(app, client, db, sent):
     make_pot(client)
     make_pot(client, name="mint", channel=1, outlet=4)
-    plant_dose(db, flow_ml=10, after_raw=WET)  # the shared pump died:
+    plant_dose(db, flow_ml=10, after_raw=WET)  # the shared pump died
     plant_dose(db, flow_ml=10, after_raw=WET, outlet=4, channel=1)
     tick(app, int(time.time()))
 
