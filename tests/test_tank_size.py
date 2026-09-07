@@ -217,6 +217,12 @@ def drops(db):
     return [ts for (ts,) in run_sql(db, "SELECT drop_ts FROM refills ORDER BY ts, rowid")]
 
 
+def forced(db):
+    """Whether the firm word's last drop came with ch207=1: the contra
+    latch forcing the word to 0, not the tank running down."""
+    return run_sql(db, "SELECT float_forced FROM status WHERE controller = 0")[0][0]
+
+
 def vm_steps(con, fetch):
     """SQLite's own count of the virtual-machine steps `fetch` costs on
     `con`, without a clock."""
@@ -593,6 +599,32 @@ def test_clear_contra_after_a_tap_at_the_forced_zero_leaves_the_tap(client, db):
     dose(client, 120, flow=110)
     empty(client)
     assert samples(db) == [(since, 110)]
+
+
+def test_a_contra_once_the_tank_is_empty_forces_nothing(client, db):
+    """The forced 0 is remembered on the firm drop that arrives with
+    ch207=1 — the report that confirms the drop, and that one alone. A
+    contra that comes later, the word already firmly 0 after a real
+    drain, is a fault over an empty tank and not what emptied it: the
+    drop closed its sample unforced and stays so. Remembered as forced,
+    the untapped refill after `clear contra` would stamp no rise — the
+    word "came back out of a forced 0" — and the counter would keep the
+    tap for its origin with the run already sampled on it, a false
+    stuck-at-full page a few doses into a fresh tank (spec D3, D4, four
+    times)."""
+    full(client)
+    since = tap(client, db)
+    dose(client, 100, flow=100)
+    empty(client)  # the real drain: the tap's drop and its sample
+    assert samples(db) == [(since, 100)] and firm(db) == 0 and forced(db) == 0
+    report(client, "c=0 ch0=1 float=0 pos=ok ch207=1")  # a contra, the tank empty
+    assert health(client)["latched"]["reason"] == "contra"
+    assert forced(db) == 0  # not the drop's confirming report: nothing forced
+    assert post(client, "/resume", "c=0").status_code == 200
+    age(db, 60)
+    full(client)  # clear contra typed and refilled, untapped: a rise
+    assert forced(db) == 0 and rise(db) == word_since(db)
+    assert origin(db) == (rise(db), "rise") and health(client)["pumped_ml"] == 0
 
 
 def test_a_contra_after_an_untapped_refill_keeps_the_rise(client, db):
