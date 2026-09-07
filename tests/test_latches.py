@@ -800,6 +800,36 @@ def test_the_three_columns_are_in_the_create_and_in_added_columns():
     assert (butler.FLAP_CHANNEL, butler.DRY_CHANNEL) == (210, 211)
 
 
+# The shape of `status` before the three columns arrived, written out rather
+# than carved out of the current one: a test that reaches for DROP COLUMN is a
+# test about SQLite, and on an older SQLite it fails on a comma inside a
+# comment rather than on anything this repository does.
+OLD_STATUS = """
+CREATE TABLE status (
+  controller     INTEGER PRIMARY KEY,
+  ts             INTEGER NOT NULL,
+  float_ok       INTEGER,
+  float_since    INTEGER,
+  pos            TEXT,
+  pos_since      INTEGER,
+  float_seen     INTEGER,
+  pos_seen       INTEGER,
+  float_bad      INTEGER,
+  float_bad_prev INTEGER,
+  pos_bad        INTEGER,
+  pos_bad_prev   INTEGER,
+  err            TEXT,
+  err_ts         INTEGER,
+  latched_ts     INTEGER,
+  latch_reason   TEXT,
+  pos_ok_seen    INTEGER,
+  float_word     INTEGER,
+  float_word_since INTEGER,
+  float_rise     INTEGER
+)
+"""
+
+
 def test_an_existing_database_grows_the_three_columns_at_startup(db):
     """The old shape of status is this one less the three columns. They
     arrive at startup, absent being 0 — a board that has not reported
@@ -807,8 +837,8 @@ def test_an_existing_database_grows_the_three_columns_at_startup(db):
     for a clock nothing has started; the next report fills them in."""
     TestClient(create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900))
     with sqlite3.connect(db) as con:
-        for column in ("flap", "flap_since", "dry"):
-            con.execute(f"ALTER TABLE status DROP COLUMN {column}")
+        con.execute("DROP TABLE status")
+        con.execute(OLD_STATUS)
         con.execute(
             "INSERT INTO status (controller, ts, float_ok, float_since) VALUES (0, 5, 0, 5)"
         )
