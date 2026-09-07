@@ -1,71 +1,19 @@
-"""Plant Butler backend.
+"""Plant Butler backend: one container on the NAS, LAN only.
 
-One container on the NAS, LAN only. The board talks first: one plain-HTTP
-POST per report interval, `k=v` tokens in the body, one static token in the
-`X-Token` header. The response is `k=v` too: the next report interval and,
-when one is queued, at most one command.
+Two callers, both of which start the conversation. The Arduino board POSTs a
+report every report interval — `k=v` tokens in the body, a static token in the
+`X-Token` header — and the reply is `k=v` too: the next interval and, when one
+is queued, at most one command. The phone app reads and writes JSON.
 
-Storage is stdlib sqlite3 on a bind-mounted volume, schema in `schema.sql`,
-WAL so a reader never blocks the writer. Timestamps are stamped on arrival:
-the board has no clock worth trusting.
+Everything here errs dry. A malformed report is refused whole rather than
+stored in part; every watering gate refuses rather than waters; a command the
+board may or may not be holding is expired rather than handed out twice.
+Timestamps are stamped on arrival, because the board has no clock.
 
-A malformed report is refused WHOLE with a 400 — half a report stored looks
-exactly like a working system with dead sensors, and a board bug should be
-loud. Strictness covers the encoding too: invalid UTF-8 is a refusal, not a
-repair, because one flipped byte in `c=` would otherwise mint a phantom
-controller and quietly fork the readings. Unknown KEYS, by contrast, are
-ignored on purpose: the board will grow keys like `last=` before this
-service learns to read them, and a report must land whole the day either
-side updates first.
-
-The board's failure mode is the design load-bearer: firmware retries a report
-once when the response is lost, so an identical `t=` (board uptime, ms) from
-the same controller within a short window is the same report arriving twice
-and is answered 200 without storing again. The window matters — uptime
-restarts at every reboot, so old `t` values legitimately recur, and a
-permanent uniqueness rule would silently drop genuine readings.
-
-Commands are a hand-off, not a job system. One slot per controller: a
-command is queued (`POST /command`), handed to the board exactly once in
-the response to its next report (queued -> sent), and acknowledged by the
-report after that (`ack=<id>`, -> acked). A report that carries no matching
-ack while a command sits sent expires it: either the response that carried
-it was lost or the board dropped it — both mean the board does not have it,
-and re-handing a watering command the board might still execute is how a
-plant drowns. A queued command nobody collected within BUTLER_CMD_TTL_S
-expires too. Expired means gone; whoever wants water asks again.
-
-Watering rules run in-process on each fresh report — no cron, no thread.
-Every gate errs dry: rules act only when the report itself says the
-reservoir floats (`float=1`) and the manifold knows where it is (`pos=ok`),
-outside quiet hours, on a full median window below the pot's target, with
-no open command on the hose, cooldown passed and the daily cap unspent.
-The board does not send `float=` or `pos=` yet, so the rules ship dark and
-the fake device exercises them. In auto the command is queued directly; in
-learning it becomes a proposal for `POST /approve`, and `POST /verdict`
-records how the dose worked out. The flip to auto is a human act, per pot.
-
-Alerting is a ticker, the one periodic thing here: a quiet controller
-cannot be noticed on report arrival. Every ALERT_TICK_S it evaluates the
-alert rules from database state alone — controller silent, a mapped
-sensor's channel gone missing, reservoir empty, manifold position lost, a
-safety field that vanished after the board had been sending it, a dose
-that was never acked or came up short on the meter or did not raise
-moisture, a learning proposal waiting, a board that stopped itself and
-waits for a human to resume it, a float presumed stuck (still saying full
-after more than the tank holds went out since the last refill or the
-float's own last rise, or still saying empty in a report minutes after a
-refill), and each time the float closes a measurement of the tank — posts
-the transitions to a public ntfy.sh topic
-(BUTLER_NTFY_TOPIC; the topic name is the secret), and only
-after a fully clean pass GETs BUTLER_DEADMAN_URL. A pass with nothing to
-send must first prove ntfy reachable, so the butler dying and the butler
-losing ntfy both stop the pings. Raising is debounced (two bad sightings
-inside FLAP_WINDOW_S for the board's own fields, thresholds for silence)
-under one re-raise per REALERT_FLOOR_S per condition, dose failures are
-floored per controller, and the observation window survives short restarts
-via a bookkeeping row — because a phone that gets muted is worse than an
-alert that arrives three minutes late.
+Storage is stdlib sqlite3 in WAL on a bind-mounted volume; `schema.sql` holds
+the tables and the rules about them. The alert ticker is the only periodic
+thing here. `fake_device.py` drives the whole wire without a board, and
+`README.md` is the endpoint-by-endpoint reference.
 """
 
 import asyncio
@@ -93,88 +41,71 @@ from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import QueryParams
 from starlette.requests import ClientDisconnect
 
-# What GET /hello answers with. Kept here rather than read from the package
-# metadata because the container installs no package — it copies butler.py
-# beside fastapi and runs it. A test asserts this and pyproject.toml agree,
-# which is the only thing that keeps the two honest.
+# The container installs no package — it copies butler.py beside fastapi and
+# runs it — so the version lives here. A test holds it to pyproject.toml.
 VERSION = "0.20.0"
 
 BODY_CAP = 4096  # a full 15-channel report is ~200 bytes; 4 KB is generous
-# Photographs are the first thing here that is not small. The phone caps the
-# long edge before it uploads, which puts a JPEG around 300-500 KB; 3 MiB is
-# room for a bad guess and still a refusal long before the NAS volume cares.
+# The phone caps the long edge before uploading, which puts a JPEG at
+# 300-500 KB; this is room for a bad guess, not a size anyone should reach.
 PHOTO_CAP = 3 * 1024 * 1024
 JPEG_HEAD = b"\xff\xd8\xff"  # every JPEG starts SOI + a marker
 PHOTO_LIMIT = 100  # the strip's default page
 MAX_PHOTO_LIMIT = 500
 MAX_PHOTO_EDGE = 8192  # w=/h= are what the phone says it downscaled to
-# Ids are four random bytes, so a collision needs tens of thousands of
-# photographs in one install. This is what stops one being a 500.
+# Ids are four random bytes; retrying keeps a collision from being a 500.
 PHOTO_ID_TRIES = 4
-# Every id that becomes part of a filesystem path goes through this first.
-# Ids here are minted, so nothing legitimate is turned away; what it stops
-# is a `pot=../../etc` writing outside the photo store, which no amount of
-# "but the pot has to exist" reasoning further down would catch on its own.
+# Every id that becomes part of a filesystem path passes this first: it is
+# what stops a `pot=../../etc` writing outside the photo store. Ids here are
+# minted, so nothing legitimate is turned away.
 SAFE_ID = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
-# err= is the board's last safety error: one of its own short lowercase
-# tokens (contra, resetmid, range, heap, i2c, ...), digits included — the
-# I2C refusal's token is `i2c`, and since err= is sticky, refusing it made
-# every later report a 400 until reboot. Bounded like every other field,
-# so a stray value cannot become an unbounded TEXT on status.
+# err= is the board's last safety error: a short lowercase token, digits
+# included (contra, resetmid, range, heap, i2c). It is sticky, so a token
+# refused here makes every later report a 400 until the board reboots.
+# Bounded so a stray value cannot become unbounded TEXT on status.
 ERR_TOKEN = re.compile(r"\A[a-z0-9_]{1,16}\Z")
 RETRY_WINDOW_S = 300  # how long an identical (controller, t) counts as a retry
 MAX_CHANNEL = 255
-# The board's own number, and an integer like every other identifier on the
-# wire. It was free text until 0.17.0, which made `c=` the one field a typo
-# could turn into a whole second garden: a report from "bench1 " or "Bench1"
-# opened its own controller row, its own heartbeat and its own alerts, and
-# nothing anywhere said the two were the same board.
+# The board's own number on the wire. Board 0 is a real board and is falsy,
+# so every check on a controller is `is None`, never truthiness.
 MAX_CONTROLLER = 255
-# The board's diagnostic channels this file reads: its three latches, 0 or 1
-# in every report while each stands, absent meaning 0 (an older board: never
-# latched, never tripped). ch207 is the contradiction latch (float said full,
-# meter saw nothing); it lives in .noinit on the board and a power cycle
-# erases it, which is why the durable half is here. ch210 is the flap: three
-# consecutive float refusals, which force the board's float= to 0 until a
-# dose is granted — the channel says WHY the word is 0, and a tap answers it
-# for one dose. ch211 is the dry latch: the board held dry by whoever did it
-# — a reset with a dose in flight, or `dry on` at the console — cleared only
-# by `dry off`, the level the backend latches on with reason `dry`.
+# The board's three latches, sent as channels: 1 in every report while each
+# stands, absent meaning 0 (an older board, never latched). The contra is
+# "float said full, meter saw nothing"; it lives in the board's .noinit,
+# which a power cycle erases, so the durable half is here. The flap is three
+# consecutive float refusals, which force float= to 0 until a dose is
+# granted — it says WHY the word is 0, and a refill tap answers it for one
+# dose. The dry latch is a board held dry by a reset mid-dose or by `dry on`
+# at the console, and only `dry off` releases it.
 CONTRA_CHANNEL = 207
 FLAP_CHANNEL = 210
 DRY_CHANNEL = 211
-# The three reasons a latch can carry: the two levels, and the reset's edge
-# (`err=` turning to resetmid), which is consulted beside the dry level and
-# keeps its own words — a `dry off` typed before the first post-reset report
-# leaves the edge as the only trace of the reset.
+# The two levels plus the reset's edge (`err=` turning to resetmid), which is
+# consulted beside them: a `dry off` typed before the first post-reset report
+# leaves that edge as the reset's only trace.
 LATCH_TEXT = {
     "contra": "the float said full and the meter saw nothing",
     "dry": "the board is held dry: a reset with the pump running, or dry on at the console",
     "resetmid": "it reset with the pump running",
 }
-# The board's own word for each, typed on its console. `clear contra` lifts
-# the contradiction latch and nothing else; a board held dry — a reset with
-# the pump running latches it so on the firmware (noinit.cpp:43) — is let go
-# only by `dry off` (cli.cpp:478). The 409, the latch page and the README
-# spell the step from this one map, so nobody is sent to type the wrong
-# thing; a reason it does not know gets the contra words, as the app's map
-# does.
+# What the human types on the board's console. `clear contra` lifts the
+# contradiction latch and nothing else; a board held dry is let go only by
+# `dry off`. The 409 and the latch page both spell the step out of this one
+# map, so nobody is sent to type the wrong word.
 LATCH_STEP = {
     "contra": "type clear contra on the board",
     "dry": "type dry off on the board",
     "resetmid": "type dry off on the board",
 }
 MAX_RAW = 2**31  # 14-bit ADC today; headroom without letting 2**63 near sqlite
-# The board's own PB_DOSE_RIG_MAX_ML, and the two move together: a pot
-# above it is refused by the firmware with err=range, acked with flow_ml=0,
-# charged nothing, cooled down and paged high once per cooldown, forever,
-# and never watered. Refusing here, at /command and at pot save, is what
-# keeps that loop unreachable. (DECISIONS #7: a full dump is a mop-up; a
-# quarter of the bench reservoir per dose is the number that makes it one.)
+# The board's own PB_DOSE_RIG_MAX_ML; the two move together. Above it the
+# firmware refuses with err=range and acks flow_ml=0, so the pot is charged
+# nothing, cooled down, paged and never watered — a loop that refusing here,
+# at /command and at pot save, keeps unreachable.
 MAX_DOSE_ML = 250
 MAX_CAP_S = 60  # the firmware enforces its own cap; this bounds what we ask
 MIN_NEXT_S, MAX_NEXT_S = 5, 3600  # the interval knob's sane range
-RULES_WINDOW = 5  # median of this many readings is the whole smoothing story
+RULES_WINDOW = 5  # median of this many readings is the whole of the smoothing
 PROPOSAL_TTL_S = 7200  # a proposal nobody approved in 2 h expires
 DEFAULT_COOLDOWN_H = 6  # when a pot does not set its own; 0 disables
 DEFAULT_DAILY_CAP_DOSES = 3  # a NULL daily_cap_ml means this many doses
@@ -193,12 +124,11 @@ NTFY_TIMEOUT_S = 10
 FLAP_WINDOW_S = 600  # two bad float/pos sightings this close together raise
 RESUME_GRACE_S = 600  # a restart shorter than this keeps the observation window
 UP_PROBE_FLOOR_S = 86400  # the up-probe fires at most daily, across restarts
-# The tank has a size, and it is measured: what the meter counted between
-# a refill tap and the float going empty is one sample, the median of the
-# last TANK_MEDIAN_OF is the size, known after TANK_SAMPLES_TO_ARM. The
-# float is judged against that volume, never a clock: pumped past the size
-# plus TANK_TOLERANCE_PCT with the float still at 1 is a float presumed
-# stuck; a sample off the known size by more than TANK_DRIFT_PCT is warned.
+# The tank's size is measured, not configured: one sample is the millilitres
+# the meter counted between a refill tap and the float going empty, and the
+# size is the median of the last TANK_MEDIAN_OF. The float is then judged
+# against that volume and never against a clock — water past the size plus
+# TANK_TOLERANCE_PCT with the float still at 1 is a float presumed stuck.
 TANK_SAMPLES_TO_ARM = 2
 TANK_MEDIAN_OF = 5
 TANK_TOLERANCE_PCT = 10
@@ -227,10 +157,9 @@ class Command(NamedTuple):
 class Alert(NamedTuple):
     """One message for the phone plus the write that remembers it went out.
 
-    `message` None is a silent judgement (a dose that worked): the record
-    step still runs, nothing is posted — "tell me when it's wrong" only.
-    `record` is applied by the tick only after a successful send, in its
-    own short transaction.
+    A None `message` is a silent judgement (a dose that worked): the record
+    step still runs and nothing is posted. `record` is applied only after a
+    successful send, in its own short transaction.
     """
 
     key: str | None  # alerts-table key; None for the unrecorded up-probe
@@ -248,37 +177,32 @@ def hhmm(ts: int) -> str:
 
 
 def new_pot_id() -> str:
-    """A pot's identity, in the plan tool's own style: `pot-3f9a21`.
-
-    Random rather than sequential so it can be minted anywhere and never
-    encodes an order that means nothing.
-    """
+    """`pot-3f9a21`. Random, not sequential, so it can be minted anywhere."""
     return "pot-" + secrets.token_hex(3)
 
 
 def write_new_file(path: Path, blob: bytes) -> None:
-    """Create `path` and write `blob` into it, refusing to overwrite.
+    """Create `path` with `blob`, refusing to overwrite it.
 
-    O_EXCL, so claiming a name and finding it taken is one atomic step:
-    a photograph's id is also its filename, and overwriting would destroy
-    an earlier picture whose row would then point at nothing.
+    O_EXCL, so claiming a name and finding it taken is one atomic step: a
+    photograph's id is also its filename, and overwriting would destroy an
+    earlier picture whose row would then point at nothing.
     """
     with open(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY), "wb") as f:
         f.write(blob)
 
 
 def new_photo_id() -> str:
-    """A photograph's identity, and its filename: `photo-3f9a21b4`.
+    """`photo-3f9a21b4`, which is also the filename.
 
-    Four bytes rather than a pot's three: this is also a path segment, and
-    the only thing standing between a guessed id and somebody else's
-    picture on a shared tailnet.
+    Four bytes rather than a pot's three: it is all that stands between a
+    guessed id and somebody else's picture.
     """
     return "photo-" + secrets.token_hex(4)
 
 
-# The columns the old pots table carried, in its own order, so the rebuild
-# reads a 0.7.0 database without guessing.
+# The pre-rebuild pots table's columns, in its own order, so migrate() reads
+# an old database without guessing.
 _OLD_POT_COLUMNS = (
     "name",
     "controller",
@@ -304,10 +228,9 @@ def _pots_ddl() -> list[str]:
     """The CREATE for `pots` and for `pots_now`, taken from schema.sql itself.
 
     The rebuild drops both and has to put them back inside its own
-    transaction, where executescript() cannot go (it commits first). Rather
-    than keep a second copy of the DDL here — to drift from the schema file
-    the day a column is added — let sqlite parse schema.sql in a scratch
-    database and hand back exactly what it made.
+    transaction, where executescript() cannot go (it commits first). A second
+    copy of the DDL here would drift the day a column is added, so let sqlite
+    parse schema.sql in a scratch database and hand back what it made.
     """
     scratch = sqlite3.connect(":memory:")
     scratch.executescript(SCHEMA_SQL)
@@ -323,10 +246,12 @@ def _pots_ddl() -> list[str]:
 
 
 class Added(NamedTuple):
-    """A column schema.sql grew after its CREATE had already run somewhere,
-    and how its value carries over from an old one: `source` is the old
-    column (None: nothing to carry), read through `convert` on the rows
-    where `gate` — SQL over the old row — holds."""
+    """A column schema.sql grew after its CREATE had already run somewhere.
+
+    `source` is the old column its value carries over from (None: nothing to
+    carry), read through `convert` on the rows where `gate` — SQL over the
+    old row — holds.
+    """
 
     table: str
     column: str
@@ -343,11 +268,9 @@ ADDED_COLUMNS = (
     Added("pots", "plant_height_cm", "REAL", "plant_size", lambda v: cm_from_text(v)),
     Added("pots", "pot_diameter_cm", "REAL", "pot_size", lambda v: cm_from_text(v)),
     Added("species_names", "family", "TEXT"),
-    # The switch became a word. The carry sets the value and cannot repair
-    # the wiring: a pot carried over as `graveyard` keeps its open mapping
-    # window, where a graveyarding through POST /pot would have closed it.
-    # Unreachable in production — the database this ships with is new — and
-    # untrue of every pot in the test fixture, which are all enabled.
+    # The carry sets the value and cannot repair the wiring: a pot carried
+    # over as `graveyard` keeps its open mapping window, where a graveyarding
+    # through POST /pot would have closed it.
     Added(
         "pots",
         "status",
@@ -357,33 +280,19 @@ ADDED_COLUMNS = (
     ),
     Added("readings", "pot_id", "TEXT"),
     Added("commands", "pot_id", "TEXT"),
-    # Trust the tank (0.18.0): a board's own last error, its durable latch,
-    # whether it ever knew its position, and whether it is retired.
     Added("controllers", "retired", "INTEGER NOT NULL DEFAULT 0"),
     Added("status", "err", "TEXT"),
     Added("status", "err_ts", "INTEGER"),
     Added("status", "latched_ts", "INTEGER"),
     Added("status", "latch_reason", "TEXT"),
     Added("status", "pos_ok_seen", "INTEGER"),
-    # The tank has a size (0.19.0): what the float said at the tap (the
-    # rows already on the NAS get NULL, which judges nothing: a tap that
-    # never meant "full to the top" is no origin, so nothing is carried
-    # onto it), the first drop after it (NULL likewise — the first tap
-    # after the upgrade starts everything), the board's last word on the
-    # float with when it last changed and last rose, the ch207 of its
-    # last report (none yet), the firm word — the word two consecutive
-    # reports agreed on: none yet, since the upgrade has one report to go
-    # on, and the first post-upgrade report that agrees with the carried
-    # word is the second of two and makes it firm — and whether the firm
-    # word's last drop was a forced one (none was). The word and its
-    # clocks are carried from float_ok and float_since so a tank sitting
-    # at full through the upgrade still closes its sample, once the word
-    # is firm, and its rise is where it was — all under one gate: a last
-    # pre-upgrade report that omitted float= blanked float_ok and
-    # restarted float_since, and a clock carried without its word would
-    # read as a float that has not moved since before any tap. The rise
-    # comes only with a word of full; float_since under a word of empty
-    # is its fall.
+    # A refill's snapshot of the float, and the first drop after it: NULL on
+    # rows that predate them, and a NULL snapshot is no origin — a tap that
+    # never meant "full to the top" cannot start a tank measurement. The
+    # float word and its clocks carry only where the last report actually
+    # said float=, a clock without its word reading as a float that never
+    # moved; the rise carries only under a word of full, float_since under a
+    # word of empty being its fall.
     Added("refills", "float_ok", "INTEGER"),
     Added("refills", "drop_ts", "INTEGER"),
     Added("status", "float_word", "INTEGER", "float_ok"),
@@ -394,11 +303,6 @@ ADDED_COLUMNS = (
     Added("status", "contra", "INTEGER NOT NULL DEFAULT 0"),
     Added("status", "float_firm", "INTEGER"),
     Added("status", "float_forced", "INTEGER NOT NULL DEFAULT 0"),
-    # Latches on the wire (0.20.0): the board's other two latches beside
-    # ch207's, from its report's channels — absent being 0, so a board
-    # that has not reported since the upgrade reads as never tripped,
-    # never latched — and when the flap last tripped, which nothing has
-    # started yet.
     Added("status", "flap", "INTEGER NOT NULL DEFAULT 0"),
     Added("status", "flap_since", "INTEGER"),
     Added("status", "dry", "INTEGER NOT NULL DEFAULT 0"),
@@ -419,10 +323,8 @@ def add_columns(con: sqlite3.Connection) -> list[str]:
     and a view over a column the table has not got yet parses fine and then
     fails on every read.
 
-    The carry-over is best-effort by design: `pot_size` held "14cm", "10"
-    and "small", and only two of those are a measurement. A word is dropped
-    rather than invented into centimetres, and a converter that answers None
-    leaves the new column NULL.
+    The carry-over is best-effort by design: a converter that answers None
+    leaves the new column NULL rather than inventing a value.
     """
     added = []
     with con:
@@ -448,19 +350,15 @@ def add_columns(con: sqlite3.Connection) -> list[str]:
 
 
 def name_standing_latches(con: sqlite3.Connection) -> int:
-    """Put its reason on a `latch:<c>` row from before the row carried one.
+    """Put its reason on a standing `latch:<c>` row that carries none.
 
-    The page has named the reason since 0.18.0; the row kept none until
-    spec D14 (d) made the two disagreeing — a standing latch renamed by
-    D12's overwrite — the tick's cue to page again. Read as "the reason
-    changed", a row with no reason would page every latched board once
-    more on the first tick after the upgrade, for a fault nobody touched.
-    The reason the latch has now is the one the row gets: what the old
-    page named is written nowhere, and a latch renamed between the two
-    upgrades goes untold rather than every latch told twice. Runs at every
-    startup and touches nothing twice: a named row is left alone, and so
-    is a cleared one, which the next latch overwrites with its own reason.
-    Returns how many rows it named.
+    A row whose reason differs from the latch's is the tick's cue to page
+    again, so a row left with no reason would page every latched board once
+    on the first tick after an upgrade, for a fault nobody touched. The
+    reason written is the one the latch has now. Runs at every startup and
+    touches nothing twice: a named row is left alone, and so is a cleared
+    one, which the next latch overwrites with its own reason. Returns how
+    many rows it named.
     """
     with con:
         return con.execute(
@@ -485,11 +383,11 @@ def migrate(con: sqlite3.Connection, db_path: str) -> bool:
         return False  # fresh database, or already rebuilt
     backup = None
     if db_path != ":memory:":
-        # The live database is WAL, so recent commits sit in the -wal file
-        # and a plain copy of the main file would back up everything except
-        # what is most at risk. Checkpoint first, and refuse the whole
-        # rebuild if anything is holding the log open: a deferred migration
-        # is recoverable, a DROP behind a blank backup is not.
+        # The live database is WAL, so recent commits sit in the -wal file and
+        # a plain copy of the main file would back up all but what is most at
+        # risk. Checkpoint first, and refuse the rebuild if anything holds the
+        # log open: a deferred migration is recoverable, a DROP behind a short
+        # backup is not.
         busy, *_ = con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         if busy:
             raise sqlite3.OperationalError(
@@ -498,14 +396,11 @@ def migrate(con: sqlite3.Connection, db_path: str) -> bool:
             )
         backup = db_path + ".pre-identity.bak"
         # Created exclusively, and kept if it is already there. A backup is
-        # only ever written while `pots` still has its `controller` column,
-        # and a rebuild that dies rolls back to exactly that shape, so an
-        # existing one is always a good pre-identity copy. Reaching here a
-        # second time is a retry after a killed rebuild — or a container
-        # start that overlapped another, which would otherwise copy an
-        # ALREADY-REBUILT file over the only copy of the garden. Bailing
-        # out instead of keeping would lose the other way: the retry after
-        # a kill has to be able to finish.
+        # only written while `pots` still has its `controller` column and a
+        # dying rebuild rolls back to that shape, so an existing one is always
+        # a good pre-identity copy — where overwriting could put an ALREADY
+        # REBUILT file over the only copy of the garden. Refusing instead of
+        # keeping would lose the other way: a retry after a kill must finish.
         try:
             with open(backup, "xb") as copy, open(db_path, "rb") as live:
                 shutil.copyfileobj(live, copy)
@@ -522,42 +417,34 @@ def migrate(con: sqlite3.Connection, db_path: str) -> bool:
     rows = con.execute(
         f"SELECT {', '.join(_OLD_POT_COLUMNS)} FROM pots ORDER BY id"
     ).fetchall()
-    # Everything the new shape needs except `pots` and its view — the
-    # pot_mappings table and every index — arrives here, before the rebuild
-    # opens its transaction, because executescript() commits and would
-    # otherwise split it in two.
+    # Everything the new shape needs except `pots` and its view arrives here,
+    # before the rebuild opens its transaction, because executescript()
+    # commits and would otherwise split that transaction in two.
     con.executescript(SCHEMA_SQL)
     con.execute("BEGIN IMMEDIATE")
     with con:
-        # The guard again, this time with the write lock held. The one at
-        # the top of this function is read outside any lock, so two
-        # container starts on the same /data — Container Manager can leave
-        # two overlapping briefly — both pass it, and the one that waits
-        # here for the lock would wake up and rebuild the winner's fresh
-        # table a second time from the rows it read before, minting new
-        # ids and orphaning the winner's pot_mappings rows against ids
-        # that no longer exist.
+        # The guard again, with the write lock held this time. The one at the
+        # top of the function reads outside any lock, so two overlapping
+        # container starts on the same /data both pass it; the one that waits
+        # here would then rebuild the winner's fresh table from the rows it
+        # read before, minting new ids and orphaning the winner's
+        # pot_mappings rows against ids that no longer exist.
         if "controller" not in [r[1] for r in con.execute("PRAGMA table_info(pots)")]:
             return False
-        # One transaction, DDL included (sqlite rolls that back like any
-        # other statement). A container killed mid-rebuild — a NAS reboot, an
-        # OOM kill, a power cut — must come back with the old table intact
-        # and retry: an empty `pots` in the NEW shape would read to the guard
-        # above as "already migrated", and the garden would be gone for good.
+        # One transaction, DDL included (sqlite rolls that back like any other
+        # statement). A container killed mid-rebuild must come back with the
+        # old table intact and retry: an empty `pots` in the NEW shape reads
+        # to the guard above as "already migrated", and the garden is gone.
         con.execute("DROP VIEW IF EXISTS pots_now")
         con.execute("DROP TABLE pots")
         for ddl in _pots_ddl():
             con.execute(ddl)
         for row in rows:
             old = dict(zip(_OLD_POT_COLUMNS, row))
-            # The old shape's two free-text sizes, as far as they were ever
-            # measurements. add_columns() does the same for a database that
-            # is past this rebuild; both go through one reader so they
-            # cannot disagree.
+            # add_columns() does the same for a database past this rebuild;
+            # both go through one reader so they cannot disagree.
             old["plant_height_cm"] = cm_from_text(old.pop("plant_size"))
             old["pot_diameter_cm"] = cm_from_text(old.pop("pot_size"))
-            # The switch became a word here too, for the same reason and by
-            # the same rule: the rebuild writes the columns pots has NOW.
             old["status"] = "alive" if old.pop("enabled") else "graveyard"
             pot_id = new_pot_id()
             keys = [k for k in old if k not in ("controller", "channel", "outlet")]
@@ -573,9 +460,8 @@ def migrate(con: sqlite3.Connection, db_path: str) -> bool:
                     "VALUES (?, ?, ?, ?, 0, NULL)",
                     (pot_id, old["controller"], old["channel"], old["outlet"]),
                 )
-    # Say so: this runs once, unattended, and it rewrites every pot id the
-    # app and the operator were using. A silent irreversible step is one
-    # nobody can audit afterwards, and nobody would find the backup.
+    # Say so: this runs unattended and rewrites every pot id the app and the
+    # operator were using. Nobody would find the backup otherwise.
     print(
         f"rebuilt {len(rows)} pots onto random ids and moved their wiring "
         "into pot_mappings"
@@ -644,11 +530,10 @@ _CM = re.compile(r"\A\d{1,4}(?:\.\d{1,2})?\Z")
 def _cm_in(value: str, key: str, high: float) -> float:
     """One measurement in centimetres, 0 exclusive to `high` inclusive.
 
-    The same ASCII-only strictness as `_int_in` and for the same reason —
-    bare float() takes "1e3", "inf", "nan", a Unicode digit and a leading
-    `+`, and every one of those would reach log2() in the band engine. Zero
-    is refused rather than treated as unsaid, because a 0 cm pot is a
-    half-finished edit and saying so beats silently ignoring it.
+    The same ASCII-only strictness as `_int_in`: bare float() takes "1e3",
+    "inf", "nan", a Unicode digit and a leading `+`, and every one of those
+    would reach log2() in the band engine. Zero is refused rather than read
+    as unsaid — a 0 cm pot is a half-finished edit.
     """
     if not (value.isascii() and _CM.match(value)):
         raise ValueError(f"{key}= is not a measurement in cm: {value!r}")
@@ -659,12 +544,11 @@ def _cm_in(value: str, key: str, high: float) -> float:
 
 
 def cm_from_text(text: str | None) -> float | None:
-    """A measurement out of the free text `plant_size` and `pot_size` held.
+    """Centimetres out of free text like "14cm", "10" or "small", or None.
 
-    Those two fields were TEXT and took anything: "14cm", "10", "small". The
-    numbers carry over, the words do not, and a word is dropped rather than
-    guessed at — "small" meant one thing to the old keyword table and would
-    have to be invented into centimetres here.
+    The numbers carry over and the words do not: "small" would have to be
+    invented into centimetres, and a wrong measurement moves the watering
+    band where a missing one leaves it alone.
     """
     if not text:
         return None
@@ -729,8 +613,7 @@ def parse_report(text: str) -> Report:
             if channel in channels:
                 raise ValueError(f"channel given twice: {key}")
             channels[channel] = _int_in(value, key, 0, MAX_RAW)
-    # `is None`, not falsiness: board 0 is a real board, and it is the one
-    # the app fills in by default.
+    # `is None`, not falsiness: board 0 is a real board.
     if controller is None:
         raise ValueError("no c= in the report")
     if not channels:
