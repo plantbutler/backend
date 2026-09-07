@@ -50,6 +50,9 @@ else.
   noticed on arrival. Some keys page once and never clear.
 - Photograph bytes are files; the row is the truth. An id is claimed before it is written so a
   collision cannot overwrite a picture that exists.
+- A command id only ever rises. The board refuses any id at or below the highest it has accepted,
+  so `commands.id` keeps its `AUTOINCREMENT`, a rebuild of that table carries `sqlite_sequence`
+  across, and a database restored from a backup needs every board power-cycled.
 
 ## Deploying
 

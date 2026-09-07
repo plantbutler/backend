@@ -45,6 +45,12 @@ CREATE INDEX IF NOT EXISTS readings_by_pot
 -- sqlite hands a deleted command's id straight back out. A recycled id would
 -- inherit the erased pot's verdict and its `dose:<id>` judgement row, so a
 -- stranger's verdict labels a new dose and a real dose is never judged.
+--
+-- The board is stricter: it drops any id at or below the highest it has ever
+-- accepted, and only a cold boot clears that mark. So the counter must never go
+-- backwards either -- a rebuild of this table carries sqlite_sequence across,
+-- because DROP TABLE takes that row with it, and a database restored from a
+-- backup needs every board power-cycled.
 CREATE TABLE IF NOT EXISTS commands (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   created_ts INTEGER NOT NULL,
