@@ -1928,28 +1928,24 @@ def sole_match(candidates: list[dict], query: str) -> str | None:
     return hits.pop() if len(hits) == 1 else None
 
 
-# The band is on OUR percentage — air is 0, tap water is 100, a straight
-# line between two calibration points (decision #6). It is not volumetric
-# water content, so no published figure could be copied into it even if a
-# source had one. These are a starting offer for a human to correct, which
-# is why nothing here is ever applied without one.
+# The band is on OUR percentage — air is 0, tap water is 100, a straight line
+# between two calibration points. It is not volumetric water content, so no
+# published figure could be copied into it even if a source had one. These are
+# a starting offer for a human to correct, and nothing here is applied without
+# one.
 
 BASE_BAND = (35, 55)
 BAND_FLOOR, BAND_CEIL, BAND_MIN_WIDTH = 5, 95, 10
 
 # The closed set the form offers, and the band each kind starts from. A
-# dropdown rather than free text because this is the biggest lever of the
-# four: an unlabelled plant starts at 35-55 and a succulent at 15-30, so a
-# typo here is a 20-point error that no pot measurement recovers. Reading
-# stays tolerant — a value written before this set existed simply matches
-# nothing and falls to the base band — but writing one is refused.
-# Insertion order is the dropdown's order and the refusal message's order:
-# driest first, so the list reads as the one axis it actually is.
+# dropdown rather than free text because this is the biggest lever of the four:
+# an unlabelled plant starts at 35-55 and a succulent at 15-30, so a typo here
+# is a 20-point error no pot measurement recovers. Reading stays tolerant — an
+# unlisted value matches nothing and falls to the base band — but writing one
+# is refused. Insertion order is the dropdown's and the refusal message's:
+# driest first, so the list reads as the one axis it is.
 PLANT_KINDS = {
-    # A cactus is drier than the succulents it used to share a row with.
-    # They were one entry while the field was free text and six words wide;
-    # a dropdown can afford to tell them apart, and 5 points is the
-    # difference between a barrel cactus and an echeveria.
+    # 5 points is the difference between a barrel cactus and an echeveria.
     "cactus": (10, 25),
     "succulent": (15, 30),
     # An epiphyte in bark is not potted in anything that holds water. The
@@ -1971,11 +1967,10 @@ PLANT_KINDS = {
 # reference the plant bands are written against, so "not said" and "the bag
 # from the shop" are the same answer and the list stays a list of movers.
 #
-# Every ceiling shift is <= 0, and that is an invariant rather than a
-# coincidence. The band is only ever widened DOWNWARDS (see the squeeze at
-# the end of target_band): a soil that raised the ceiling above the plant's
-# own base would offer a wetter top than the kind allows, and contradict the
-# reason printed beside it.
+# Every ceiling shift is <= 0, and that is an invariant: the band is only ever
+# widened DOWNWARDS (see the squeeze at the end of target_band). A soil that
+# raised the ceiling above the plant's own base would offer a wetter top than
+# the kind allows, and contradict the reason printed beside it.
 SOIL_SHIFTS = {
     "sphagnum": (10, 0, "sphagnum moss"),  # stays wet by design
     "peat": (5, 0, "peat soil"),  # what most nursery pots arrive in
@@ -2016,10 +2011,7 @@ GENUS_KINDS = {
     "citrus": "mediterranean",
     "lavandula": "mediterranean",
 }
-# Lowercased, because GBIF's case is not a promise. Orchidaceae used to be
-# left out deliberately — an epiphyte on bark waters nothing like a flowering
-# pot plant, and "not sure" beat 20 confident points in the wrong direction.
-# There is an `orchid` band now, so it can be answered instead of dodged.
+# Lowercased, because GBIF's case is not a promise.
 FAMILY_KINDS = {
     "cactaceae": "cactus",
     "crassulaceae": "succulent",
@@ -2088,8 +2080,7 @@ def kind_for(accepted: str | None, family: str | None) -> str | None:
 # one, and no band survives being multiplied by 23. What is linear in
 # percentage points is the LOG of the volume — each doubling of buffer moves
 # the band one step — so the cube arrives as the factor of 3 that log2 turns
-# (d/d0)**3 into. The old small/large keywords sat at roughly +5/-5, which is
-# what 10 cm and 24 cm still come out at.
+# (d/d0)**3 into.
 POT_REF_CM = 14.0  # the pot the base bands assume
 HEIGHT_REF_RATIO = 1.5  # a 21 cm plant in a 14 cm pot: neither tall nor short
 BAND_PER_DOUBLING = 2.5  # percentage points per doubling
@@ -2129,19 +2120,19 @@ def size_shifts(
     Two independent effects, and both move the FLOOR far more than the
     ceiling. The pot is a water buffer: a small one runs out before anybody
     looks again, so its floor rises; a big one holds water around roots that
-    rot, so its ceiling drops. The ceiling only ever drops, because no pot
-    size is a reason to keep a plant wetter than its own kind wants — and
-    lifting it would contradict #5 as well.
+    rot, so its ceiling drops. The ceiling only ever drops — no pot size is a
+    reason to keep a plant wetter than its kind wants, and raising it would
+    err wet.
 
     The plant is the demand against that buffer, which is why height is read
-    OVER diameter rather than on its own: 40 cm of basil is thirsty in a
-    10 cm pot and comfortable in a 30 cm one. A height with no pot to
-    measure against falls back to the reference pot, which is the same
-    assumption the base bands already make.
+    OVER diameter rather than on its own: 40 cm of basil is thirsty in a 10 cm
+    pot and comfortable in a 30 cm one. A height with no pot to measure
+    against falls back to the reference pot, the same assumption the base
+    bands make.
 
-    Zero and negative are treated as unsaid rather than refused here: the
-    write path rejects them, but a row from before it did must not make the
-    whole garden unreadable through a log of zero.
+    Zero and negative are read as unsaid rather than refused: the write path
+    rejects them, and a row that predates it must not make the whole garden
+    unreadable through a log of zero.
     """
     low = high = 0.0
     why: list[str] = []
@@ -2173,13 +2164,12 @@ def target_band(
 ) -> Band:
     """A target moisture band to offer, and the reason in words.
 
-    The species is in here now, but only through the door marked plant kind:
-    a lookup may pre-select that dropdown and a human may overrule it, and
-    the band reads whatever the dropdown ends up saying. No care source
-    reaches this function, because none of them carries a watering regime.
-    What is left is what is actually on hand — what kind of plant it is,
-    what it sits in, how big the pot is, how big the plant is, and the time
-    of year — which is roughly what a person would use anyway.
+    The species reaches this only through the plant kind: a lookup may
+    pre-select that dropdown, a human may overrule it, and the band reads
+    whatever it ends up saying. No care source reaches here at all, because
+    none carries a watering regime. What is left is what is on hand — the
+    kind of plant, what it sits in, how big the pot and the plant are, and
+    the time of year.
     """
     base = PLANT_KINDS.get(plant_type or "", BASE_BAND)
     # Float from here down: three half-point shifts rounded as they land
@@ -2198,14 +2188,11 @@ def target_band(
         shift = SEASON_SHIFTS[season]
         low, high = low + shift[0], high + shift[1]
         why.append(season)
-    # Back to whole points once, at the end. Rounding each shift as it
-    # landed would let three half-points vanish one at a time.
     low, high = round(low), round(high)
     # A band the shifts have squeezed shut is widened DOWNWARDS. Raising the
-    # top instead would offer a wetter ceiling than the plant's own base —
-    # a succulent in clay came out capped at 35% when its unmodified top is
-    # 30% — and would contradict the reason printed beside it. Lowering the
-    # floor errs dry, which is the direction #5 asks for.
+    # top would offer a wetter ceiling than the plant's own base — a succulent
+    # in clay capped at 35% where its unmodified top is 30% — and contradict
+    # the reason printed beside it. Lowering the floor errs dry.
     low = min(low, high - BAND_MIN_WIDTH)
     low = max(BAND_FLOOR, min(BAND_CEIL - BAND_MIN_WIDTH, low))
     high = max(low + BAND_MIN_WIDTH, min(BAND_CEIL, high))
@@ -2235,11 +2222,9 @@ def create_app(
     Refusals to start, all of them loud and specific: a missing token (this
     listens on a LAN with other people's devices on it, and "forgot to set the
     token" must not be a working deployment); a BUTLER_NEXT_S or
-    BUTLER_CMD_TTL_S that is not an integer (the alternative is a
-    crash-looping container with a bare traceback); a BUTLER_DB under /data
-    when /data is not actually a mount (a forgotten bind mount would store
-    readings in the container's own layer and lose them all on the next
-    recreate, while looking perfectly healthy).
+    BUTLER_CMD_TTL_S that is not an integer; and a BUTLER_DB under /data when
+    /data is not a mount, since a forgotten bind mount stores readings in the
+    container layer and loses them on the next recreate while looking healthy.
     """
     db = Path(db_path or os.environ.get("BUTLER_DB", "/data/butler.db"))
     secret = token if token is not None else os.environ.get("BUTLER_TOKEN", "")
@@ -2336,11 +2321,9 @@ def create_app(
             "BUTLER_DB is under /data but /data is not a mounted volume; "
             "refusing to store readings in the container layer"
         )
-    # The photographs sit beside the database by default, so they land on
-    # the same bind mount and are backed up or lost together — the one
-    # arrangement in which a restore cannot produce rows whose files are
-    # from a different day. BUTLER_PHOTOS can move them, and gets the same
-    # refusal the database gets if it points into an unmounted /data.
+    # Beside the database by default, so they land on the same bind mount and
+    # are backed up or lost together — the one arrangement in which a restore
+    # cannot produce rows whose files are from a different day.
     photos = Path(
         photos_dir or os.environ.get("BUTLER_PHOTOS") or str(db.parent / "photos")
     )
@@ -2389,22 +2372,20 @@ def create_app(
     def keep_photo(
         pot_id: str, blob: bytes, w: int | None, h: int | None, now: int
     ) -> str:
-        """The bytes, then the row.
+        """The bytes, then the row. Returns the new photograph's id.
 
         A crash between the two leaves a file no row knows about, which
         nothing lists and nothing serves; the other order would leave a row
-        whose picture never existed and which the strip would have to show
-        as missing forever. Neither connection is held across the disk
-        write — a photograph is megabytes over a NAS volume, and a write
-        transaction held that long is the board's reports blocked.
+        whose picture never existed and which the strip would show as missing
+        for ever. Neither connection is held across the disk write — a
+        photograph is megabytes over a NAS volume, and a write transaction
+        held that long is the board's reports blocked.
 
-        The id is claimed by creating its file exclusively, and a taken one
-        is simply tried again. Overwriting the file first and finding out
-        from the INSERT would destroy the picture already at that path — an
-        earlier photograph, already committed, whose row would then be left
-        pointing at nothing. Two ids can collide in two ways: the file is
-        there, or only the row is (a photograph whose file was lost), and
-        both have to fall out the same way.
+        The id is claimed by creating its file exclusively, and a taken one is
+        tried again. Overwriting first and finding out from the INSERT would
+        destroy the picture already at that path, leaving its committed row
+        pointing at nothing. A collision comes two ways — the file is there,
+        or only the row is — and both must fall out the same way.
         """
         with connect() as con:
             row = con.execute(
