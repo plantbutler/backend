@@ -6,11 +6,16 @@ is down is a garden nobody is watering.
 """
 
 import http.client
+import time
 import urllib.request
 from collections.abc import Callable
 from typing import NamedTuple
 
 from . import constants
+
+
+def hhmm(ts: int) -> str:
+    return time.strftime("%H:%M", time.localtime(ts))
 
 
 class Alert(NamedTuple):

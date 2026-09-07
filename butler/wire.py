@@ -471,7 +471,9 @@ def parse_verdict(text: str) -> tuple[int, str]:
             if verdict is not None:
                 raise ValueError("verdict= given twice")
             if value not in constants.VERDICT_VALUES:
-                raise ValueError(f"verdict= must be one of {'|'.join(constants.VERDICT_VALUES)}")
+                raise ValueError(
+                    f"verdict= must be one of {'|'.join(constants.VERDICT_VALUES)}"
+                )
             verdict = value
     if cmd_id is None:
         raise ValueError("no cmd= in the request")
@@ -560,7 +562,12 @@ def parse_photos(params: QueryParams) -> tuple[str, int]:
         raise ValueError(f"not a pot id: {pot!r}")
     # +1 like every other bound here: _int_in's top is exclusive, and the
     # named max is meant to be a limit somebody can actually ask for.
-    return pot, _int_in(one("limit", str(constants.PHOTO_LIMIT)) or "", "limit", 1, constants.MAX_PHOTO_LIMIT + 1)
+    return pot, _int_in(
+        one("limit", str(constants.PHOTO_LIMIT)) or "",
+        "limit",
+        1,
+        constants.MAX_PHOTO_LIMIT + 1,
+    )
 
 
 def parse_photo_delete(text: str) -> str:
