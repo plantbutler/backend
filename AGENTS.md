@@ -27,11 +27,17 @@ wire), 5 (what this decides and the firmware does not) and 7 (safety) are what t
 ## The shape
 
 The service is the package `butler/`, and `__init__.py` is its facade: it builds the app and
-re-exports every public name, so `from butler import X`, `butler.X` and a test that patches an
-attribute on `butler` all mean what they always did. Inside the package a module imports other
-**modules**, not names, so that patching keeps working; the three places that import a name say
-why in their file header. Keep it that way, and keep the import graph acyclic: when two modules
-need the same thing, move it down a layer rather than importing sideways.
+re-exports every public name, so `from butler import X` and reading `butler.X` mean what they
+always did. Inside the package a module imports other **modules**, not names, so a module's
+function has one home that every caller resolves at call time; the three places that import a
+name say why in their file header. Keep the import graph acyclic: when two modules need the same
+thing, move it down a layer rather than importing sideways.
+
+**Patch the module that owns the function, not the facade.** `monkeypatch.setattr(butler, "X")`
+rebinds only the facade's own name, which nothing outside `__init__.py` reads, so the caller
+carries on with the original. `monkeypatch.setattr(butler.wire, "X")` is what a caller inside the
+package sees. This is why the split moved six patch targets in the tests and changed nothing
+else.
 
 ## Traps
 

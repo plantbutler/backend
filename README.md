@@ -80,9 +80,14 @@ you run it by hand. Nothing here is ever exposed to the internet.
 
 ## What it answers
 
-Every route takes the token in an `X-Token` header, except `/health`. What you send is always
-`key=value` pairs rather than JSON, because the board writes them by hand. What comes back is
-JSON on the list and history routes, `key=value` elsewhere, and bytes for a photograph.
+Everything that writes takes the token in an `X-Token` header, and so does anything that costs an
+outside call or hands back bytes. Four reads answer without one: `/pots`, `/doses`, `/history`
+and `/health`. That is deliberate rather than an oversight, because what they return is numbers
+about plants; it does mean an unauthenticated caller can confirm that a pot id exists.
+
+What you send is always `key=value` pairs rather than JSON, because the board writes them by
+hand. What comes back is JSON on the list and history routes, `key=value` elsewhere, and bytes
+for a photograph.
 
 | route | what it does |
 | --- | --- |
