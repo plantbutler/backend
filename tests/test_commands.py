@@ -337,5 +337,7 @@ def test_parse_command_shapes():
 def test_cap_for_stays_under_the_firmware_cap_after_a_retune(monkeypatch):
     assert cap_for(1) == 5  # the slack alone
     assert cap_for(butler.MAX_DOSE_ML) == 17  # under MAX_CAP_S at today's flow floor
-    monkeypatch.setattr(butler, "FLOW_FLOOR_ML_S", 1)  # a bench retune
+    # On the module that owns it: cap_for reads it through `constants`, so
+    # patching the name butler re-exports would not reach the call.
+    monkeypatch.setattr(butler.constants, "FLOW_FLOOR_ML_S", 1)  # a bench retune
     assert cap_for(butler.MAX_DOSE_ML) == butler.MAX_CAP_S
