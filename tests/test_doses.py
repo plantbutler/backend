@@ -1,28 +1,25 @@
 """The watering history: every dose a pot was handed, and the odd ones too."""
 
-import sqlite3
 import time
 
 import pytest
 from starlette.datastructures import QueryParams
 
 from butler import parse_doses
-from conftest import TOKEN
+from conftest import minted, post, run_sql, water
 
 
 def pot(db, pot_id, name, controller=0, outlet=0, from_ts=0, to_ts=None):
     """A pot and one mapping window. The window no longer decides whose
     dose it was — the row's stamp does — but it says which sensor the pot
     was on, which enqueue reads to pick that stamp."""
-    with sqlite3.connect(db) as con:
-        con.execute(
-            "INSERT OR IGNORE INTO pots (id, name) VALUES (?, ?)", (pot_id, name)
-        )
-        con.execute(
-            "INSERT INTO pot_mappings (pot_id, controller, channel, outlet, from_ts, to_ts) "
-            "VALUES (?, ?, 0, ?, ?, ?)",
-            (pot_id, controller, outlet, from_ts, to_ts),
-        )
+    run_sql(db, "INSERT OR IGNORE INTO pots (id, name) VALUES (?, ?)", pot_id, name)
+    run_sql(
+        db,
+        "INSERT INTO pot_mappings (pot_id, controller, channel, outlet, from_ts, to_ts) "
+        "VALUES (?, ?, 0, ?, ?, ?)",
+        pot_id, controller, outlet, from_ts, to_ts,
+    )
 
 
 def dose(db, cmd_id, sent_ts, state="acked", ml=100, flow_ml=None, outlet=0,
@@ -31,57 +28,25 @@ def dose(db, cmd_id, sent_ts, state="acked", ml=100, flow_ml=None, outlet=0,
     """`pot_id` is the stamp the row carries — whom the dose was made for,
     written when the command was. None is a real value: a hose no pot was
     on, and a stop, which names no hose at all."""
-    with sqlite3.connect(db) as con:
-        con.execute(
-            "INSERT INTO commands (id, created_ts, controller, kind, outlet, ml, "
-            "cap_s, state, source, sent_ts, acked_ts, flow_ml, pot_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, 30, ?, ?, ?, ?, ?, ?)",
-            (
-                cmd_id,
-                created_ts if created_ts is not None else (sent_ts or 0),
-                controller,
-                kind,
-                outlet,
-                ml,
-                state,
-                source,
-                sent_ts,
-                acked_ts,
-                flow_ml,
-                pot_id,
-            ),
-        )
+    run_sql(
+        db,
+        "INSERT INTO commands (id, created_ts, controller, kind, outlet, ml, "
+        "cap_s, state, source, sent_ts, acked_ts, flow_ml, pot_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, 30, ?, ?, ?, ?, ?, ?)",
+        cmd_id,
+        created_ts if created_ts is not None else (sent_ts or 0),
+        controller, kind, outlet, ml, state, source, sent_ts, acked_ts,
+        flow_ml, pot_id,
+    )
 
 
 def post_pot(client, body):
-    answer = client.post("/pot", content=body, headers={"X-Token": TOKEN})
-    assert answer.status_code == 200, answer.text
-    return answer.text.split()[0].removeprefix("pot=")
-
-
-def water(client, pot_id, controller, outlet, ml=100):
-    """A manual dose through the real path, then handed out and acked, so
-    the stamp and the sent_ts are the ones production would write."""
-    answer = client.post(
-        "/command",
-        content=f"c={controller} water={outlet} ml={ml}",
-        headers={"X-Token": TOKEN},
-    )
-    assert answer.status_code == 200, answer.text
-    cmd_id = int(answer.text.split()[0].removeprefix("cmd="))
-    report = client.post(
-        "/report", content=f"c={controller} ch0=8000", headers={"X-Token": TOKEN}
-    )
-    assert f"cmd={cmd_id}" in report.text, report.text
-    client.post(
-        "/report",
-        content=f"c={controller} ch0=8000 ack={cmd_id} flow_ml={ml}",
-        headers={"X-Token": TOKEN},
-    )
-    return cmd_id
+    return minted(post(client, "/pot", body))
 
 
 def get(client, **params):
+    """The list, read with no token: /doses is a read, like /pots and
+    /history."""
     answer = client.get("/doses", params=params)
     assert answer.status_code == 200, answer.text
     return answer.json()["doses"]
@@ -104,11 +69,11 @@ def test_a_remap_takes_the_pots_history_with_it(client, db):
     holds the hose now. Driven through POST /pot so the remap and stamps
     are the real ones, not hand-written windows."""
     basil = post_pot(client, "name=basil controller=0 channel=0 outlet=0")
-    water(client, basil, 0, 0)  # 1: basil, on outlet 0
+    water(client)  # 1: basil, on outlet 0
     post_pot(client, f"id={basil} outlet=3")  # basil moves hose
-    water(client, basil, 0, 3)  # 2: basil, moved
+    water(client, outlet=3)  # 2: basil, moved
     mint = post_pot(client, "name=mint controller=0 channel=1 outlet=0")
-    water(client, mint, 0, 0)  # 3: mint, on outlet 0 now
+    water(client)  # 3: mint, on outlet 0 now
     assert [r["id"] for r in get(client, pot=basil)] == [2, 1]
     assert [r["id"] for r in get(client, pot=mint)] == [3]
 
@@ -165,11 +130,9 @@ def test_the_verdict_rides_along(client, db):
     pot(db, "pot-1", "basil")
     dose(db, 1, now - 100, acked_ts=now - 90, flow_ml=100)
     dose(db, 2, now - 50, acked_ts=now - 40, flow_ml=100)
-    with sqlite3.connect(db) as con:
-        con.execute(
-            "INSERT INTO verdicts (command_id, ts, verdict) VALUES (1, ?, 'too_much')",
-            (now,),
-        )
+    run_sql(
+        db, "INSERT INTO verdicts (command_id, ts, verdict) VALUES (1, ?, 'too_much')", now
+    )
     rows = {r["id"]: r for r in get(client, pot="pot-1")}
     assert rows[1]["verdict"] == "too_much"
     assert rows[2]["verdict"] is None
@@ -234,11 +197,6 @@ def test_the_cursor_crosses_a_second_boundary_too(client, db):
     assert [r["id"] for r in page] == [3]
     rest = get(client, pot="pot-1", before=page[0]["sent_ts"], before_id=page[0]["id"])
     assert [r["id"] for r in rest] == [2, 1]
-
-
-def test_doses_needs_no_token(client, db):
-    """A read, like /pots and /history."""
-    assert client.get("/doses").status_code == 200
 
 
 def test_the_answer_carries_the_servers_clock(client, db):

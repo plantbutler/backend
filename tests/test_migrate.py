@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 import butler
 from butler import create_app, migrate, new_pot_id
+from conftest import TOKEN, columns, run_sql
 
 OLD_POTS = """
 CREATE TABLE pots (
@@ -89,12 +90,6 @@ def test_migrate_is_idempotent(tmp_path):
     assert con.execute("SELECT id FROM pots ORDER BY name").fetchall() == before
 
 
-def test_migrate_leaves_a_backup(tmp_path):
-    path, con = old_db(tmp_path)
-    migrate(con, path)
-    assert (tmp_path / "old.db.pre-identity.bak").exists()
-
-
 def test_a_pot_with_no_mapping_gets_no_mapping_row(tmp_path):
     """A (NULL, NULL, NULL) row in pot_mappings would read back through
     pots_now the same as no mapping at all, but would also claim to be the
@@ -143,10 +138,9 @@ def test_the_backup_carries_what_is_still_in_the_wal(tmp_path):
 
     assert migrate(con, path) is True
 
-    backup = sqlite3.connect(str(tmp_path / "wal.db.pre-identity.bak"))
-    assert backup.execute(
-        "SELECT name, controller, channel FROM pots"
-    ).fetchall() == [("basil", "0", 3)]
+    assert run_sql(
+        tmp_path / "wal.db.pre-identity.bak", "SELECT name, controller, channel FROM pots"
+    ) == [("basil", "0", 3)]
     # pot_mappings declares INTEGER; sqlite's affinity converts the string
     assert con.execute(
         "SELECT controller, channel FROM pot_mappings"
@@ -174,7 +168,7 @@ def test_a_rebuild_killed_half_way_leaves_the_old_table_intact(tmp_path, monkeyp
     with pytest.raises(RuntimeError):
         migrate(con, path)
 
-    assert [r[1] for r in con.execute("PRAGMA table_info(pots)")][:3] == [
+    assert columns(path, "pots")[:3] == [
         "id",
         "name",
         "controller",
@@ -213,7 +207,7 @@ def test_starting_on_a_live_old_database_rebuilds_it(tmp_path):
     con.close()
 
     client = TestClient(
-        create_app(db_path=path, token="test-token", next_s=60, cmd_ttl_s=900)
+        create_app(db_path=path, token=TOKEN, next_s=60, cmd_ttl_s=900)
     )
     pots = client.get("/pots").json()["pots"]
 
@@ -222,18 +216,18 @@ def test_starting_on_a_live_old_database_rebuilds_it(tmp_path):
     assert basil["id"].startswith("pot-")
     assert (basil["controller"], basil["channel"], basil["outlet"]) == (0, 3, 1)
     assert (basil["dry_raw"], basil["wet_raw"], basil["mode"]) == (13000, 4200, "auto")
-    with sqlite3.connect(path) as check:
-        assert check.execute(
-            "SELECT controller, channel, outlet, from_ts, to_ts FROM pot_mappings "
-            "WHERE pot_id = ?",
-            (basil["id"],),
-        ).fetchall() == [(0, 3, 1, 0, None)]
+    assert run_sql(
+        path,
+        "SELECT controller, channel, outlet, from_ts, to_ts FROM pot_mappings "
+        "WHERE pot_id = ?",
+        basil["id"],
+    ) == [(0, 3, 1, 0, None)]
     assert (tmp_path / "old.db.pre-identity.bak").exists()
 
     # the restart that matters in production: a second container start on
     # the same file must change nothing, ids included
     again = TestClient(
-        create_app(db_path=path, token="test-token", next_s=60, cmd_ttl_s=900)
+        create_app(db_path=path, token=TOKEN, next_s=60, cmd_ttl_s=900)
     )
     assert again.get("/pots").json()["pots"] == pots
 
@@ -290,9 +284,9 @@ def test_an_overlapping_start_does_not_replace_the_backup(tmp_path):
         migrate(con, path)  # its own SELECT finds no `controller` any more
     assert ran == [True]  # the other container really did rebuild
 
-    backup = sqlite3.connect(str(tmp_path / "old.db.pre-identity.bak"))
-    assert "controller" in [r[1] for r in backup.execute("PRAGMA table_info(pots)")]
-    assert backup.execute("SELECT name FROM pots ORDER BY name").fetchall() == [
+    backup = tmp_path / "old.db.pre-identity.bak"
+    assert "controller" in columns(backup, "pots")
+    assert run_sql(backup, "SELECT name FROM pots ORDER BY name") == [
         ("basil",),
         ("unmapped",),
     ]
@@ -313,8 +307,7 @@ def test_an_overlapping_start_does_not_rebuild_what_was_just_rebuilt(tmp_path):
     assert migrate(con, path) is False  # the work was already done
     assert ran == [True]
 
-    check = sqlite3.connect(path)
-    live = {i for (i,) in check.execute("SELECT id FROM pots")}
+    live = {i for (i,) in run_sql(path, "SELECT id FROM pots")}
     assert len(live) == 2
-    mapped = [p for (p,) in check.execute("SELECT pot_id FROM pot_mappings")]
+    mapped = [p for (p,) in run_sql(path, "SELECT pot_id FROM pot_mappings")]
     assert mapped and [p for p in mapped if p not in live] == []

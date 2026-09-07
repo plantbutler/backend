@@ -15,17 +15,26 @@ from butler import (
     TANK_MEDIAN_OF,
     TANK_SAMPLES_TO_ARM,
     UP_AFTER_S,
-    create_app,
 )
 from conftest import (
-    TOKEN,
+    ack,
+    age,
     capturing,
+    dose,
+    empty,
+    full,
+    hand,
     health,
     keys,
+    make_app,
     origin,
     post,
+    pumped,
     report,
+    rise,
     run_sql,
+    still_empty,
+    tap,
     taps,
     tick,
     word_since,
@@ -38,118 +47,12 @@ def settings(sent, pinged):
     return {"quiet": "0-0"} | capturing(sent, pinged)
 
 
-def age(db, seconds):
-    """Everything so far happened `seconds` earlier, so what comes next is
-    later than all of it: the tests run inside one second, a dose handed
-    in an origin's own second is counted as after it, and two float=0
-    sightings inside the flap window are one float flapping, not two runs
-    of the tank."""
-    with sqlite3.connect(db) as con:
-        con.execute(
-            "UPDATE refills SET ts = ts - ?, drop_ts = drop_ts - ?", (seconds, seconds)
-        )
-        con.execute(
-            "UPDATE status SET float_since = float_since - ?, "
-            "float_word_since = float_word_since - ?, float_rise = float_rise - ?, "
-            "float_seen = float_seen - ?, float_bad = float_bad - ?, "
-            "float_bad_prev = float_bad_prev - ?, flap_since = flap_since - ?",
-            (seconds,) * 7,
-        )
-        con.execute(
-            "UPDATE commands SET created_ts = created_ts - ?, "
-            "sent_ts = sent_ts - ?, acked_ts = acked_ts - ?",
-            (seconds, seconds, seconds),
-        )
-        con.execute(
-            "UPDATE tank_samples SET ts = ts - ?, refill_ts = refill_ts - ?",
-            (seconds, seconds),
-        )
-        # meta: rows excepted, they're the ticker's own clock; a tap must
-        # be able to clear `over:` from the same second as the raise.
-        con.execute(
-            "UPDATE alerts SET raised_ts = raised_ts - ?, cleared_ts = cleared_ts - ? "
-            "WHERE key NOT LIKE 'meta:%'",
-            (seconds, seconds),
-        )
-        # The page a sample earned is keyed on its tap, so it moves with it:
-        # left behind, the sample would look unannounced and page again.
-        for (key,) in con.execute(
-            "SELECT key FROM alerts WHERE key LIKE 'tank:%'"
-        ).fetchall():
-            head, refill_ts = key.rsplit(":", 1)
-            con.execute(
-                "UPDATE alerts SET key = ? WHERE key = ?",
-                (f"{head}:{int(refill_ts) - seconds}", key),
-            )
-
-
-def tap(client, db):
-    """The human says the tank is full, a minute ago. Returns the tap's
-    ts as it stands now; a later `age` moves it again, so a test that taps
-    twice reads the taps back with `taps`."""
-    answer = post(client, "/refill", "c=0")
-    assert answer.status_code == 200, answer.text
-    ts = int(answer.text.removeprefix("refill=").strip())
-    age(db, 60)
-    return ts - 60
-
-
-def hand(client, ml):
-    """A manual dose, handed to the board on its next report."""
-    answer = post(client, "/command", f"c=0 water=3 ml={ml}")
-    assert answer.status_code == 200, answer.text
-    cmd_id = int(answer.text.strip().removeprefix("cmd="))
-    handed = report(client, "c=0 ch0=1 float=1 pos=ok").text
-    assert f"cmd={cmd_id} water=3 ml={ml}" in handed
-    return cmd_id
-
-
-def ack(client, cmd_id, flow=None, float_ok=1):
-    count = "" if flow is None else f" flow_ml={flow}"
-    report(client, f"c=0 ch0=1 float={float_ok} pos=ok ack={cmd_id}{count}")
-
-
-def dose(client, ml, flow=None):
-    ack(client, hand(client, ml), flow)
-
-
-def full(client):
-    """The float says full, twice. One sighting is not yet the word the
-    tank is measured on: the firm word is what two consecutive reports
-    that carry float= agree on, and its rise is where the word rose."""
-    report(client, "c=0 ch0=1 float=1")
-    report(client, "c=0 ch0=1 float=1")
-
-
-def empty(client):
-    """The float says empty, twice: one sighting is a glitch by the
-    board's own design (any of its three samples failing fails the
-    word), and the drop is the firm word's, confirmed by the second."""
-    report(client, "c=0 ch0=1 float=0")
-    report(client, "c=0 ch0=1 float=0")
-
-
-def still_empty(client, db):
-    """A flap window on, the float still says empty: the sighting that
-    confirms an earlier one — a dose's ack, a first report of empty —
-    far enough from it that the two are the tank's run and not a float
-    flapping at the line, which is the float: rule's subject and would
-    page here."""
-    age(db, FLAP_WINDOW_S + 1)
-    report(client, "c=0 ch0=1 float=0")
-
-
 def samples(db):
     return run_sql(db, "SELECT refill_ts, ml FROM tank_samples ORDER BY ts, rowid")
 
 
 def refills(db):
     return run_sql(db, "SELECT float_ok FROM refills ORDER BY ts, rowid")
-
-
-def rise(db):
-    """When the float's firm word last went 0 -> 1."""
-    return run_sql(db, "SELECT float_rise FROM status WHERE controller = 0")[0][0]
 
 
 def firm(db):
@@ -223,7 +126,7 @@ def test_the_counter_is_acked_water_sent_after_the_tap(client, db):
     age(db, 60)
     since = tap(client, db)
     dose(client, 150, flow=140)  # the meter's count wins over the dose
-    dose(client, 50)  # an ack without a count is charged the dose
+    dose(client, 50, flow=None)  # an ack without a count is charged the dose
     hand(client, 70)  # never acked: expired on the next report, uncounted
     report(client, "c=0 ch0=1 float=1 pos=ok")
     with sqlite3.connect(db) as con:
@@ -323,13 +226,7 @@ def test_the_firm_word_starts_null_and_null_is_no_edge(client, db):
         report(client, f"c={board} ch0=1 float=1")  # one word of full...
         assert post(client, "/refill", f"c={board}").status_code == 200  # ...tapped
         since = run_sql(db, "SELECT ts FROM refills WHERE controller = ?", board)[0][0]
-        run_sql(
-            db,
-            "INSERT INTO commands (created_ts, controller, kind, outlet, ml, cap_s, "
-            "state, source, sent_ts, acked_ts, flow_ml) "
-            "VALUES (?, ?, 'water', 3, 100, 30, 'acked', 'manual', ?, ?, 100)",
-            since + 1, board, since + 1, since + 2,
-        )
+        pumped(db, 100, since + 1, controller=board)
         report(client, f"c={board} ch0=1 float=0{contra}")
         report(client, f"c={board} ch0=1 float=0{contra}")  # firm, out of NULL
         assert run_sql(
@@ -918,13 +815,7 @@ def test_a_drain_under_a_resetmid_latch_is_a_drop_and_no_sample(client, db):
 def test_a_first_report_has_no_previous_float_and_closes_nothing(client, db):
     since = tap(client, db)
     run_sql(db, "UPDATE refills SET float_ok = 1")  # a tap that saw the float
-    run_sql(
-        db,
-        "INSERT INTO commands (created_ts, controller, kind, outlet, ml, cap_s, "
-        "state, source, sent_ts, acked_ts, flow_ml) "
-        "VALUES (?, 0, 'water', 3, 100, 30, 'acked', 'manual', ?, ?, 100)",
-        since + 1, since + 1, since + 2,
-    )
+    pumped(db, 100, since + 1)
     report(client, "c=0 ch0=1 float=0")
     assert samples(db) == []
     # And a board that never tapped stores nothing however the float moves.
@@ -964,13 +855,7 @@ def test_a_report_without_float_hides_no_edge(client, db):
     assert samples(db) == [(taps(db)[0], 130)]
     # Empty, silent, empty is not one, whatever the counter says.
     since = tap(client, db)
-    run_sql(
-        db,
-        "INSERT INTO commands (created_ts, controller, kind, outlet, ml, cap_s, "
-        "state, source, sent_ts, acked_ts, flow_ml) "
-        "VALUES (?, 0, 'water', 3, 100, 30, 'acked', 'manual', ?, ?, 100)",
-        since + 1, since + 1, since + 2,
-    )
+    pumped(db, 100, since + 1)
     report(client, "c=0 ch0=1")
     report(client, "c=0 ch0=1 float=0")
     first, _second = taps(db)
@@ -1169,9 +1054,7 @@ def test_an_existing_database_gains_the_snapshot_column_at_startup(db):
             INSERT INTO refills VALUES (5, 0);
             """
         )
-    client = TestClient(
-        create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900)
-    )
+    client = TestClient(make_app(db))
     assert client.get("/health").status_code == 200
     report(client, "c=0 ch0=1 float=1")
     assert post(client, "/refill", "c=0").status_code == 200
@@ -1202,9 +1085,7 @@ def test_an_existing_database_carries_the_floats_last_word_at_startup(db):
             INSERT INTO refills VALUES (10, 0);
             """
         )
-    client = TestClient(
-        create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900)
-    )
+    client = TestClient(make_app(db))
     # The word, its clock and its rise, carried from float_ok and
     # float_since: the rise the float had before the upgrade is where it
     # was, no report has carried ch207 yet, and nothing is firm — the
@@ -1221,13 +1102,7 @@ def test_an_existing_database_carries_the_floats_last_word_at_startup(db):
     run_sql(db, "UPDATE refills SET ts = ts - 60 WHERE float_ok IS NOT NULL")
     assert refills(db) == [(None,), (1,)]
     since = taps(db)[-1]
-    run_sql(
-        db,
-        "INSERT INTO commands (created_ts, controller, kind, outlet, ml, cap_s, "
-        "state, source, sent_ts, acked_ts, flow_ml) "
-        "VALUES (?, 0, 'water', 3, 100, 30, 'acked', 'manual', ?, ?, 100)",
-        since + 1, since + 1, since + 2,
-    )
+    pumped(db, 100, since + 1)
     empty(client)
     assert samples(db) == [(since, 100)]
 
@@ -1247,7 +1122,7 @@ def test_the_carried_clocks_come_only_with_the_word(db):
             VALUES (0, 9, NULL, 7), (1, 9, 0, 6), (2, 9, 1, 5);
             """
         )
-    TestClient(create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900))
+    TestClient(make_app(db))
     assert run_sql(
         db,
         "SELECT controller, float_word, float_word_since, float_rise, float_firm "
@@ -1273,9 +1148,7 @@ def test_the_firm_word_is_not_carried_at_the_upgrade(db):
             VALUES (0, 9, 1, 5), (1, 9, 0, 6), (2, 9, NULL, 7);
             """
         )
-    client = TestClient(
-        create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900)
-    )
+    client = TestClient(make_app(db))
     assert run_sql(
         db, "SELECT controller, float_word, float_firm FROM status ORDER BY controller"
     ) == [(0, 1, None), (1, 0, None), (2, None, None)]
@@ -1304,9 +1177,7 @@ def test_a_tank_already_empty_at_the_upgrade_starts_at_its_next_tap(db):
             INSERT INTO refills VALUES (10, 0);
             """
         )
-    client = TestClient(
-        create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900)
-    )
+    client = TestClient(make_app(db))
     assert refills(db) == [(None,)] and drops(db) == [None]
     assert run_sql(db, "SELECT float_word, float_firm FROM status") == [(0, None)]
     run_sql(
@@ -1314,12 +1185,7 @@ def test_a_tank_already_empty_at_the_upgrade_starts_at_its_next_tap(db):
         "INSERT INTO tank_samples (ts, controller, refill_ts, ml) "
         "VALUES (2, 0, 1, 200), (30, 0, 10, 250)",
     )
-    run_sql(
-        db,
-        "INSERT INTO commands (created_ts, controller, kind, outlet, ml, cap_s, "
-        "state, source, sent_ts, acked_ts, flow_ml) "
-        "VALUES (20, 0, 'water', 3, 250, 30, 'acked', 'manual', 20, 21, 250)",
-    )
+    pumped(db, 250, 20)
     full(client)  # the refill that was coming reaches the float
     assert origin(db) is None and drops(db) == [None]
     entry = health(client)

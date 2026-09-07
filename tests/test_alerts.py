@@ -22,7 +22,9 @@ from butler import (
     post_ntfy,
 )
 from conftest import (
+    DRY,
     TOKEN,
+    WET,
     age_controller,
     capturing,
     keys,
@@ -32,9 +34,6 @@ from conftest import (
     run_sql,
     tick,
 )
-
-DRY = 11000  # pct 12 with the calibration below
-WET = 8000  # pct 50
 
 
 def build_app(db, sent, pinged, **over):
@@ -415,25 +414,93 @@ def test_a_silent_controller_does_not_double_page_its_sensors(app, client, db, s
 # --------------------------------------------------------------------------- #
 
 
-def test_a_dose_that_worked_is_recorded_silently(app, client, db, sent):
+@pytest.mark.parametrize(
+    "planted, verdict",
+    [
+        pytest.param({"flow_ml": 95, "after_raw": WET}, "ok", id="it_worked"),
+        pytest.param(
+            {"flow_ml": 95, "before_raw": 4100, "after_raw": 4100},
+            "ok",
+            id="an_already_wet_pot_has_no_headroom_and_does_not_cry_wolf",
+        ),
+        pytest.param({}, "unverified", id="no_evidence_is_unverified_not_ok"),
+        pytest.param(
+            {"flow_ml": 95, "sent_ago": 60, "acked_ago": 50},
+            None,
+            id="not_judged_before_its_soak_is_over",
+        ),
+        pytest.param(
+            {"flow_ml": 12, "sent_ago": 90000, "acked_ago": 89990},
+            None,
+            id="older_than_a_day_is_history_not_news",
+        ),
+    ],
+)
+def test_a_dose_with_nothing_to_report_is_judged_in_silence(
+    app, client, db, sent, planted, verdict
+):
+    """The first row is 12% -> 50%, the second 98% -> 98% with no headroom
+    to rise into. The last two are not judged at all yet: one is still
+    soaking, one is a day old and is history rather than news."""
     make_pot(client)
-    plant_dose(db, flow_ml=95, after_raw=WET)  # 12% -> 50%
+    plant_dose(db, **planted)
     tick(app, int(time.time()))
     assert sent == []  # tell me when it's WRONG
-    assert dose_rows(db) == [("dose:1", "ok")]
+    ledger = [] if verdict is None else [("dose:1", verdict)]
+    assert dose_rows(db) == ledger
 
     tick(app, int(time.time()))
-    assert dose_rows(db) == [("dose:1", "ok")]  # judged once
+    assert dose_rows(db) == ledger  # judged once
 
 
-def test_a_dose_with_no_moisture_rise_alerts_at_default_priority(app, client, db, sent):
-    make_pot(client)
-    plant_dose(db, flow_ml=95, after_raw=DRY + 100)  # 12% -> 11%
+@pytest.mark.parametrize(
+    "planted, potted, priority, says, verdict",
+    [
+        pytest.param(
+            {"flow_ml": 95, "after_raw": DRY + 100},  # 12% -> 11%
+            True,
+            "default",  # the bench rig has not spoken yet
+            "moisture went",
+            "failed",
+            id="no_moisture_rise_alerts_at_default_priority",
+        ),
+        pytest.param(
+            {"flow_ml": 12, "after_raw": WET},
+            True,
+            "high",
+            "12 of 100 ml",
+            "failed",
+            id="short_on_the_meter_alerts_high",
+        ),
+        pytest.param(
+            {"state": "expired", "acked_ago": None, "sent_ago": 90},
+            True,
+            "high",
+            "never acknowledged",  # and no pointless soak wait
+            "failed",
+            id="never_acknowledged_alerts_high_and_immediately",
+        ),
+        pytest.param(
+            {"flow_ml": 12},
+            False,  # no pot anywhere: it names the outlet instead
+            "high",
+            "outlet 3",
+            "failed",
+            id="an_unmapped_outlet_still_reports_short_flow",
+        ),
+    ],
+)
+def test_a_dose_that_went_wrong_pages_once_and_says_how(
+    app, client, db, sent, planted, potted, priority, says, verdict
+):
+    if potted:
+        make_pot(client)
+    plant_dose(db, **planted)
     tick(app, int(time.time()))
     assert [a.key for a in sent] == ["dose:1"]
-    assert sent[0].priority == "default"  # the bench rig has not spoken yet
-    assert "moisture went" in sent[0].message
-    assert dose_rows(db) == [("dose:1", "failed")]
+    assert sent[0].priority == priority
+    assert says in sent[0].message
+    assert dose_rows(db) == [("dose:1", verdict)]
 
 
 def test_a_dose_is_judged_for_the_pot_that_got_it(app, client, db, sent):
@@ -453,31 +520,6 @@ def test_a_dose_is_judged_for_the_pot_that_got_it(app, client, db, sent):
     assert "moisture went" in sent[0].message  # judged on basil's own window
 
 
-def test_a_dose_short_on_the_meter_alerts_high(app, client, db, sent):
-    make_pot(client)
-    plant_dose(db, flow_ml=12, after_raw=WET)
-    tick(app, int(time.time()))
-    assert sent[0].priority == "high"
-    assert "12 of 100 ml" in sent[0].message
-
-
-def test_a_dose_never_acknowledged_alerts_high_and_immediately(app, client, db, sent):
-    make_pot(client)
-    plant_dose(db, state="expired", acked_ago=None, sent_ago=90)
-    tick(app, int(time.time()))
-    assert [a.key for a in sent] == ["dose:1"]  # no pointless soak wait
-    assert sent[0].priority == "high"
-    assert "never acknowledged" in sent[0].message
-
-
-def test_a_dose_is_not_judged_before_its_soak_is_over(app, client, db, sent):
-    make_pot(client)
-    plant_dose(db, flow_ml=95, sent_ago=60, acked_ago=50)
-    tick(app, int(time.time()))
-    assert sent == []
-    assert dose_rows(db) == []
-
-
 def test_the_soak_scales_with_a_slow_report_interval(db, sent, pinged):
     app = build_app(db, sent, pinged, cmd_ttl_s=7200)
     client = TestClient(app)
@@ -487,39 +529,6 @@ def test_the_soak_scales_with_a_slow_report_interval(db, sent, pinged):
     plant_dose(db, flow_ml=95, sent_ago=2010, acked_ago=2000)  # past SOAK_S
     tick(app, int(time.time()))
     assert dose_rows(db) == []  # a slow reporter's window is still open
-
-
-def test_a_dose_on_an_unmapped_outlet_still_reports_short_flow(app, client, db, sent):
-    plant_dose(db, flow_ml=12)  # no pot anywhere
-    tick(app, int(time.time()))
-    assert "outlet 3" in sent[0].message
-    assert sent[0].priority == "high"
-
-
-def test_an_already_wet_pot_has_no_headroom_and_does_not_cry_wolf(
-    app, client, db, sent
-):
-    make_pot(client)
-    plant_dose(db, flow_ml=95, before_raw=4100, after_raw=4100)  # 98% -> 98%
-    tick(app, int(time.time()))
-    assert sent == []
-    assert dose_rows(db) == [("dose:1", "ok")]
-
-
-def test_a_dose_with_no_evidence_is_unverified_not_ok(app, client, db, sent):
-    make_pot(client)
-    plant_dose(db)  # acked, but no meter number and no post-ack readings
-    tick(app, int(time.time()))
-    assert sent == []
-    assert dose_rows(db) == [("dose:1", "unverified")]
-
-
-def test_doses_older_than_a_day_are_history_not_news(app, client, db, sent):
-    make_pot(client)
-    plant_dose(db, flow_ml=12, sent_ago=90000, acked_ago=89990)
-    tick(app, int(time.time()))
-    assert sent == []
-    assert dose_rows(db) == []
 
 
 def test_correlated_dose_failures_page_once_per_controller(app, client, db, sent):

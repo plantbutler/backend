@@ -1,29 +1,23 @@
 """The command hand-off: one slot, handed once, acked or expired."""
 
-import sqlite3
 
 import pytest
 
 import butler
 from butler import cap_for, create_app, parse_command, parse_report
-from conftest import TOKEN
-
-
-def report(client, body, token=TOKEN):
-    return client.post("/report", content=body, headers={"X-Token": token})
+from conftest import TOKEN, count, post, report, run_sql
 
 
 def command(client, body, token=TOKEN):
-    return client.post("/command", content=body, headers={"X-Token": token})
+    return post(client, "/command", body, token)
 
 
 def interval(client, body, token=TOKEN):
-    return client.post("/interval", content=body, headers={"X-Token": token})
+    return post(client, "/interval", body, token)
 
 
 def states(db):
-    with sqlite3.connect(db) as con:
-        return dict(con.execute("SELECT id, state FROM commands").fetchall())
+    return dict(run_sql(db, "SELECT id, state FROM commands"))
 
 
 # --------------------------------------------------------------------------- #
@@ -47,11 +41,9 @@ def test_the_following_report_acks_it_and_the_flow_count_is_kept(client, db):
 
     answer = report(client, "c=0 t=61000 ch0=8000 ack=1 flow_ml=48")
     assert answer.text == "next=60\n"
-    with sqlite3.connect(db) as con:
-        state, flow = con.execute(
-            "SELECT state, flow_ml FROM commands WHERE id = 1"
-        ).fetchone()
-    assert (state, flow) == ("acked", 48)
+    assert run_sql(db, "SELECT state, flow_ml FROM commands WHERE id = 1") == [
+        ("acked", 48)
+    ]
 
 
 def test_a_stop_command_is_handed_as_stop(client, db):
@@ -74,24 +66,22 @@ def test_a_command_waits_for_its_own_controller(client, db):
 # --------------------------------------------------------------------------- #
 
 
-def test_a_report_without_the_ack_expires_the_sent_command(client, db):
+@pytest.mark.parametrize(
+    "t",
+    [
+        pytest.param(61000, id="a_report_without_the_ack"),
+        # A retry of a lost-response report can't carry an ack, so the
+        # command it carried is gone for good, never re-handed, since the
+        # board might still be executing a copy of it.
+        pytest.param(1000, id="a_retry_of_the_report_that_carried_it"),
+    ],
+)
+def test_a_sent_command_the_next_report_does_not_ack_expires(client, db, t):
     command(client, "c=0 water=3 ml=50 cap_s=30")
     report(client, "c=0 t=1000 ch0=8000")
 
-    answer = report(client, "c=0 t=61000 ch0=8000")
+    answer = report(client, f"c=0 t={t} ch0=8000")
     assert "cmd=" not in answer.text
-    assert states(db) == {1: "expired"}
-
-
-def test_a_lost_response_expires_the_command_it_carried(client, db):
-    # a retry of a lost-response report can't carry an ack, so the command it
-    # carried is gone for good, never re-handed, since the board might still
-    # be executing a copy of it
-    command(client, "c=0 water=3 ml=50 cap_s=30")
-    report(client, "c=0 t=1000 ch0=8000")
-
-    retry = report(client, "c=0 t=1000 ch0=8000")
-    assert "cmd=" not in retry.text
     assert states(db) == {1: "expired"}
 
 
@@ -101,17 +91,16 @@ def test_a_retry_of_the_acking_report_is_heard_once(client, db):
     command(client, "c=0 water=3 ml=50 cap_s=30")
     report(client, "c=0 t=1000 ch0=8000")
     report(client, "c=0 t=61000 ch0=8000 ack=1 flow_ml=48")
-    with sqlite3.connect(db) as con:  # so a second stamp would differ
-        con.execute("UPDATE commands SET acked_ts = acked_ts - 60")
-        stamp = con.execute("SELECT acked_ts FROM commands WHERE id = 1").fetchone()[0]
+    # Back the stamp up, so a second one written here would differ.
+    run_sql(db, "UPDATE commands SET acked_ts = acked_ts - 60")
+    ((stamp,),) = run_sql(db, "SELECT acked_ts FROM commands WHERE id = 1")
 
     retry = report(client, "c=0 t=61000 ch0=8000 ack=1 flow_ml=48")
     assert retry.status_code == 200 and retry.text == "next=60\n"
-    with sqlite3.connect(db) as con:
-        assert con.execute(
-            "SELECT state, acked_ts, flow_ml FROM commands WHERE id = 1"
-        ).fetchone() == ("acked", stamp, 48)
-        assert con.execute("SELECT COUNT(*) FROM readings").fetchone()[0] == 2
+    assert run_sql(
+        db, "SELECT state, acked_ts, flow_ml FROM commands WHERE id = 1"
+    ) == [("acked", stamp, 48)]
+    assert count(db, "readings") == 2
 
 
 def test_a_late_ack_for_an_expired_command_changes_nothing(client, db):
@@ -125,8 +114,7 @@ def test_a_late_ack_for_an_expired_command_changes_nothing(client, db):
 
 def test_a_queued_command_nobody_collects_expires(client, db):
     command(client, "c=0 water=3 ml=50 cap_s=30")
-    with sqlite3.connect(db) as con:  # age it past the TTL
-        con.execute("UPDATE commands SET created_ts = created_ts - 3600")
+    run_sql(db, "UPDATE commands SET created_ts = created_ts - 3600")  # past the TTL
 
     answer = report(client, "c=0 t=1000 ch0=8000")
     assert "cmd=" not in answer.text
@@ -163,11 +151,9 @@ def test_controllers_have_their_own_slots(client, db):
 def test_an_abandoned_command_frees_the_slot_after_the_ttl(client, db):
     command(client, "c=0 water=3 ml=50 cap_s=30")
     report(client, "c=0 t=1000 ch0=8000")  # sent; the board dies now
-    with sqlite3.connect(db) as con:
-        con.execute(
-            "UPDATE commands SET created_ts = created_ts - 3600, "
-            "sent_ts = sent_ts - 3600"
-        )
+    run_sql(
+        db, "UPDATE commands SET created_ts = created_ts - 3600, sent_ts = sent_ts - 3600"
+    )
 
     assert command(client, "c=0 stop=1").status_code == 200
     assert states(db) == {1: "expired", 2: "queued"}
@@ -295,14 +281,22 @@ def test_the_knob_cannot_let_a_live_board_outlive_the_command_ttl(client, db):
     assert "BUTLER_CMD_TTL_S" in answer.text
 
 
-def test_a_ttl_shorter_than_the_report_beat_refuses_to_start(db):
-    with pytest.raises(ValueError, match="BUTLER_CMD_TTL_S"):
-        create_app(db_path=str(db), token=TOKEN, next_s=600, cmd_ttl_s=900)
-
-
-def test_an_out_of_range_default_interval_refuses_to_start(db):
-    with pytest.raises(ValueError, match="BUTLER_NEXT_S"):
-        create_app(db_path=str(db), token=TOKEN, next_s=0)
+@pytest.mark.parametrize(
+    "over, names",
+    [
+        pytest.param(
+            {"next_s": 600, "cmd_ttl_s": 900},
+            "BUTLER_CMD_TTL_S",
+            id="a_ttl_shorter_than_the_report_beat",
+        ),
+        pytest.param(
+            {"next_s": 0}, "BUTLER_NEXT_S", id="an_out_of_range_default_interval"
+        ),
+    ],
+)
+def test_a_refusal_to_start_names_the_variable_to_fix(db, over, names):
+    with pytest.raises(ValueError, match=names):
+        create_app(db_path=str(db), token=TOKEN, **over)
 
 
 def test_commands_and_the_knob_need_the_token_too(client, db):

@@ -8,39 +8,20 @@ import pytest
 
 import butler
 from butler import moisture_pct, parse_pot
-from conftest import TOKEN
+from conftest import TOKEN, count, garden, minted, only_pot, post, report, run_sql
 
 
 def pot(client, body, token=TOKEN):
-    return client.post("/pot", content=body, headers={"X-Token": token})
-
-
-def report(client, body, token=TOKEN):
-    return client.post("/report", content=body, headers={"X-Token": token})
-
-
-def garden(client):
-    return client.get("/pots").json()["pots"]
-
-
-def pot_id(answer):
-    """The id out of a `pot=<id> name=<name>` answer.
-
-    Asserts the 200 first: a refusal's text parses into a plausible-looking
-    string too, and a test that then asks about that id gets an empty answer
-    and passes for the wrong reason.
-    """
-    assert answer.status_code == 200, answer.text
-    return answer.text.split()[0].removeprefix("pot=")
+    return post(client, "/pot", body, token)
 
 
 def mappings(db, pid):
-    with sqlite3.connect(db) as con:
-        return con.execute(
-            "SELECT channel, outlet, to_ts FROM pot_mappings WHERE pot_id = ? "
-            "ORDER BY from_ts, rowid",
-            (pid,),
-        ).fetchall()
+    return run_sql(
+        db,
+        "SELECT channel, outlet, to_ts FROM pot_mappings WHERE pot_id = ? "
+        "ORDER BY from_ts, rowid",
+        pid,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -57,11 +38,11 @@ def test_a_pot_is_born_from_one_line(client):
     assert answer.status_code == 200
     # The answer names the id the caller must key on from now on, and the
     # nickname it went in under.
-    assert answer.text == f"pot={pot_id(answer)} name=basil\n"
-    assert pot_id(answer).startswith("pot-")
+    assert answer.text == f"pot={minted(answer)} name=basil\n"
+    assert minted(answer).startswith("pot-")
 
-    (entry,) = garden(client)
-    assert entry["id"] == pot_id(answer)
+    entry = only_pot(client)
+    assert entry["id"] == minted(answer)
     assert entry["name"] == "basil"
     assert entry["outlet"] == 3
     assert entry["plant_type"] == "herb"
@@ -76,11 +57,11 @@ def test_a_pot_is_born_from_one_line(client):
 
 
 def test_an_update_touches_only_the_keys_given(client):
-    basil = pot_id(pot(client, "name=basil controller=0 channel=0 plant_type=herb"))
+    basil = minted(pot(client, "name=basil controller=0 channel=0 plant_type=herb"))
 
     pot(client, f"id={basil} outlet=4")
 
-    (entry,) = garden(client)
+    entry = only_pot(client)
     assert entry["outlet"] == 4
     assert entry["plant_type"] == "herb"
     assert entry["channel"] == 0
@@ -88,7 +69,7 @@ def test_an_update_touches_only_the_keys_given(client):
 
 def test_a_name_alone_is_a_valid_pot(client):
     assert pot(client, "name=mystery").status_code == 200
-    (entry,) = garden(client)
+    entry = only_pot(client)
     assert entry["name"] == "mystery"
 
 
@@ -98,28 +79,27 @@ def test_a_name_alone_is_a_valid_pot(client):
 
 
 def test_calibration_turns_raw_into_percent(client):
-    basil = pot_id(pot(client, "name=basil controller=0 channel=0"))
+    basil = minted(pot(client, "name=basil controller=0 channel=0"))
     report(client, "c=0 t=1000 ch0=8000")
     assert garden(client)[0]["pct"] is None
 
     pot(client, f"id={basil} dry_raw=12000 wet_raw=4000")
 
-    (entry,) = garden(client)
+    entry = only_pot(client)
     assert entry["raw"] == 8000
     assert entry["pct"] == 50
 
 
 def test_recalibrating_reinterprets_history_without_touching_it(client, db):
-    basil = pot_id(pot(client, "name=basil controller=0 channel=0 dry_raw=12000 wet_raw=4000"))
+    basil = minted(pot(client, "name=basil controller=0 channel=0 dry_raw=12000 wet_raw=4000"))
     report(client, "c=0 t=1000 ch0=8000")
     assert garden(client)[0]["pct"] == 50
 
     pot(client, f"id={basil} dry_raw=10000 wet_raw=8000")  # no new reading
 
-    (entry,) = garden(client)
+    entry = only_pot(client)
     assert entry["pct"] == 100  # same raw, new meaning
-    with sqlite3.connect(db) as con:
-        assert con.execute("SELECT raw FROM readings").fetchall() == [(8000,)]
+    assert run_sql(db, "SELECT raw FROM readings") == [(8000,)]
 
 
 def test_percent_clamps_and_survives_either_sensor_direction():
@@ -134,14 +114,14 @@ def test_percent_clamps_and_survives_either_sensor_direction():
 def test_equal_calibration_points_are_refused_even_across_requests(client):
     assert pot(client, "name=a dry_raw=5000 wet_raw=5000").status_code == 400
 
-    b = pot_id(pot(client, "name=b dry_raw=5000"))
+    b = minted(pot(client, "name=b dry_raw=5000"))
     answer = pot(client, f"id={b} wet_raw=5000")
     assert answer.status_code == 400
     assert "must differ" in answer.text
 
 
 def test_an_inverted_target_range_is_refused(client):
-    a = pot_id(pot(client, "name=a target_low_pct=30"))
+    a = minted(pot(client, "name=a target_low_pct=30"))
     answer = pot(client, f"id={a} target_high_pct=30")
     assert answer.status_code == 400
     assert "target_low_pct" in answer.text
@@ -152,24 +132,23 @@ def test_an_inverted_target_range_is_refused(client):
 # --------------------------------------------------------------------------- #
 
 
-def test_two_live_pots_cannot_share_a_channel(client):
-    pot(client, "name=basil controller=0 channel=0")
+@pytest.mark.parametrize(
+    "wiring",
+    [
+        pytest.param("channel=0", id="two_live_pots_cannot_share_a_channel"),
+        pytest.param("outlet=3", id="two_live_pots_cannot_share_an_outlet"),
+    ],
+)
+def test_one_hose_one_pot_and_the_refusal_names_the_holder(client, wiring):
+    pot(client, f"name=basil controller=0 {wiring}")
 
-    answer = pot(client, "name=mint controller=0 channel=0")
-    assert answer.status_code == 400
-    assert "taken by pot basil" in answer.text
-
-
-def test_two_live_pots_cannot_share_an_outlet(client):
-    pot(client, "name=basil controller=0 outlet=3")
-
-    answer = pot(client, "name=mint controller=0 outlet=3")
+    answer = pot(client, f"name=mint controller=0 {wiring}")
     assert answer.status_code == 400
     assert "taken by pot basil" in answer.text
 
 
 def test_a_buried_pot_frees_its_channel_and_hose(client, db):
-    basil = pot_id(pot(client, "name=basil controller=0 channel=0 outlet=3"))
+    basil = minted(pot(client, "name=basil controller=0 channel=0 outlet=3"))
     assert pot(client, f"id={basil} status=graveyard").status_code == 200
     # The 200 alone proves nothing: what frees the hardware is the closed
     # window, and a graveyard pot that kept its window open would pass the
@@ -185,11 +164,11 @@ def test_a_buried_pot_frees_its_channel_and_hose(client, db):
 def test_a_buried_pot_comes_back_unwired(client, db):
     """The plant that comes back is not in the socket the old one left, so
     restoring opens no window and the form asks where it went."""
-    basil = pot_id(pot(client, "name=basil controller=0 channel=0 outlet=3"))
+    basil = minted(pot(client, "name=basil controller=0 channel=0 outlet=3"))
     pot(client, f"id={basil} status=graveyard")
     assert pot(client, f"id={basil} status=alive").status_code == 200
 
-    (entry,) = garden(client)
+    entry = only_pot(client)
     assert entry["status"] == "alive"
     assert (entry["controller"], entry["channel"], entry["outlet"]) == (None, None, None)
     assert [row[2] is None for row in mappings(db, basil)] == [False], "still closed"
@@ -198,7 +177,7 @@ def test_a_buried_pot_comes_back_unwired(client, db):
 def test_burying_a_pot_and_wiring_it_in_one_body_is_refused(client):
     """Two opposite instructions in one request. Asked of the REQUEST, not
     of the row — burying a pot that is wired right now is the whole point."""
-    basil = pot_id(pot(client, "name=basil controller=0 channel=0 outlet=3"))
+    basil = minted(pot(client, "name=basil controller=0 channel=0 outlet=3"))
     answer = pot(client, f"id={basil} status=graveyard outlet=4")
     assert answer.status_code == 400
     assert "holds no wiring" in answer.text
@@ -210,25 +189,13 @@ def test_the_displacement_backstop_still_closes_a_stray_open_window(client, db):
     last defence: a reading is stamped with one pot as it lands, and two
     open windows on one channel would make that pick arbitrary and
     permanent."""
-    basil = pot_id(pot(client, "name=basil controller=0 channel=0 outlet=3"))
-    with sqlite3.connect(db) as con:
-        con.execute("UPDATE pots SET status = 'graveyard' WHERE id = ?", (basil,))
+    basil = minted(pot(client, "name=basil controller=0 channel=0 outlet=3"))
+    run_sql(db, "UPDATE pots SET status = 'graveyard' WHERE id = ?", basil)
     assert mappings(db, basil) == [(0, 3, None)], "open, as the old defect left it"
 
-    mint = pot_id(pot(client, "name=mint controller=0 channel=0 outlet=3"))
+    mint = minted(pot(client, "name=mint controller=0 channel=0 outlet=3"))
     assert [row[2] is None for row in mappings(db, basil)] == [False], "basil let go"
     assert mappings(db, mint) == [(0, 3, None)], "mint holds it now"
-
-
-def test_a_pot_may_not_park_on_a_working_pots_hose(client, db):
-    """The collision check is asked whatever the SAVED pot's own status is:
-    the point is the other pot. Skipping it for a disabled pot would let
-    one open a second window on a working pot's hose."""
-    pot(client, "name=basil controller=0 channel=0 outlet=3")
-
-    answer = pot(client, "name=mint controller=0 outlet=3")
-    assert answer.status_code == 400
-    assert "taken by pot basil" in answer.text
 
 
 def test_a_displaced_window_keeps_the_doses_it_held(client, db):
@@ -237,7 +204,7 @@ def test_a_displaced_window_keeps_the_doses_it_held(client, db):
     import time
 
     now = int(time.time())
-    basil = pot_id(pot(client, "name=basil controller=0 channel=0 outlet=3"))
+    basil = minted(pot(client, "name=basil controller=0 channel=0 outlet=3"))
     with sqlite3.connect(db) as con:
         # Backdate the window so it has a duration to hold a dose inside:
         # created and displaced in the same second, it would have none, and
@@ -253,7 +220,7 @@ def test_a_displaced_window_keeps_the_doses_it_held(client, db):
             (now - 510, now - 500, now - 490, basil),
         )
     assert pot(client, f"id={basil} status=graveyard").status_code == 200
-    mint = pot_id(pot(client, "name=mint controller=0 channel=0 outlet=3"))
+    mint = minted(pot(client, "name=mint controller=0 channel=0 outlet=3"))
 
     mine = client.get(f"/doses?pot={basil}").json()["doses"]
     assert [r["id"] for r in mine] == [1], "the dose stays with the pot that held the hose"
@@ -299,8 +266,7 @@ def test_a_malformed_pot_is_refused(client, db, body):
     answer = pot(client, body)
     assert answer.status_code == 400
     assert answer.text.startswith("refused: ")
-    with sqlite3.connect(db) as con:
-        assert con.execute("SELECT COUNT(*) FROM pots").fetchone() == (0,)
+    assert count(db, "pots") == 0
 
 
 def test_writing_a_pot_needs_the_token_reading_the_garden_does_not(client):
@@ -310,7 +276,7 @@ def test_writing_a_pot_needs_the_token_reading_the_garden_does_not(client):
 
 def test_unknown_keys_are_ignored_like_everywhere_else(client):
     assert pot(client, "name=basil colour=green").status_code == 200
-    (entry,) = garden(client)
+    entry = only_pot(client)
     assert "colour" not in entry
     # `photo` is an answer key — the newest picture, for the thumbnail
     # beside the name — but not a writable field, so a pot that has never
@@ -330,16 +296,8 @@ def test_parse_pot_is_strict_about_its_own_fields():
 # --------------------------------------------------------------------------- #
 
 
-def test_create_mints_an_id_and_returns_it(client):
-    answer = pot(client, "name=basil")
-    assert answer.status_code == 200
-    got_id, got_name = answer.text.split()
-    assert got_id.startswith("pot=pot-")
-    assert got_name == "name=basil"
-
-
 def test_a_pot_can_be_renamed_by_id(client):
-    pid = pot_id(pot(client, "name=basil"))
+    pid = minted(pot(client, "name=basil"))
 
     assert pot(client, f"id={pid} name=genovese").status_code == 200
 
@@ -353,7 +311,7 @@ def test_a_save_by_name_after_a_rename_creates_a_second_pot(client):
     nickname and missed the rename does not recalibrate the pot — it
     forks it, and calibrates a pot nobody is watering.
     """
-    pid = pot_id(pot(client, "name=basil controller=0 channel=0"))
+    pid = minted(pot(client, "name=basil controller=0 channel=0"))
     pot(client, f"id={pid} name=genovese")
 
     assert pot(client, "name=basil dry_raw=12000 wet_raw=4000").status_code == 200
@@ -365,7 +323,7 @@ def test_a_save_by_name_after_a_rename_creates_a_second_pot(client):
 
 
 def test_renaming_onto_a_taken_name_is_refused(client):
-    basil = pot_id(pot(client, "name=basil"))
+    basil = minted(pot(client, "name=basil"))
     pot(client, "name=mint")
 
     answer = pot(client, f"id={basil} name=mint")
@@ -384,11 +342,11 @@ def test_an_unknown_id_is_refused_rather_than_creating(client):
 
 
 def test_an_edit_by_id_needs_no_name(client):
-    pid = pot_id(pot(client, "name=basil controller=0 channel=0"))
+    pid = minted(pot(client, "name=basil controller=0 channel=0"))
 
     assert pot(client, f"id={pid} dry_raw=12000 wet_raw=4000").status_code == 200
 
-    (entry,) = garden(client)
+    entry = only_pot(client)
     assert entry["name"] == "basil"
     assert entry["dry_raw"] == 12000
 
@@ -399,7 +357,7 @@ def test_an_edit_by_id_needs_no_name(client):
 
 
 def test_remapping_closes_the_old_row_and_opens_a_new_one(client, db):
-    pid = pot_id(pot(client, "name=basil controller=0 channel=3 outlet=1"))
+    pid = minted(pot(client, "name=basil controller=0 channel=3 outlet=1"))
 
     assert pot(client, f"id={pid} channel=4").status_code == 200
 
@@ -410,7 +368,7 @@ def test_remapping_closes_the_old_row_and_opens_a_new_one(client, db):
 
 
 def test_an_unchanged_mapping_opens_no_second_row(client, db):
-    pid = pot_id(pot(client, "name=basil controller=0 channel=3"))
+    pid = minted(pot(client, "name=basil controller=0 channel=3"))
 
     # Accepted AND silent about the mapping. Without the status assertion a
     # refusal that wrote nothing at all would satisfy the row count below,
@@ -424,25 +382,25 @@ def test_an_unchanged_mapping_opens_no_second_row(client, db):
 def test_a_remap_saves_the_rest_of_the_request_too(client, db):
     """One POST /pot, two destinations: the wiring goes to pot_mappings and
     every other field to pots. Neither half may swallow the other."""
-    pid = pot_id(pot(client, "name=basil controller=0 channel=3 outlet=1"))
+    pid = minted(pot(client, "name=basil controller=0 channel=3 outlet=1"))
 
     assert pot(client, f"id={pid} channel=4 soil=peat dry_raw=12000").status_code == 200
 
-    (entry,) = garden(client)
+    entry = only_pot(client)
     assert (entry["channel"], entry["soil"], entry["dry_raw"]) == (4, "peat", 12000)
     assert len(mappings(db, pid)) == 2
 
 
 def test_a_pot_that_was_never_wired_has_no_mapping_row(client, db):
-    pid = pot_id(pot(client, "name=mystery dry_raw=12000"))
+    pid = minted(pot(client, "name=mystery dry_raw=12000"))
 
     assert mappings(db, pid) == []
 
 
 def test_a_freed_channel_can_be_taken_by_another_pot(client, db):
     """The collision check reads pots_now, so a closed window frees the hose."""
-    basil = pot_id(pot(client, "name=basil controller=0 channel=0 outlet=3"))
-    mint = pot_id(pot(client, "name=mint"))
+    basil = minted(pot(client, "name=basil controller=0 channel=0 outlet=3"))
+    mint = minted(pot(client, "name=mint"))
 
     pot(client, f"id={basil} channel=1 outlet=4")
 
@@ -483,17 +441,16 @@ def test_a_clock_that_steps_back_cannot_invert_a_window(client, db, monkeypatch)
     opened, and the next one starts on that same clamped second, because
     the whole attribution scheme assumes the windows are contiguous.
     """
-    pid = pot_id(pot(client, "name=basil controller=0 channel=0 outlet=3"))
+    pid = minted(pot(client, "name=basil controller=0 channel=0 outlet=3"))
     step_the_clock(monkeypatch, -7200)
 
     assert pot(client, f"id={pid} outlet=4").status_code == 200
 
-    with sqlite3.connect(db) as con:
-        rows = con.execute(
-            "SELECT outlet, from_ts, to_ts FROM pot_mappings WHERE pot_id = ? "
-            "ORDER BY rowid",
-            (pid,),
-        ).fetchall()
+    rows = run_sql(
+        db,
+        "SELECT outlet, from_ts, to_ts FROM pot_mappings WHERE pot_id = ? ORDER BY rowid",
+        pid,
+    )
     closed, opened = rows
     assert closed[2] >= closed[1], f"window closed before it opened: {closed}"
     assert opened[1] == closed[2], f"windows left with a gap: {rows}"
@@ -506,9 +463,9 @@ def test_a_clock_that_steps_back_cannot_invert_a_window(client, db, monkeypatch)
 
 
 def test_species_round_trips(client):
-    pid = pot_id(pot(client, "name=basil species=Ocimum_basilicum"))
+    pid = minted(pot(client, "name=basil species=Ocimum_basilicum"))
 
-    (entry,) = garden(client)
+    entry = only_pot(client)
     assert entry["species"] == "Ocimum_basilicum"
     assert entry["id"] == pid
 
@@ -517,7 +474,7 @@ def test_a_create_never_edits_the_pot_that_already_has_that_name(client, db):
     """An id-less POST /pot is always a create. Looking the name up and
     editing whatever answered to it would mean a "new pot" made against a
     stale list could quietly overwrite an existing one."""
-    basil = pot_id(pot(client, "name=basil controller=0 channel=0 soil=peat"))
+    basil = minted(pot(client, "name=basil controller=0 channel=0 soil=peat"))
 
     answer = pot(client, "name=basil soil=peat")
     assert answer.status_code == 400
@@ -525,15 +482,15 @@ def test_a_create_never_edits_the_pot_that_already_has_that_name(client, db):
     assert "open it instead of creating one" in answer.text
 
     # Nothing moved, and no second pot appeared.
-    (entry,) = garden(client)
+    entry = only_pot(client)
     assert entry["id"] == basil
     assert entry["soil"] == "peat"
 
 
 def test_editing_that_pot_still_works_through_its_id(client):
-    basil = pot_id(pot(client, "name=basil soil=peat"))
+    basil = minted(pot(client, "name=basil soil=peat"))
     assert pot(client, f"id={basil} soil=peat").status_code == 200
-    (entry,) = garden(client)
+    entry = only_pot(client)
     assert entry["soil"] == "peat"
     assert entry["id"] == basil
 
@@ -541,7 +498,7 @@ def test_editing_that_pot_still_works_through_its_id(client):
 def test_a_rename_onto_a_taken_name_keeps_its_own_words(client):
     """The rename refusal is not the create's: there is nothing to open."""
     pot(client, "name=basil")
-    mint = pot_id(pot(client, "name=mint"))
+    mint = minted(pot(client, "name=mint"))
     answer = pot(client, f"id={mint} name=basil")
     assert answer.status_code == 400
     assert "taken by pot" in answer.text

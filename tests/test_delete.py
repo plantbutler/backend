@@ -5,12 +5,10 @@ record and gives back the hardware; the delete keeps nothing. Only one of
 them is reachable by accident, and it is the reversible one.
 """
 
-import sqlite3
-import time
 
 import pytest
 
-from conftest import TOKEN, post
+from conftest import TOKEN, count, minted, post, raise_alert, run_sql, water
 
 DRY, WET = 9000, 4000
 
@@ -21,24 +19,7 @@ def settings():
 
 
 def pot(client, body):
-    answer = post(client, "/pot", body)
-    assert answer.status_code == 200, answer.text
-    return answer.text.split()[0].removeprefix("pot=")
-
-
-def count(db, table, where="1", args=()):
-    with sqlite3.connect(db) as con:
-        return con.execute(f"SELECT COUNT(*) FROM {table} WHERE {where}", args).fetchone()[0]
-
-
-def water(client, controller=0, outlet=0, ml=100):
-    """A manual dose all the way through: queued, handed out, acknowledged."""
-    answer = post(client, "/command", f"c={controller} water={outlet} ml={ml}")
-    assert answer.status_code == 200, answer.text
-    cmd_id = int(answer.text.split()[0].removeprefix("cmd="))
-    post(client, "/report", f"c={controller} ch0=8000")
-    post(client, "/report", f"c={controller} ch0=8000 ack={cmd_id} flow_ml={ml}")
-    return cmd_id
+    return minted(post(client, "/pot", body))
 
 
 def furnished(client, db, name="basil"):
@@ -73,9 +54,9 @@ def test_burying_a_pot_keeps_everything_and_frees_the_hardware(client, db):
     entry = {p["id"]: p for p in client.get("/pots").json()["pots"]}[basil]
     assert entry["status"] == "graveyard"
     assert (entry["controller"], entry["channel"], entry["outlet"]) == (None, None, None)
-    assert count(db, "commands", "pot_id = ?", (basil,)) == 1
-    assert count(db, "readings", "pot_id = ?", (basil,)) >= 1
-    assert count(db, "photos", "pot_id = ?", (basil,)) == 1
+    assert count(db, "commands", "pot_id = ?", basil) == 1
+    assert count(db, "readings", "pot_id = ?", basil) >= 1
+    assert count(db, "photos", "pot_id = ?", basil) == 1
     assert count(db, "verdicts") == 1
     assert client.get(f"/history?pot={basil}").json()["points"] != []
 
@@ -90,29 +71,35 @@ def test_burying_a_pot_expires_the_proposal_it_was_waiting_on(client, db):
     )
     for _ in range(6):
         post(client, "/report", f"c=0 float=1 pos=ok ch0={DRY}")
-    with sqlite3.connect(db) as con:
-        assert con.execute(
-            "SELECT COUNT(*) FROM commands WHERE state = 'proposed'"
-        ).fetchone() == (1,)
+    assert count(db, "commands", "state = 'proposed'") == 1
 
     post(client, "/pot", f"id={basil} status=graveyard")
-    with sqlite3.connect(db) as con:
-        assert con.execute(
-            "SELECT COUNT(*) FROM commands WHERE state = 'proposed'"
-        ).fetchone() == (0,)
+    assert count(db, "commands", "state = 'proposed'") == 0
 
 
-def test_burying_a_pot_clears_the_sensor_alarm_nobody_could_clear(client, db):
-    """The raise and the clear both live inside a loop over the live pots,
-    so a pot that leaves the loop while its alarm stands would leave a row
-    nothing can ever clear."""
-    basil = pot(client, "name=basil controller=0 channel=0")
-    with sqlite3.connect(db) as con:
-        con.execute(
-            "INSERT INTO alerts (key, raised_ts) VALUES ('sensor:0:0', ?)",
-            (int(time.time()),),
-        )
-    post(client, "/pot", f"id={basil} status=graveyard")
+@pytest.mark.parametrize(
+    "wiring, change",
+    [
+        # The raise and the clear both live inside a loop over the live
+        # pots, so a pot that leaves the loop while its alarm stands would
+        # leave a row nothing can ever clear.
+        pytest.param(
+            "channel=0", "status=graveyard", id="burying_a_pot_clears_the_sensor_alarm"
+        ),
+        # Both the raise and the clear read the pot's CURRENT wiring, so a
+        # pot moved to another channel would otherwise leave the old
+        # channel's alarm with nobody to clear it.
+        pytest.param(
+            "channel=0 outlet=0", "channel=1", id="a_remap_frees_the_socket_it_left"
+        ),
+    ],
+)
+def test_a_channel_nobody_is_on_keeps_no_alarm_nobody_could_clear(
+    client, db, wiring, change
+):
+    basil = pot(client, f"name=basil controller=0 {wiring}")
+    raise_alert(db, "sensor:0:0")
+    post(client, "/pot", f"id={basil} {change}")
     assert count(db, "alerts", "key = 'sensor:0:0'") == 0
 
 
@@ -121,19 +108,16 @@ def test_another_pot_on_that_hose_keeps_its_own_alarm(client, db):
     holds the pair. Same controller AND same outlet, or the key would not
     even be the same string and the test would prove nothing."""
     basil = pot(client, "name=basil controller=0 channel=0 outlet=0")
-    with sqlite3.connect(db) as con:
-        # a second live pot on the same hose is a config error the mapping
-        # write refuses, so it's written by hand here
-        con.execute("INSERT INTO pots (id, name) VALUES ('pot-other', 'mint')")
-        con.execute(
-            "INSERT INTO pot_mappings (pot_id, controller, channel, outlet, from_ts) "
-            "VALUES ('pot-other', 0, 0, 0, 0)"
-        )
-        for key in ("sensor:0:0", "proposal:0:0"):
-            con.execute(
-                "INSERT INTO alerts (key, raised_ts) VALUES (?, ?)",
-                (key, int(time.time())),
-            )
+    # A second live pot on the same hose is a config error the mapping
+    # write refuses, so it is written by hand here.
+    run_sql(db, "INSERT INTO pots (id, name) VALUES ('pot-other', 'mint')")
+    run_sql(
+        db,
+        "INSERT INTO pot_mappings (pot_id, controller, channel, outlet, from_ts) "
+        "VALUES ('pot-other', 0, 0, 0, 0)",
+    )
+    for key in ("sensor:0:0", "proposal:0:0"):
+        raise_alert(db, key)
     post(client, "/pot", f"id={basil} status=graveyard")
     assert count(db, "alerts", "key = 'sensor:0:0'") == 1
     assert count(db, "alerts", "key = 'proposal:0:0'") == 1
@@ -156,7 +140,7 @@ def test_a_delete_erases_every_trace_including_the_files(client, db, photos):
     for table in ("pots", "pot_mappings", "commands", "readings", "photos",
                   "advice_dismissed"):
         where = "id = ?" if table == "pots" else "pot_id = ?"
-        assert count(db, table, where, (basil,)) == 0, table
+        assert count(db, table, where, basil) == 0, table
     assert count(db, "verdicts") == 0
     assert not any(f.exists() for f in files)
     assert not (photos / basil).exists()
@@ -167,32 +151,14 @@ def test_a_delete_frees_the_alerts_the_pot_leaves_behind(client, db):
     """The delete's own free_alerts call, both keys and both branches of it —
     the graveyard's identical call is covered by the tests above it."""
     basil, _ = furnished(client, db)
-    with sqlite3.connect(db) as con:
-        for key in ("sensor:0:0", "proposal:0:0", "silent:0"):
-            con.execute(
-                "INSERT INTO alerts (key, raised_ts) VALUES (?, ?)",
-                (key, int(time.time())),
-            )
+    for key in ("sensor:0:0", "proposal:0:0", "silent:0"):
+        raise_alert(db, key)
     post(client, "/pot/delete", f"id={basil}")
 
     assert count(db, "alerts", "key = 'sensor:0:0'") == 0
     assert count(db, "alerts", "key = 'proposal:0:0'") == 0
     # the board's own conditions are not this pot's to clear
     assert count(db, "alerts", "key = 'silent:0'") == 1
-
-
-def test_a_remap_frees_the_socket_it_left(client, db):
-    """Both the raise and the clear read the pot's CURRENT wiring, so a pot
-    moved to another channel would otherwise leave the old channel's alarm
-    with nobody to clear it."""
-    basil = pot(client, "name=basil controller=0 channel=0 outlet=0")
-    with sqlite3.connect(db) as con:
-        con.execute(
-            "INSERT INTO alerts (key, raised_ts) VALUES ('sensor:0:0', ?)",
-            (int(time.time()),),
-        )
-    post(client, "/pot", f"id={basil} channel=1")
-    assert count(db, "alerts", "key = 'sensor:0:0'") == 0
 
 
 def test_burying_a_pot_takes_a_queued_dose_with_it(client, db):
@@ -242,7 +208,7 @@ def test_a_delete_leaves_another_pots_things_alone(client, db):
     post(client, "/report", "c=0 ch1=7000")
 
     post(client, "/pot/delete", f"id={basil}")
-    assert count(db, "readings", "pot_id = ?", (mint,)) >= 1
+    assert count(db, "readings", "pot_id = ?", mint) >= 1
     assert [p["id"] for p in client.get("/pots").json()["pots"]] == [mint]
 
 
@@ -271,15 +237,11 @@ def test_the_delete_still_clears_the_ledger_it_could_leave_behind(client, db):
     loses it — must not be left holding a judgement row or a verdict for a
     command nobody can look up."""
     basil, cmd_id = furnished(client, db)
-    with sqlite3.connect(db) as con:  # the judgement ledger row for that dose
-        con.execute(
-            "INSERT INTO alerts (key, raised_ts) VALUES (?, ?)",
-            (f"dose:{cmd_id}", int(time.time())),
-        )
+    raise_alert(db, f"dose:{cmd_id}")  # the judgement ledger row for that dose
     post(client, "/pot/delete", f"id={basil}")
 
-    assert count(db, "alerts", "key = ?", (f"dose:{cmd_id}",)) == 0
-    assert count(db, "verdicts", "command_id = ?", (cmd_id,)) == 0
+    assert count(db, "alerts", "key = ?", f"dose:{cmd_id}") == 0
+    assert count(db, "verdicts", "command_id = ?", cmd_id) == 0
 
 
 def test_a_deleted_pots_readings_are_not_inherited_by_the_next_plant(client, db):

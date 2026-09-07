@@ -9,10 +9,7 @@ from fastapi.testclient import TestClient
 
 import butler
 from butler import create_app, in_quiet, parse_quiet, parse_report
-from conftest import TOKEN, make_pot, post
-
-DRY = 11000  # pct 12 with the calibration below
-WET = 8000  # pct 50
+from conftest import DRY, TOKEN, WET, make_pot, post, run_sql
 
 
 @pytest.fixture
@@ -21,12 +18,15 @@ def settings():
 
 
 def report(client, raw=DRY, safe=True, extra="", token=TOKEN):
+    """One report from board 0, built the way the rules want to read it.
+    Not conftest's `report`, which takes a finished body and insists on a
+    200: half the cases here are about the refusals."""
     body = f"c=0 ch0={raw}"
     if safe:
         body += " float=1 pos=ok"
     if extra:
         body += f" {extra}"
-    return client.post("/report", content=body, headers={"X-Token": token})
+    return post(client, "/report", body, token)
 
 
 def soak(client, n, raw=DRY, safe=True):
@@ -45,10 +45,9 @@ def soak_both(client, n):
 
 
 def commands(db):
-    with sqlite3.connect(db) as con:
-        return con.execute(
-            "SELECT id, state, source, ml, cap_s, outlet FROM commands ORDER BY id"
-        ).fetchall()
+    return run_sql(
+        db, "SELECT id, state, source, ml, cap_s, outlet FROM commands ORDER BY id"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -153,8 +152,7 @@ def test_a_dose_the_stamp_missed_still_holds_the_cooldown(client, db):
     assert "cmd=1" in report(client).text, "handed out"
     post(client, "/report", "c=0 ch0=8000 ack=1 flow_ml=100")
 
-    with sqlite3.connect(db) as con:
-        (stamp,) = con.execute("SELECT pot_id FROM commands WHERE id = 1").fetchone()
+    ((stamp,),) = run_sql(db, "SELECT pot_id FROM commands WHERE id = 1")
     assert stamp == basil, "the pot that actually got the water"
 
     post(client, "/pot", f"id={basil} outlet=5")  # the hose floor stops covering it
@@ -173,8 +171,7 @@ def test_a_dose_is_recorded_against_the_pot_that_received_it(client, db):
     mint = make_pot(client, name="mint", channel=1, outlet=3, mode="manual")
     report(client, extra=f"ch1={DRY}")
 
-    with sqlite3.connect(db) as con:
-        (stamp,) = con.execute("SELECT pot_id FROM commands WHERE id = 1").fetchone()
+    ((stamp,),) = run_sql(db, "SELECT pot_id FROM commands WHERE id = 1")
     assert stamp == mint, "the water went down outlet 3, and mint is on it"
     assert stamp != basil
 
@@ -244,21 +241,34 @@ def test_a_bad_quiet_setting_refuses_to_start(db):
 # --------------------------------------------------------------------------- #
 
 
-def test_cooldown_blocks_a_second_dose(client, db):
-    make_pot(client)  # default cooldown: 6 h
+@pytest.mark.parametrize("moved", [False, True], ids=["", "with_its_hose_moved"])
+@pytest.mark.parametrize(
+    "knobs, flowed",
+    [
+        pytest.param({}, 97, id="cooldown_blocks_a_second_dose"),  # default: 6 h
+        pytest.param(
+            {"cooldown_h": 0, "daily_cap_ml": 150},
+            100,  # first dose 100 of 150, so 100 + 100 > 150: capped
+            id="the_daily_cap_counts_what_actually_flowed",
+        ),
+    ],
+)
+def test_one_dose_only_however_the_hose_hangs(client, db, knobs, flowed, moved):
+    """The six hours and the millilitres belong to the plant, not to the
+    plumbing: watering a pot and then moving its hose must not water it
+    twice, and a remap is not a fresh allowance.
+
+    No rewind before the remap on purpose: it lands in the very second of
+    the dose, the one genuinely ambiguous point of the window, and the
+    gates have to read that ambiguity as "watered" in both directions.
+    """
+    basil = make_pot(client, **knobs)
     soak(client, 5)  # waters
-    report(client, extra="ack=1 flow_ml=97")
+    report(client, extra=f"ack=1 flow_ml={flowed}")
+    if moved:
+        post(client, "/pot", f"id={basil} outlet=4")
 
     soak(client, 6)  # still bone dry, but freshly watered
-    assert len(commands(db)) == 1
-
-
-def test_the_daily_cap_counts_what_actually_flowed(client, db):
-    make_pot(client, cooldown_h=0, daily_cap_ml=150)
-    soak(client, 5)  # first dose: 100 of 150
-    report(client, extra="ack=1 flow_ml=100")
-
-    soak(client, 6)  # 100 + 100 > 150: capped
     assert len(commands(db)) == 1
 
 
@@ -324,10 +334,7 @@ def test_approved_proposal_is_handed_acked_and_verdicted(client, db):
     answer = post(client, "/verdict", "cmd=1 verdict=too_much")
     assert answer.text == "cmd=1 verdict=too_much\n"
     post(client, "/verdict", "cmd=1 verdict=ok")  # second look replaces
-    with sqlite3.connect(db) as con:
-        assert con.execute("SELECT command_id, verdict FROM verdicts").fetchall() == [
-            (1, "ok")
-        ]
+    assert run_sql(db, "SELECT command_id, verdict FROM verdicts") == [(1, "ok")]
 
 
 def test_the_garden_carries_the_last_handed_dose_and_its_verdict(client, db):
@@ -377,22 +384,20 @@ def test_the_garden_carries_the_last_handed_dose_and_its_verdict(client, db):
     def last_dose_id():
         return client.get("/pots").json()["pots"][0]["last_dose"]["id"]
 
-    with sqlite3.connect(db) as con:
-        con.execute(
-            "UPDATE commands SET sent_ts = (SELECT sent_ts FROM commands WHERE id = 1) "
-            "WHERE id = 2"
-        )
+    run_sql(
+        db,
+        "UPDATE commands SET sent_ts = (SELECT sent_ts FROM commands WHERE id = 1) "
+        "WHERE id = 2",
+    )
     assert last_dose_id() == 2
-    with sqlite3.connect(db) as con:
-        con.execute("UPDATE commands SET sent_ts = sent_ts - 60 WHERE id = 2")
+    run_sql(db, "UPDATE commands SET sent_ts = sent_ts - 60 WHERE id = 2")
     assert last_dose_id() == 1
 
 
 def test_approval_restarts_the_queued_ttl_clock(client, db):
     make_pot(client, mode="learning")
     soak(client, 5)
-    with sqlite3.connect(db) as con:  # the human took 800 s to walk over
-        con.execute("UPDATE commands SET created_ts = created_ts - 800")
+    run_sql(db, "UPDATE commands SET created_ts = created_ts - 800")  # a slow walk over
 
     post(client, "/approve", "cmd=1")
     handed = report(client)  # NOT swept as a stale queued command
@@ -402,8 +407,7 @@ def test_approval_restarts_the_queued_ttl_clock(client, db):
 def test_an_unapproved_proposal_expires(client, db):
     make_pot(client, mode="learning")
     soak(client, 5)
-    with sqlite3.connect(db) as con:
-        con.execute("UPDATE commands SET created_ts = created_ts - 7300")
+    run_sql(db, "UPDATE commands SET created_ts = created_ts - 7300")
 
     report(client)
     assert commands(db)[0][1] == "expired"
@@ -415,8 +419,7 @@ def test_a_stale_proposal_from_a_dark_board_cannot_be_approved(client, db):
     # so /approve must enforce the TTL itself.
     make_pot(client, mode="learning")
     soak(client, 5)
-    with sqlite3.connect(db) as con:  # the board goes dark for three days
-        con.execute("UPDATE commands SET created_ts = created_ts - 259200")
+    run_sql(db, "UPDATE commands SET created_ts = created_ts - 259200")  # dark three days
 
     (entry,) = client.get("/pots").json()["pots"]
     assert entry["proposal"] is None  # not advertised past its TTL
@@ -428,8 +431,7 @@ def test_a_dead_boards_abandoned_command_does_not_wedge_approval(client, db):
     make_pot(client, mode="learning")
     soak(client, 5)  # proposal cmd=1
     post(client, "/command", "c=0 stop=1")  # cmd=2 queued; the board dies
-    with sqlite3.connect(db) as con:
-        con.execute("UPDATE commands SET created_ts = created_ts - 1000 WHERE id = 2")
+    run_sql(db, "UPDATE commands SET created_ts = created_ts - 1000 WHERE id = 2")
 
     assert post(client, "/approve", "cmd=1").status_code == 200
 
@@ -573,36 +575,6 @@ def test_a_proposal_is_not_inherited_by_the_next_pot_on_the_hose(client, db):
 
     assert cards(client)["mint"]["proposal"] is None
     assert cards(client)["basil"]["proposal"] is None  # not on that hose now
-
-
-def test_the_cooldown_stays_with_the_pot_when_its_hose_moves(client, db):
-    """The six hours belong to the plant, not to the plumbing. Watering a
-    pot and then moving its hose must not water it twice.
-
-    No rewind here on purpose: the remap lands in the very second of the
-    dose, which is the one genuinely ambiguous point of the window, and
-    the gates have to read that ambiguity as "watered" in both directions.
-    """
-    basil = make_pot(client)  # auto, outlet 3, default 6 h cooldown
-    soak(client, 5)
-    report(client, extra="ack=1 flow_ml=97")
-
-    post(client, "/pot", f"id={basil} outlet=4")
-
-    soak(client, 6)  # still bone dry, still freshly watered
-    assert len(commands(db)) == 1
-
-
-def test_the_daily_cap_stays_with_the_pot_when_its_hose_moves(client, db):
-    """The same, for the millilitres: a remap is not a fresh allowance."""
-    basil = make_pot(client, cooldown_h=0, daily_cap_ml=150)
-    soak(client, 5)
-    report(client, extra="ack=1 flow_ml=100")
-
-    post(client, "/pot", f"id={basil} outlet=4")
-
-    soak(client, 6)  # 100 + 100 > 150 wherever the hose hangs
-    assert len(commands(db)) == 1
 
 
 def test_a_proposal_survives_a_correction_that_leaves_the_hose_alone(client, db):

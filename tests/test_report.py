@@ -1,41 +1,34 @@
 """The report endpoint's contract, spelled as the board will exercise it."""
 
-import sqlite3
 import time
 
 import pytest
 from fastapi.testclient import TestClient
 
 from butler import create_app, parse_report
-from conftest import TOKEN
+from conftest import TOKEN, count, minted, post, run_sql
 
 
 REPORT = "c=0 t=123456\nch0=8123 ch1=7902 ch2=15\n"
 
 
 def rows(db):
-    with sqlite3.connect(db) as con:
-        return con.execute(
-            "SELECT controller, channel, raw FROM readings ORDER BY ts, channel"
-        ).fetchall()
+    return run_sql(db, "SELECT controller, channel, raw FROM readings ORDER BY ts, channel")
 
 
 def stamps(db):
     """(channel, pot_id) per reading, oldest first: whose reading each one is."""
-    with sqlite3.connect(db) as con:
-        return con.execute(
-            "SELECT channel, pot_id FROM readings ORDER BY ts, channel"
-        ).fetchall()
+    return run_sql(db, "SELECT channel, pot_id FROM readings ORDER BY ts, channel")
 
 
-def post(client, body, token=TOKEN):
-    return client.post("/report", content=body, headers={"X-Token": token})
+def reported(client, body, token=TOKEN):
+    """One report, and the answer left unjudged: most of this file is about
+    what the endpoint refuses, so conftest's `report` and its 200 will not do."""
+    return post(client, "/report", body, token)
 
 
 def pot(client, body):
-    answer = client.post("/pot", content=body, headers={"X-Token": TOKEN})
-    assert answer.status_code == 200, answer.text
-    return answer.text.split()[0].removeprefix("pot=")
+    return minted(post(client, "/pot", body))
 
 
 def test_the_controller_is_an_integer_and_zero_is_a_real_board(client, db):
@@ -43,9 +36,8 @@ def test_the_controller_is_an_integer_and_zero_is_a_real_board(client, db):
     own heartbeat and alerts, silently. Board 0 is the trap inside the trap:
     it is falsy, and the app fills it in by default, so `if not controller`
     would refuse the commonest board there is."""
-    assert post(client, "c=0 ch0=8000").status_code == 200
-    with sqlite3.connect(db) as con:
-        assert con.execute("SELECT controller FROM readings").fetchone() == (0,)
+    assert reported(client, "c=0 ch0=8000").status_code == 200
+    assert run_sql(db, "SELECT controller FROM readings") == [(0,)]
 
 
 @pytest.mark.parametrize(
@@ -60,11 +52,10 @@ def test_the_controller_is_an_integer_and_zero_is_a_real_board(client, db):
     ],
 )
 def test_a_controller_that_is_not_a_number_is_refused(client, db, body, why):
-    answer = post(client, body)
+    answer = reported(client, body)
     assert answer.status_code == 400
     assert answer.text.startswith("refused: " + why), answer.text
-    with sqlite3.connect(db) as con:
-        assert con.execute("SELECT COUNT(*) FROM readings").fetchone() == (0,)
+    assert count(db, "readings") == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -74,7 +65,7 @@ def test_a_controller_that_is_not_a_number_is_refused(client, db, body, why):
 
 def test_a_reading_carries_the_pot_that_was_on_that_channel(client, db):
     basil = pot(client, "name=basil controller=0 channel=0")
-    post(client, REPORT)
+    reported(client, REPORT)
     # ch1 and ch2 are sockets nobody has claimed: NULL is the honest answer
     assert stamps(db) == [(0, basil), (1, None), (2, None)]
 
@@ -83,10 +74,10 @@ def test_a_remap_changes_what_is_stamped_next_and_leaves_the_past_alone(client, 
     """A plant moved to another socket takes its old readings with it, and
     the pot that arrives on the socket it left does not inherit them."""
     basil = pot(client, "name=basil controller=0 channel=0")
-    post(client, "c=0 t=1\nch0=8000\n")
+    reported(client, "c=0 t=1\nch0=8000\n")
     pot(client, f"id={basil} channel=1")
     mint = pot(client, "name=mint controller=0 channel=0")
-    post(client, "c=0 t=2\nch0=7000 ch1=6000\n")
+    reported(client, "c=0 t=2\nch0=7000 ch1=6000\n")
 
     assert stamps(db) == [(0, basil), (0, mint), (1, basil)]
 
@@ -95,21 +86,13 @@ def test_a_buried_pots_channel_stamps_nobody(client, db):
     """Burying a pot closes its window, so a reading that arrives on that
     socket afterwards belongs to no plant."""
     basil = pot(client, "name=basil controller=0 channel=0")
-    post(client, "c=0 t=1\nch0=8000\n")
+    reported(client, "c=0 t=1\nch0=8000\n")
     client.post(
         "/pot", content=f"id={basil} status=graveyard", headers={"X-Token": TOKEN}
     )
-    post(client, "c=0 t=2\nch0=8000\n")
+    reported(client, "c=0 t=2\nch0=8000\n")
 
     assert stamps(db) == [(0, basil), (0, None)]
-
-
-def test_a_retry_still_dedups_when_nothing_is_mapped(client, db):
-    """The dedup probe is on (controller, t), not on pots: an unmapped
-    board must not write its readings twice."""
-    post(client, REPORT)
-    post(client, REPORT)
-    assert len(stamps(db)) == 3
 
 
 # --------------------------------------------------------------------------- #
@@ -118,7 +101,7 @@ def test_a_retry_still_dedups_when_nothing_is_mapped(client, db):
 
 
 def test_a_report_lands_whole_and_answers_the_next_interval(client, db):
-    answer = post(client, REPORT)
+    answer = reported(client, REPORT)
 
     assert answer.status_code == 200
     assert answer.text == "next=60\n"
@@ -126,24 +109,37 @@ def test_a_report_lands_whole_and_answers_the_next_interval(client, db):
 
 
 def test_the_server_stamps_arrival_time_itself(client, db):
-    post(client, REPORT)
+    reported(client, REPORT)
 
-    with sqlite3.connect(db) as con:
-        (ts,) = con.execute("SELECT DISTINCT ts FROM readings").fetchone()
+    ((ts,),) = run_sql(db, "SELECT DISTINCT ts FROM readings")
     assert abs(time.time() - ts) < 5
 
 
-def test_keys_this_version_does_not_know_are_ignored(client, db):
-    body = "c=0 float=1 pos=ok last=ok zz=9 ch0=8123\n"
-    answer = post(client, body)
+@pytest.mark.parametrize(
+    "body, landed",
+    [
+        pytest.param(
+            "c=0 float=1 pos=ok last=ok zz=9 ch0=8123\n",
+            [(0, 0, 8123)],
+            id="keys_this_version_does_not_know",
+        ),
+        pytest.param(
+            "c=0 ch\u0667=7 ch0=1\n",  # Arabic-Indic seven: an unknown key
+            [(0, 0, 1)],
+            id="unicode_digits_do_not_alias_onto_ascii_channels",
+        ),
+    ],
+)
+def test_a_key_this_version_cannot_read_is_skipped_and_the_rest_lands(client, db, body, landed):
+    answer = reported(client, body)
 
     assert answer.status_code == 200
-    assert rows(db) == [(0, 0, 8123)]
+    assert rows(db) == landed
 
 
 def test_reports_append_and_health_counts_them(client, db):
-    post(client, "c=0 t=60000 ch0=1\n")
-    post(client, "c=0 t=120000 ch0=2\n")
+    reported(client, "c=0 t=60000 ch0=1\n")
+    reported(client, "c=0 t=120000 ch0=2\n")
 
     health = client.get("/health").json()
     assert health["ok"] is True
@@ -162,7 +158,7 @@ def test_health_reports_the_default_interval_not_an_override(db):
     client = TestClient(
         create_app(db_path=str(db), token=TOKEN, next_s=45, cmd_ttl_s=900)
     )
-    post(client, "c=0 ch0=1\n")
+    reported(client, "c=0 ch0=1\n")
     knob = client.post("/interval", content="c=0 next=120", headers={"X-Token": TOKEN})
     assert knob.status_code == 200
     health = client.get("/health").json()
@@ -173,26 +169,28 @@ def test_health_reports_the_default_interval_not_an_override(db):
 
 
 def test_an_identical_retry_is_answered_200_and_stored_once(client, db):
-    first = post(client, REPORT)
-    retry = post(client, REPORT)
+    """No pot is mapped here, which is the point: the dedup probe is on
+    (controller, t), not on pots, so an unmapped board must not write its
+    readings twice either."""
+    first = reported(client, REPORT)
+    retry = reported(client, REPORT)
 
     assert first.status_code == retry.status_code == 200
     assert len(rows(db)) == 3
 
 
 def test_a_report_after_a_reboot_reuses_old_uptimes_and_still_lands(client, db):
-    post(client, "c=0 t=60000 ch0=1\n")
-    with sqlite3.connect(db) as con:  # age the first report past the window
-        con.execute("UPDATE readings SET ts = ts - 3600")
-    answer = post(client, "c=0 t=60000 ch0=2\n")
+    reported(client, "c=0 t=60000 ch0=1\n")
+    run_sql(db, "UPDATE readings SET ts = ts - 3600")  # past the window
+    answer = reported(client, "c=0 t=60000 ch0=2\n")
 
     assert answer.status_code == 200
     assert [r[2] for r in rows(db)] == [1, 2]
 
 
 def test_a_report_without_t_never_dedups(client, db):
-    post(client, "c=0 ch0=1\n")
-    post(client, "c=0 ch0=1\n")
+    reported(client, "c=0 ch0=1\n")
+    reported(client, "c=0 ch0=1\n")
 
     assert len(rows(db)) == 2
 
@@ -202,26 +200,19 @@ def test_a_report_without_t_never_dedups(client, db):
 # --------------------------------------------------------------------------- #
 
 
-def test_a_wrong_token_stores_nothing(client, db):
-    assert post(client, REPORT, token="nope").status_code == 401
-    assert rows(db) == []
-
-
-def test_a_missing_token_header_stores_nothing(client, db):
-    answer = client.post("/report", content=REPORT)
-
-    assert answer.status_code == 401
-    assert rows(db) == []
-
-
-def test_a_non_ascii_token_is_a_401_not_a_500(client, db):
-    # h11 lets obs-text header bytes through and the ASGI layer decodes them
-    # latin-1, so the handler sees a non-ASCII str; compare_digest on that
-    # would 500 rather than 401.
-    answer = client.post(
-        "/report", content=REPORT, headers={"X-Token": "sécret".encode("latin-1")}
-    )
-    assert answer.status_code == 401
+@pytest.mark.parametrize(
+    "token",
+    [
+        pytest.param("nope", id="a_wrong_token"),
+        pytest.param(None, id="a_missing_token_header"),
+        # h11 lets obs-text header bytes through and the ASGI layer decodes
+        # them latin-1, so the handler sees a non-ASCII str; compare_digest
+        # on that would 500 rather than 401.
+        pytest.param("sécret".encode("latin-1"), id="a_non_ascii_token"),
+    ],
+)
+def test_a_report_the_token_does_not_open_stores_nothing(client, db, token):
+    assert reported(client, REPORT, token=token).status_code == 401
     assert rows(db) == []
 
 
@@ -245,7 +236,7 @@ def test_a_non_ascii_token_is_a_401_not_a_500(client, db):
     ],
 )
 def test_a_malformed_report_is_refused_whole(client, db, body):
-    answer = post(client, body)
+    answer = reported(client, body)
 
     assert answer.status_code == 400
     assert answer.text.startswith("refused: ")
@@ -263,18 +254,10 @@ def test_invalid_utf8_is_refused_not_repaired(client, db):
 
 def test_an_oversized_body_is_cut_off_with_413(client, db):
     body = "c=0 " + " ".join(f"ch{i % 200}=1" for i in range(2000))
-    answer = post(client, body)
+    answer = reported(client, body)
 
     assert answer.status_code == 413
     assert rows(db) == []
-
-
-def test_unicode_digits_do_not_alias_onto_ascii_channels(client, db):
-    body = "c=0 ch٧=7 ch0=1\n"  # Arabic-Indic seven: unknown key, skipped
-    answer = post(client, body)
-
-    assert answer.status_code == 200
-    assert rows(db) == [(0, 0, 1)]
 
 
 # --------------------------------------------------------------------------- #
