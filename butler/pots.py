@@ -26,6 +26,19 @@ def live_sql(col: str = "status") -> str:
     return f"{col} IN (" + ", ".join(f"'{s}'" for s in LIVE_STATUSES) + ")"
 
 
+def moisture_pct(raw: int, dry_raw: int | None, wet_raw: int | None) -> int | None:
+    """Linear between the two calibration points, clamped to 0..100.
+
+    None while uncalibrated. Works whichever way the sensor counts (dry
+    high or dry low) because both endpoints are stored. Derived at read
+    time and never stored: recalibrating reinterprets history.
+    """
+    if dry_raw is None or wet_raw is None or dry_raw == wet_raw:
+        return None
+    pct = (dry_raw - raw) * 100 / (dry_raw - wet_raw)
+    return max(0, min(100, round(pct)))
+
+
 # A pot the rules can water on a board (the one `?`): live, on a channel and
 # an outlet, calibrated, with a target and a dose. The ladder's candidates and
 # the stale page's "a try can still come" are one predicate, so the page

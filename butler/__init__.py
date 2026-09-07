@@ -125,6 +125,7 @@ from .pots import (
     RULES_POT_SQL,
     _hose_since,
     live_sql,
+    moisture_pct,
     waters,
     window_edge,
 )
@@ -138,6 +139,7 @@ from .schema import (
     new_photo_id,
     new_pot_id,
 )
+from .rules import water_rules
 from .species import (
     CANDIDATE_KEYS,
     CANDIDATES_MAX,
@@ -228,19 +230,6 @@ from .wire import (
 # The container installs no package — it copies this one beside fastapi and
 # runs it — so the version lives here. A test holds it to pyproject.toml.
 VERSION = "0.20.0"
-
-
-def moisture_pct(raw: int, dry_raw: int | None, wet_raw: int | None) -> int | None:
-    """Linear between the two calibration points, clamped to 0..100.
-
-    None while uncalibrated. Works whichever way the sensor counts (dry
-    high or dry low) because both endpoints are stored. Derived at read
-    time and never stored: recalibrating reinterprets history.
-    """
-    if dry_raw is None or wet_raw is None or dry_raw == wet_raw:
-        return None
-    pct = (dry_raw - raw) * 100 / (dry_raw - wet_raw)
-    return max(0, min(100, round(pct)))
 
 
 def create_app(
@@ -355,181 +344,6 @@ def create_app(
                 "INSERT OR REPLACE INTO advice_dismissed "
                 "(pot_id, kind, fingerprint, ts) VALUES (?, ?, ?, ?)",
                 (pot_id, kind, f"{band.low}-{band.high}", now),
-            )
-
-    def water_rules(con: sqlite3.Connection, r: Report, now: int) -> None:
-        """The watering ladder, statelessly, inside the report's own
-        transaction. The median over the last RULES_WINDOW readings is both
-        the smoothing and the consecutive-dry test: a dry median of five means
-        most of the window was dry. Every gate errs dry, and a skipped pot is
-        retried on the next report for free.
-        """
-        con.execute(
-            "UPDATE commands SET state = 'expired' "
-            "WHERE controller = ? AND state = 'proposed' AND created_ts < ?",
-            (r.controller, now - PROPOSAL_TTL_S),
-        )
-        if is_retired(con, r.controller):
-            return  # a retired board keeps its readings and never waters
-        if latch_of(con, r.controller) is not None:
-            return  # the durable half of the board's latch: dry until a human resumes
-        origin = counter_origin(con, r.controller)
-        if isinstance(tank_state(con, r.controller, origin), tuple) or over_stands(
-            con, r.controller
-        ):
-            return  # over: past the tank with the float at full, or paged so until a tap
-        if r.pos != "ok":
-            return  # no known position, no report field: dry
-        answering = tap_answers_flap(
-            con, r.controller, r.float_ok, r.channels.get(FLAP_CHANNEL)
-        )
-        if r.float_ok != 1 and answering is None:
-            return  # no reservoir, no report field: dry — unless a tap answers the flap
-        # While the tap answers the flap, a refusal acked before it — the
-        # board's float check failing with the word still up, the thing the
-        # flap counts — is not water to the cooldown below: the try the tap
-        # bought must not wait out the refusal's six hours, when the person
-        # told to refill and tap has just done both. Any other time a refusal
-        # cools the pot as a dose does, or a pot the board refuses for ever
-        # would be asked at report pace.
-        refusals_before = 0 if answering is None else answering
-        # This board's own beat, so "recent" below means the same number of
-        # reports whether it speaks every minute or every hour.
-        beat = con.execute(
-            "SELECT next_s FROM controllers WHERE controller = ?", (r.controller,)
-        ).fetchone()
-        cadence = (beat and beat[0]) or interval
-        if in_quiet(time.localtime(now).tm_hour, *cfg.quiet_window):
-            return
-        candidates = con.execute(
-            "SELECT id, channel, outlet, dry_raw, wet_raw, target_low_pct, "
-            "dose_ml, mode, cooldown_h, daily_cap_ml FROM pots_now "
-            f"WHERE {RULES_POT_SQL} AND mode IN ('learning', 'auto') "
-            "ORDER BY name",
-            (r.controller,),
-        ).fetchall()
-        for (
-            pot_id,
-            channel,
-            outlet,
-            dry,
-            wet,
-            low,
-            dose,
-            mode,
-            cool_h,
-            cap_ml,
-        ) in candidates:
-            if channel not in r.channels:
-                # A sensor that went silent errs dry, exactly like a missing
-                # float=: without it the window would freeze on stale values
-                # and water the pot at cooldown pace forever.
-                continue
-            # THIS pot's readings, not this channel's. A socket that has
-            # just changed hands still holds the last plant's rows, and four
-            # of a dead plant's drought readings under one fresh one make a
-            # median that opens a valve on a pot nobody has measured.
-            #
-            # And only recent ones, which the channel key gave for free and
-            # the pot key does not: a pot rewired after a month would
-            # otherwise decide on four month-old rows plus today's. Fewer
-            # than RULES_WINDOW inside the window means it waits — dry.
-            fresh = now - RULES_WINDOW * 3 * cadence
-            window = [
-                raw
-                for (raw,) in con.execute(
-                    "SELECT raw FROM readings "
-                    "WHERE pot_id = ? AND ts >= ? "
-                    "ORDER BY ts DESC, rowid DESC LIMIT ?",
-                    (pot_id, fresh, RULES_WINDOW),
-                )
-            ]
-            if len(window) < RULES_WINDOW:
-                continue
-            window.sort()  # median of raw == median of pct: the map is monotonic
-            median_pct = moisture_pct(window[RULES_WINDOW // 2], dry, wet)
-            if median_pct is None or median_pct >= low:
-                continue
-            # Keyed on the hose, and rightly so: this one asks whether the
-            # plumbing is busy, not what this pot has had. The two gates
-            # below ask about the pot, through its mapping windows — and
-            # then about the hose anyway, as the floor no attribution
-            # failure can dig under.
-            open_cmd = con.execute(
-                "SELECT 1 FROM commands WHERE controller = ? AND outlet = ? "
-                "AND state IN ('proposed', 'queued', 'sent') LIMIT 1",
-                (r.controller, outlet),
-            ).fetchone()
-            if open_cmd:
-                continue
-            # Cooldown counts from the last command the board ever HELD
-            # (sent_ts set): an expired-unacked command may still have
-            # watered, so it cools the pot just like an acked one. It
-            # follows the pot when its hose moves — the six hours belong to
-            # the plant, and a remap that reset them would water it twice.
-            cooldown_s = (cool_h if cool_h is not None else DEFAULT_COOLDOWN_H) * 3600
-            watered = con.execute(
-                "SELECT 1 FROM commands WHERE pot_id = ? AND sent_ts IS NOT NULL "
-                "AND COALESCE(acked_ts, sent_ts) > ? "
-                "AND (flow_ml IS NOT 0 OR acked_ts >= ?) LIMIT 1",
-                (pot_id, now - cooldown_s, refusals_before),
-            ).fetchone() or con.execute(
-                # ...and the hose underneath it. Attribution is a lookup, and
-                # a lookup comes back empty for reasons that say nothing about
-                # the plant: a dose handed before the pot was registered, a
-                # clock that stepped while the wiring was saved. Water went
-                # down this hose either way, so the hose-keyed gate is the
-                # floor: an unknown state waters LESS, never more.
-                "SELECT 1 FROM commands WHERE controller = ? AND outlet = ? "
-                "AND sent_ts IS NOT NULL AND COALESCE(acked_ts, sent_ts) > ? "
-                "AND (flow_ml IS NOT 0 OR acked_ts >= ?) LIMIT 1",
-                (r.controller, outlet, now - cooldown_s, refusals_before),
-            ).fetchone()
-            if watered:
-                continue
-            cap = cap_ml if cap_ml is not None else DEFAULT_DAILY_CAP_DOSES * dose
-            # Acked water only. A handed command the board never acked is far
-            # likelier a response that never arrived than a lost ack — the
-            # firmware never retries once any response bytes came back — and
-            # charging its full dose would starve the pot for the day on
-            # nothing. The cooldown above still counts it: spacing errs dry,
-            # the cap counts water. One row, one owner, one SUM: the stamp
-            # means no dose can fall inside two mapping windows at once.
-            (spent,) = con.execute(
-                "SELECT COALESCE(SUM(CASE WHEN acked_ts IS NOT NULL "
-                "THEN COALESCE(flow_ml, ml) ELSE 0 END), 0) FROM commands "
-                "WHERE pot_id = ? AND sent_ts > ?",
-                (pot_id, now - 86400),
-            ).fetchone()
-            # The same floor as the cooldown's, for the same reason: what
-            # this HOSE poured in the last day, whoever it was attributed
-            # to. MAX rather than a sum, because an attributed dose is
-            # counted by both queries and must be spent once.
-            (hose_spent,) = con.execute(
-                "SELECT COALESCE(SUM(CASE WHEN acked_ts IS NOT NULL "
-                "THEN COALESCE(flow_ml, ml) ELSE 0 END), 0) FROM commands "
-                "WHERE controller = ? AND outlet = ? AND sent_ts > ?",
-                (r.controller, outlet, now - 86400),
-            ).fetchone()
-            spent = max(spent, hose_spent)
-            if spent + dose > cap:
-                continue
-            state = "proposed"
-            if mode == "auto":
-                slot_busy = con.execute(
-                    "SELECT 1 FROM commands WHERE controller = ? "
-                    "AND state IN ('queued', 'sent') LIMIT 1",
-                    (r.controller,),
-                ).fetchone()
-                if slot_busy:
-                    continue  # the next report retries; dry beats flooded
-                state = "queued"
-            cap_s = cap_for(dose)
-            con.execute(
-                "INSERT INTO commands (created_ts, controller, kind, outlet, "
-                "ml, cap_s, state, source, pot_id) "
-                "VALUES (?, ?, 'water', ?, ?, ?, ?, 'rules', ?)",
-                (now, r.controller, outlet, dose, cap_s, state, pot_id),
             )
 
     def handle_report(r: Report) -> tuple[int, tuple | None]:
@@ -806,7 +620,7 @@ def create_app(
                         for ch, raw in sorted(r.channels.items())
                     ],
                 )
-                water_rules(con, r, now)
+                water_rules(con, r, now, interval, cfg.quiet_window)
             handed = con.execute(
                 "SELECT id, kind, outlet, ml, cap_s FROM commands "
                 "WHERE controller = ? AND state = 'queued' ORDER BY id LIMIT 1",
