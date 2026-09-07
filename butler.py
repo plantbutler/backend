@@ -3,7 +3,8 @@
 Two callers, both of which start the conversation. The Arduino board POSTs a
 report every report interval — `k=v` tokens in the body, a static token in the
 `X-Token` header — and the reply is `k=v` too: the next interval and, when one
-is queued, at most one command. The phone app reads and writes JSON.
+is queued, at most one command. The phone app writes `k=v` as well; what it
+reads back comes as JSON on the list and history routes, `k=v` elsewhere.
 
 Everything here errs dry. A malformed report is refused whole rather than
 stored in part; every watering gate refuses rather than waters; a command the
