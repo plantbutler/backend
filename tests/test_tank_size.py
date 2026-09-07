@@ -858,6 +858,100 @@ def test_the_carried_clocks_come_only_with_the_word(db):
     ) == [(0, None, None, None), (1, 0, 6, None), (2, 1, 5, 5)]
 
 
+# The shape between the two amendments: the tap already snapshots the
+# float and the word has its clock, but no tap has a drop yet.
+MID_SHAPE = """
+CREATE TABLE status (
+  controller INTEGER PRIMARY KEY, ts INTEGER NOT NULL, float_ok INTEGER,
+  float_since INTEGER, pos TEXT, pos_since INTEGER, float_seen INTEGER,
+  pos_seen INTEGER, float_bad INTEGER, float_bad_prev INTEGER,
+  pos_bad INTEGER, pos_bad_prev INTEGER, err TEXT, err_ts INTEGER,
+  latched_ts INTEGER, latch_reason TEXT, pos_ok_seen INTEGER,
+  float_word INTEGER, float_word_since INTEGER);
+CREATE TABLE refills (ts INTEGER NOT NULL, controller INTEGER NOT NULL,
+  float_ok INTEGER);
+"""
+
+
+def test_a_tank_already_empty_at_the_upgrade_carries_its_drop(db):
+    """A tank that ran down before the upgrade is one that ran down: the
+    latest tap that saw the float gets the word's fall as its drop_ts
+    when the word is 0 and fell after the tap — or in its second, the tap
+    having seen it full, since a tap after the fall snapshots the 0 — so
+    the rise after the next untapped refill restarts the counter instead
+    of the board being paged stuck at full on every dose since a tap it
+    demonstrably ran down from. A word of full hides whatever fall
+    preceded it: that tap keeps NULL, as with no fall (spec D2, amended)."""
+    with sqlite3.connect(db) as con:
+        con.executescript(MID_SHAPE)
+        con.executemany(
+            "INSERT INTO status (controller, ts, float_ok, float_since, "
+            "float_word, float_word_since) VALUES (?, 50, ?, ?, ?, ?)",
+            [
+                (0, 0, 30, 0, 30),  # tapped at full, ran down: carried
+                (1, 0, 5, 0, 5),  # tapped at empty, never moved: the fall came first
+                (2, 0, 40, 0, 40),  # tapped at empty, rose and fell: carried
+                (3, 1, 30, 1, 30),  # full now: whatever fell is hidden
+                (4, 0, 10, 0, 10),  # fell in the tap's second, tap saw full: carried
+                (5, 0, 10, 0, 10),  # fell in the tap's second, saw empty: fall first
+                (6, 0, 30, 0, 30),  # latest tap saw nothing: the one before is the base
+            ],
+        )
+        con.executemany(
+            "INSERT INTO refills VALUES (?, ?, ?)",
+            [
+                (10, 0, 1),
+                (10, 1, 0),
+                (10, 2, 0),
+                (10, 3, 1),
+                (10, 4, 1),
+                (10, 5, 0),
+                (10, 6, 1),
+                (20, 6, None),
+            ],
+        )
+    client = TestClient(
+        create_app(db_path=str(db), token=TOKEN, next_s=60, cmd_ttl_s=900)
+    )
+    assert run_sql(
+        db, "SELECT controller, ts, drop_ts FROM refills ORDER BY controller, ts"
+    ) == [
+        (0, 10, 30),
+        (1, 10, None),
+        (2, 10, 40),
+        (3, 10, None),
+        (4, 10, 10),
+        (5, 10, None),
+        (6, 10, 30),
+        (6, 20, None),
+    ]
+    # Board 0 pumped a tank's worth between its tap and the fall — the run
+    # the old code closed — and is now refilled by someone who forgot to
+    # tap: the rise is the origin, nothing is on the counter, and the
+    # board is not presumed stuck.
+    run_sql(
+        db,
+        "INSERT INTO tank_samples (ts, controller, refill_ts, ml) "
+        "VALUES (2, 0, 1, 200), (30, 0, 10, 250)",
+    )
+    run_sql(
+        db,
+        "INSERT INTO commands (created_ts, controller, kind, outlet, ml, cap_s, "
+        "state, source, sent_ts, acked_ts, flow_ml) "
+        "VALUES (20, 0, 'water', 3, 250, 30, 'acked', 'manual', 20, 21, 250)",
+    )
+    report(client, "c=0 ch0=1 float=1 pos=ok")
+    assert origin(db) == (rise(db), "rise")
+    entry = health(client)
+    assert (entry["tank_ml"], entry["pumped_ml"], entry["over"]) == (225, 0, 0)
+    # Its second drain is the untapped refill's, not the tap's: the tap
+    # keeps the drop it was carried, and the rise stays the origin.
+    report(client, "c=0 ch0=1 float=0 pos=ok")
+    assert run_sql(db, "SELECT drop_ts FROM refills WHERE controller = 0") == [(30,)]
+    assert origin(db) == (rise(db), "rise")
+    assert samples(db) == [(1, 200), (10, 250)]
+
+
 # --------------------------------------------------------------------------- #
 # Every sample is announced (spec D8)
 # --------------------------------------------------------------------------- #

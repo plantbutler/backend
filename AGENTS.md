@@ -324,9 +324,11 @@ pot_id)` — the command log is the watering history, never pruned EXCEPT by `PO
 stored. `schema.sql` stays additive, but `CREATE TABLE IF NOT EXISTS` is additive about tables
 only — a column appended to a CREATE that already ran never reaches an existing database — so a new
 column goes in the CREATE *and* in `butler.ADDED_COLUMNS`, which ALTERs it in at startup and can
-carry a value over from an old column. `pots_now` is dropped and recreated on every start for the
-same reason; it holds no data, and a view over a column the table has not got yet parses fine and
-then fails on every read. Air temperature and light ride the same readings table as extra channels (the sensor kit
+carry a value over from an old column (`source`, row by row) or, once every column is in, from
+another table (`carry`: `refills.drop_ts` on a tank already empty at the upgrade). `pots_now` is
+dropped and recreated on every start for the same reason; it holds no data, and a view over a
+column the table has not got yet parses fine and then fails on every read. Air temperature and
+light ride the same readings table as extra channels (the sensor kit
 has both modules); season is derived from the date. Adaptive dosing from range, temperature,
 light and season is a later pitch — see the plan's Planta note — v1 rules stay thresholds.
 

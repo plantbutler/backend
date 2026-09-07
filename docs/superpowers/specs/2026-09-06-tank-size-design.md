@@ -42,8 +42,15 @@ board when it was retired still acks.
 (`refill=<ts>`). The row gains `float_ok INTEGER`: `status.float_ok` at the tap, NULL when the
 board has never sent `float=`. Schema: column in the `CREATE` **and** in `ADDED_COLUMNS`; the
 rows already on the NAS get NULL, which D7 judges as nothing. Likewise `refills.drop_ts INTEGER`
-(D3/D4), `status.float_rise INTEGER` and `status.contra INTEGER NOT NULL DEFAULT 0`. The app's copy says what the tap
-means (D9).
+(D3/D4), `status.float_rise INTEGER` and `status.contra INTEGER NOT NULL DEFAULT 0`. *Amended
+2026-09-07:* `drop_ts` is carried on a tank already empty at the upgrade: the latest tap that saw
+the float gets `status.float_word_since` when the word is 0 and fell after the tap (or in its
+second, the tap having seen it full — a tap after the fall snapshots the 0). It is the drop D4
+would have stamped; left NULL, the rise after the next untapped refill counts for nothing (D3),
+every dose since a tap the tank demonstrably ran down from stays on the counter, and the board is
+paged stuck at full with a tap the only clear (D6). A word of full hides whatever fall preceded
+it: that tap keeps NULL, as with no fall. Another table's value, so `Added.carry`, run once every
+column is in. The app's copy says what the tap means (D9).
 
 **D3 — The counter.** `pumped_since(con, controller, since_ts) -> int`: `SUM(COALESCE(flow_ml,
 ml))` over `commands` with `kind = 'water'`, this controller, `acked_ts IS NOT NULL` and

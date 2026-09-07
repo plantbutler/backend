@@ -299,7 +299,9 @@ class Added(NamedTuple):
     """A column schema.sql grew after its CREATE had already run somewhere,
     and how its value carries over from an old one: `source` is the old
     column (None: nothing to carry), read through `convert` on the rows
-    where `gate` — SQL over the old row — holds."""
+    where `gate` — SQL over the old row — holds. `carry` is for a value
+    that comes from another table: called with the connection once every
+    column is in, since what it reads may be arriving in the same pass."""
 
     table: str
     column: str
@@ -307,6 +309,7 @@ class Added(NamedTuple):
     source: str | None = None
     convert: Callable = lambda v: v
     gate: str = "1"
+    carry: Callable[[sqlite3.Connection], None] | None = None
 
 
 # Append-only, like the schema itself. The converters that reach for
@@ -340,9 +343,11 @@ ADDED_COLUMNS = (
     Added("status", "pos_ok_seen", "INTEGER"),
     # The tank has a size (0.19.0): what the float said at the tap (the
     # rows already on the NAS get NULL, which judges nothing), the first
-    # drop after it (none yet), the board's last word on the float with
-    # when it last changed and last rose, and the ch207 of its last report
-    # (none yet). The word and its clocks are carried from float_ok and
+    # drop after it (stamped, on a tank already empty at the upgrade, from
+    # the word's clock: carry_drops, a lambda for the same reason as
+    # above), the board's last word on the float with when it last
+    # changed and last rose, and the ch207 of its last report (none yet).
+    # The word and its clocks are carried from float_ok and
     # float_since so a tank sitting at full through the upgrade still
     # closes its sample and its rise is where it was — all three under one
     # gate: a last pre-upgrade report that omitted float= blanked float_ok
@@ -351,7 +356,7 @@ ADDED_COLUMNS = (
     # comes only with a word of full; float_since under a word of empty
     # is its fall.
     Added("refills", "float_ok", "INTEGER"),
-    Added("refills", "drop_ts", "INTEGER"),
+    Added("refills", "drop_ts", "INTEGER", carry=lambda con: carry_drops(con)),
     Added("status", "float_word", "INTEGER", "float_ok"),
     Added(
         "status", "float_word_since", "INTEGER", "float_since", gate="float_ok IS NOT NULL"
@@ -381,13 +386,16 @@ def add_columns(con: sqlite3.Connection) -> list[str]:
     leaves the new column NULL.
     """
     added = []
+    carries = []
     with con:
-        for table, column, kind, source, convert, gate in ADDED_COLUMNS:
+        for table, column, kind, source, convert, gate, carry in ADDED_COLUMNS:
             cols = [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
             if not cols or column in cols:
                 continue  # no such table here yet, or nothing to do
             con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
             added.append(f"{table}.{column}")
+            if carry is not None:
+                carries.append(carry)
             if source is None or source not in cols:
                 continue
             for rowid, text in con.execute(
@@ -400,6 +408,11 @@ def add_columns(con: sqlite3.Connection) -> list[str]:
                         f"UPDATE {table} SET {column} = ? WHERE rowid = ?",
                         (value, rowid),
                     )
+        # Once every column is in, so the tuple stays append-only: the
+        # carry for refills.drop_ts reads the word and its clock, which
+        # this same pass adds to status on a database old enough.
+        for carry in carries:
+            carry(con)
     return added
 
 
@@ -883,6 +896,41 @@ def base_tap(
         (controller,),
     ).fetchone()
     return (row[0], row[1], row[2]) if row else None
+
+
+def carry_drops(con: sqlite3.Connection) -> None:
+    """The upgrade's `drop_ts` for a tank already empty: on each board
+    whose word is 0, the latest tap that saw the float is stamped with
+    when the word fell (`float_word_since`) if that is after the tap —
+    or in its second with the tap having seen it full, since a tap after
+    the fall snapshots the 0. It is the drop the report path would have
+    stamped had this code been running: left NULL, the rise after the
+    next untapped refill counts for nothing (counter_origin needs a drop
+    since the tap), every dose since a tap the tank has demonstrably run
+    down from stays on the counter, and the board is paged stuck at full
+    with a tap the only clear. The tank has to be empty now — a word of
+    full hides whatever fall and rise preceded it, and that tap keeps
+    NULL, as with no fall — and the fall on the clock is the word's last,
+    the only one the old row kept. Another table's value, so an
+    `Added.carry` rather than a `source` (spec D2)."""
+    if not con.execute("PRAGMA table_info(status)").fetchall():
+        return  # no board has ever reported: nothing has fallen
+    for controller, fell in con.execute(
+        "SELECT controller, float_word_since FROM status "
+        "WHERE float_word = 0 AND float_word_since IS NOT NULL"
+    ).fetchall():
+        tap = con.execute(
+            "SELECT ts, rowid, float_ok FROM refills WHERE controller = ? "
+            "AND float_ok IS NOT NULL ORDER BY ts DESC, rowid DESC LIMIT 1",
+            (controller,),
+        ).fetchone()
+        if tap is None:
+            continue
+        ts, rowid, saw = tap
+        if fell > ts or (fell == ts and saw == 1):
+            con.execute(
+                "UPDATE refills SET drop_ts = ? WHERE rowid = ?", (fell, rowid)
+            )
 
 
 def counter_origin(
