@@ -61,6 +61,7 @@ from .band import (
     size_shifts,
     target_band,
 )
+from .config import Config, configure, env_int
 from .constants import (
     ALERT_TICK_S,
     BODY_CAP,
@@ -258,121 +259,39 @@ def create_app(
     fetch: Callable[[str], dict | None] | None = None,
     photos_dir: str | None = None,
 ) -> FastAPI:
-    """Everything configurable comes from the environment, overridable for tests.
+    """The whole service: the configuration, the database, and the routes.
 
-    Refusals to start, all of them loud and specific: a missing token (this
-    listens on a LAN with other people's devices on it, and "forgot to set the
-    token" must not be a working deployment); a BUTLER_NEXT_S or
-    BUTLER_CMD_TTL_S that is not an integer; and a BUTLER_DB under /data when
-    /data is not a mount, since a forgotten bind mount stores readings in the
-    container layer and loses them on the next recreate while looking healthy.
+    Nothing is read from the environment below this line — `configure` did
+    that, and refused to start if any of it was wrong — so everything here
+    takes its numbers from `cfg` and the app is built the same way whether it
+    came up on the NAS or in a test.
     """
-    db = Path(db_path or os.environ.get("BUTLER_DB", "/data/butler.db"))
-    secret = token if token is not None else os.environ.get("BUTLER_TOKEN", "")
-    if not secret:
-        raise ValueError("BUTLER_TOKEN is not set; refusing to serve without one")
-
-    def env_int(given: int | None, name: str, default: str) -> int:
-        raw = str(given) if given is not None else (os.environ.get(name) or default)
-        try:
-            return int(raw)
-        except ValueError:
-            raise ValueError(
-                f"{name} must be an integer number of seconds, got {raw!r}"
-            ) from None
-
-    interval = env_int(next_s, "BUTLER_NEXT_S", "60")
-    cmd_ttl = env_int(cmd_ttl_s, "BUTLER_CMD_TTL_S", "900")
-    if not MIN_NEXT_S <= interval <= MAX_NEXT_S:
-        raise ValueError(
-            f"BUTLER_NEXT_S out of range ({MIN_NEXT_S}..{MAX_NEXT_S}): {interval}"
-        )
-    if cmd_ttl < 2 * interval:
-        # The TTL backstops are only safe if a live board always reports well
-        # within the TTL; otherwise a 'sent' command can be swept aside and a
-        # second one queued while the board still holds the first — two doses.
-        raise ValueError(
-            f"BUTLER_CMD_TTL_S ({cmd_ttl}) must be at least twice "
-            f"BUTLER_NEXT_S ({interval}), or a live board could be declared "
-            "dead between two on-time reports"
-        )
-
-    quiet_window = parse_quiet(
-        quiet if quiet is not None else os.environ.get("BUTLER_QUIET") or "22-08"
+    cfg = configure(
+        db_path=db_path,
+        token=token,
+        next_s=next_s,
+        cmd_ttl_s=cmd_ttl_s,
+        quiet=quiet,
+        ntfy_topic=ntfy_topic,
+        ntfy_url=ntfy_url,
+        deadman_url=deadman_url,
+        silent_s=silent_s,
+        tick_s=tick_s,
+        send=send,
+        ping=ping,
+        probe=probe,
+        trefle_token=trefle_token,
+        fetch=fetch,
+        photos_dir=photos_dir,
     )
-
-    topic = (
-        ntfy_topic
-        if ntfy_topic is not None
-        else os.environ.get("BUTLER_NTFY_TOPIC", "")
-    )
-    base_url = (
-        ntfy_url
-        if ntfy_url is not None
-        else (os.environ.get("BUTLER_NTFY_URL") or "https://ntfy.sh")
-    )
-    deadman = (
-        deadman_url
-        if deadman_url is not None
-        else os.environ.get("BUTLER_DEADMAN_URL", "")
-    )
-    silent_after = env_int(silent_s, "BUTLER_SILENT_S", str(SILENT_AFTER_S))
-    if not 60 <= silent_after <= 86400:
-        raise ValueError(f"BUTLER_SILENT_S out of range (60..86400): {silent_after}")
-    beat = tick_s if tick_s is not None else ALERT_TICK_S
-    alerts_on = bool(topic) or send is not None
-    if deadman and not alerts_on:
-        raise ValueError(
-            "BUTLER_DEADMAN_URL is set but BUTLER_NTFY_TOPIC is not: the "
-            "dead-man would report a healthy butler whose alerting is off"
-        )
-    check = probe
-    if send is None and topic:
-
-        def send(alert: Alert) -> bool:
-            return post_ntfy(base_url, topic, alert)
-
-        if check is None:
-
-            def check() -> bool:
-                # Reachability for quiet passes: a healthy garden sends no
-                # messages, so without this an ntfy outage would never stop
-                # the dead-man.
-                return ping_deadman(f"{base_url.rstrip('/')}/v1/health")
-
-    if ping is None and deadman:
-
-        def ping() -> bool:
-            return ping_deadman(deadman)
-
-    if not alerts_on:
-        print("BUTLER_NTFY_TOPIC unset: alerts are off", file=sys.stderr)
-
-    care_token = (
-        trefle_token
-        if trefle_token is not None
-        else os.environ.get("BUTLER_TREFLE_TOKEN", "")
-    )
-    get_json = fetch or fetch_json
-    if not care_token and fetch is None:
-        print("BUTLER_TREFLE_TOKEN unset: care lookups are typed in", file=sys.stderr)
-
-    if db.parent == Path("/data") and not os.path.ismount("/data"):
-        raise ValueError(
-            "BUTLER_DB is under /data but /data is not a mounted volume; "
-            "refusing to store readings in the container layer"
-        )
-    # Beside the database by default, so they land on the same bind mount and
-    # are backed up or lost together — the one arrangement in which a restore
-    # cannot produce rows whose files are from a different day.
-    photos = Path(
-        photos_dir or os.environ.get("BUTLER_PHOTOS") or str(db.parent / "photos")
-    )
-    if photos.parent == Path("/data") and not os.path.ismount("/data"):
-        raise ValueError(
-            "BUTLER_PHOTOS is under /data but /data is not a mounted volume; "
-            "refusing to store photographs in the container layer"
-        )
+    # The fields the closures below still read as locals. They go one by one
+    # as each of those closures becomes a top-level function taking what it
+    # needs; `cfg` is then the only thing this factory carries.
+    db, photos = cfg.db, cfg.photos
+    interval, cmd_ttl = cfg.interval, cfg.cmd_ttl
+    send, ping, check = cfg.send, cfg.ping, cfg.check
+    beat, alerts_on = cfg.beat, cfg.alerts_on
+    care_token, get_json = cfg.care_token, cfg.get_json
 
     db.parent.mkdir(parents=True, exist_ok=True)
     photos.mkdir(parents=True, exist_ok=True)
@@ -816,7 +735,7 @@ def create_app(
             "SELECT next_s FROM controllers WHERE controller = ?", (r.controller,)
         ).fetchone()
         cadence = (beat and beat[0]) or interval
-        if in_quiet(time.localtime(now).tm_hour, *quiet_window):
+        if in_quiet(time.localtime(now).tm_hour, *cfg.quiet_window):
             return
         candidates = con.execute(
             "SELECT id, channel, outlet, dry_raw, wet_raw, target_low_pct, "
@@ -1897,7 +1816,7 @@ def create_app(
             "WHERE last_seen > 0 AND retired = 0"
         ):
             heartbeat[controller] = (last_seen, override)
-            threshold = max(silent_after, 3 * (override or interval))
+            threshold = max(cfg.silent_after, 3 * (override or interval))
             key = f"silent:{controller}"
             if now - max(last_seen, since) > threshold:
                 if not raised(key) and floor_ok(key):
@@ -1936,7 +1855,7 @@ def create_app(
             if pulse is None:
                 continue  # never-heard controller: nothing to compare against
             last_seen, override = pulse
-            threshold = max(silent_after, 3 * (override or interval))
+            threshold = max(cfg.silent_after, 3 * (override or interval))
             if now - last_seen > threshold:
                 continue  # the whole controller is silent: that rule pages
             (latest,) = con.execute(
@@ -2579,7 +2498,9 @@ def create_app(
         given = request.headers.get("x-token", "")
         # Bytes, not str: compare_digest raises TypeError on non-ASCII str,
         # which would turn a garbled header into a 500 instead of a 401.
-        return not hmac.compare_digest(given.encode("utf-8"), secret.encode("utf-8"))
+        return not hmac.compare_digest(
+            given.encode("utf-8"), cfg.secret.encode("utf-8")
+        )
 
     async def slurp(request: Request, cap: int = BODY_CAP) -> bytes | PlainTextResponse:
         body = b""

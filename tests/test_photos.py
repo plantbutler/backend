@@ -422,7 +422,9 @@ def test_a_photo_store_under_an_unmounted_data_is_refused(tmp_path, monkeypatch)
     """The same refusal the database gets: a forgotten bind mount would
     store photographs in the container's own layer and lose every one of
     them on the next recreate, while looking healthy."""
-    monkeypatch.setattr(butler.os.path, "ismount", lambda path: False)
+    # On the module that asks the question: config is what reads the
+    # environment and refuses, and butler itself no longer imports os.
+    monkeypatch.setattr(butler.config.os.path, "ismount", lambda path: False)
     with pytest.raises(ValueError, match="not a mounted volume"):
         create_app(
             db_path=str(tmp_path / "butler.db"),
