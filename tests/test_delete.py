@@ -98,7 +98,6 @@ def test_burying_a_pot_keeps_everything_and_frees_the_hardware(client, db):
     entry = {p["id"]: p for p in client.get("/pots").json()["pots"]}[basil]
     assert entry["status"] == "graveyard"
     assert (entry["controller"], entry["channel"], entry["outlet"]) == (None, None, None)
-    # Everything it was is still there — that is the whole difference.
     assert count(db, "commands", "pot_id = ?", (basil,)) == 1
     assert count(db, "readings", "pot_id = ?", (basil,)) >= 1
     assert count(db, "photos", "pot_id = ?", (basil,)) == 1
@@ -107,8 +106,8 @@ def test_burying_a_pot_keeps_everything_and_frees_the_hardware(client, db):
 
 
 def test_burying_a_pot_expires_the_proposal_it_was_waiting_on(client, db):
-    """Nothing else does this, and a proposal outliving its plant is an
-    offer to water a pot that is no longer on that hose."""
+    """A proposal outliving its plant would be an offer to water a pot
+    that is no longer on that hose."""
     basil = pot(
         client,
         f"name=basil controller=0 channel=0 outlet=0 plant_type=herb "
@@ -129,9 +128,9 @@ def test_burying_a_pot_expires_the_proposal_it_was_waiting_on(client, db):
 
 
 def test_burying_a_pot_clears_the_sensor_alarm_nobody_could_clear(client, db):
-    """Both the raise and the clear live inside a loop over the live pots,
-    so a pot that leaves the loop while its alarm stands leaves a row
-    nothing can ever clear: it sits in /health for good."""
+    """The raise and the clear both live inside a loop over the live pots,
+    so a pot that leaves the loop while its alarm stands would leave a row
+    nothing can ever clear."""
     basil = pot(client, "name=basil controller=0 channel=0")
     with sqlite3.connect(db) as con:
         con.execute(
@@ -148,9 +147,8 @@ def test_another_pot_on_that_hose_keeps_its_own_alarm(client, db):
     even be the same string and the test would prove nothing."""
     basil = pot(client, "name=basil controller=0 channel=0 outlet=0")
     with sqlite3.connect(db) as con:
-        # A second live pot on the same hose is a config error the mapping
-        # write refuses, so it is written by hand: the point is only that
-        # free_alerts looks before it deletes.
+        # a second live pot on the same hose is a config error the mapping
+        # write refuses, so it's written by hand here
         con.execute("INSERT INTO pots (id, name) VALUES ('pot-other', 'mint')")
         con.execute(
             "INSERT INTO pot_mappings (pot_id, controller, channel, outlet, from_ts) "
@@ -191,8 +189,8 @@ def test_a_delete_erases_every_trace_including_the_files(client, db, photos):
 
 
 def test_a_delete_frees_the_alerts_the_pot_leaves_behind(client, db):
-    """The delete's own free_alerts call, which the graveyard's identical
-    one does not cover: both keys, and both branches of the helper."""
+    """The delete's own free_alerts call, both keys and both branches of it —
+    the graveyard's identical call is covered by the tests above it."""
     basil, _ = furnished(client, db)
     with sqlite3.connect(db) as con:
         for key in ("sensor:0:0", "proposal:0:0", "silent:0"):
@@ -204,14 +202,14 @@ def test_a_delete_frees_the_alerts_the_pot_leaves_behind(client, db):
 
     assert count(db, "alerts", "key = 'sensor:0:0'") == 0
     assert count(db, "alerts", "key = 'proposal:0:0'") == 0
-    # The board's own conditions are not this pot's to clear.
+    # the board's own conditions are not this pot's to clear
     assert count(db, "alerts", "key = 'silent:0'") == 1
 
 
 def test_a_remap_frees_the_socket_it_left(client, db):
-    """A pot moved to another channel leaves the old channel's alarm with
-    nobody to clear it: both the raise and the clear read the pot's CURRENT
-    wiring, so the row would stand in /health for ever."""
+    """Both the raise and the clear read the pot's CURRENT wiring, so a pot
+    moved to another channel would otherwise leave the old channel's alarm
+    with nobody to clear it."""
     basil = pot(client, "name=basil controller=0 channel=0 outlet=0")
     with sqlite3.connect(db) as con:
         con.execute(
@@ -223,8 +221,8 @@ def test_a_remap_frees_the_socket_it_left(client, db):
 
 
 def test_burying_a_pot_takes_a_queued_dose_with_it(client, db):
-    """Burial hands the outlet back to the garden, so a dose still waiting
-    for the board would pour into whatever is wired there next."""
+    """Burial hands the outlet back to the garden: a dose still waiting for
+    the board would otherwise pour into whatever is wired there next."""
     basil = pot(client, "name=basil controller=0 channel=0 outlet=0")
     answer = post(client, "/command", "c=0 water=0 ml=100")
     assert answer.status_code == 200, answer.text
@@ -235,9 +233,9 @@ def test_burying_a_pot_takes_a_queued_dose_with_it(client, db):
 
 
 def test_a_pot_the_board_is_holding_a_dose_for_cannot_be_erased(client, db):
-    """The row would go while the water is still running: the board acks an
-    id that no longer exists, and the freed slot lets the next command out
-    on top of the one already pouring."""
+    """Erasing here would leave the row gone while the water still runs: the
+    board acks an id that no longer exists, and the freed slot lets the
+    next command out on top of the one already pouring."""
     basil = pot(client, "name=basil controller=0 channel=0 outlet=0")
     post(client, "/command", "c=0 water=0 ml=100")
     assert "cmd=" in post(client, "/report", "c=0 ch0=8000").text
@@ -249,16 +247,15 @@ def test_a_pot_the_board_is_holding_a_dose_for_cannot_be_erased(client, db):
 
 
 def test_wiring_a_pot_that_is_already_buried_is_refused(client, db):
-    """The contradiction spread over two requests. One body saying both is
-    already refused; this is the same thing said twice."""
+    """The same contradiction one body saying both is already refused for,
+    said instead across two requests."""
     basil = pot(client, "name=basil controller=0 channel=0 outlet=0")
     post(client, "/pot", f"id={basil} status=graveyard")
 
     answer = post(client, "/pot", f"id={basil} controller=0 channel=0 outlet=0")
     assert answer.status_code == 400
     assert "bring it back first" in answer.text
-    # Restoring and wiring in one body is NOT a contradiction: it is how a
-    # plant comes back.
+    # restoring and wiring in one body is NOT a contradiction: it's how a plant comes back
     assert post(
         client, "/pot", f"id={basil} status=alive controller=0 channel=0 outlet=0"
     ).status_code == 200
@@ -283,11 +280,10 @@ def test_deleting_the_same_pot_twice_is_refused_not_silently_ok(client, db):
 
 
 def test_a_deleted_command_id_is_never_handed_out_again(client, db):
-    """The belt. Without AUTOINCREMENT `id` is a rowid alias and sqlite
-    hands a deleted command's id straight back, so the next dose inherits
-    the erased pot's `dose:<id>` judgement row — and is then skipped for
-    ever by the loop's NOT EXISTS guard, which is silence exactly where a
-    failed pump should page."""
+    """Without AUTOINCREMENT `id` is a rowid alias and sqlite hands a
+    deleted command's id straight back, so the next dose would inherit the
+    erased pot's `dose:<id>` judgement row and be silently skipped by the
+    loop's NOT EXISTS guard, right where a failed pump should page."""
     basil, cmd_id = furnished(client, db)
     post(client, "/pot/delete", f"id={basil}")
 
@@ -296,9 +292,9 @@ def test_a_deleted_command_id_is_never_handed_out_again(client, db):
 
 
 def test_the_delete_still_clears_the_ledger_it_could_leave_behind(client, db):
-    """And the braces. A database made before the AUTOINCREMENT — or a
-    future one that loses it — must not be left holding a judgement row or
-    a verdict for a command nobody can look up."""
+    """A database made before the AUTOINCREMENT — or a future one that
+    loses it — must not be left holding a judgement row or a verdict for a
+    command nobody can look up."""
     basil, cmd_id = furnished(client, db)
     with sqlite3.connect(db) as con:  # the judgement ledger row for that dose
         con.execute(
@@ -312,8 +308,8 @@ def test_the_delete_still_clears_the_ledger_it_could_leave_behind(client, db):
 
 
 def test_a_deleted_pots_readings_are_not_inherited_by_the_next_plant(client, db):
-    """The reason the whole rework exists: a new plant in a dead one's
-    socket must open its chart on its own soil, not on the dead one's."""
+    """A new plant in a dead one's socket must open its chart on its own
+    soil, not on the dead one's."""
     basil = pot(client, f"name=basil controller=0 channel=0 dry_raw={DRY} wet_raw={WET}")
     post(client, "/report", "c=0 t=1 ch0=8000")
     post(client, "/pot/delete", f"id={basil}")
@@ -336,7 +332,7 @@ def test_the_same_is_true_of_a_pot_that_was_only_buried(client, db):
     assert [p["raw"] for p in client.get(f"/history?pot={mint}").json()["points"]] == [
         7000
     ]
-    # And basil keeps its own, which is what the graveyard is for.
+    # basil keeps its own, which is what the graveyard is for
     assert [p["raw"] for p in client.get(f"/history?pot={basil}").json()["points"]] == [
         8000
     ]
