@@ -532,51 +532,38 @@ def test_the_latch_keeps_its_first_stamp_and_names_its_newest_reason(client, db)
     assert fresh["reason"] == "resetmid" and fresh["since"] > stamp
 
 
-def test_a_reset_under_a_standing_contra_names_the_reset(client, db):
+def test_a_reset_under_a_standing_contra_names_the_contra_first(client, db):
     # The contra latch lives in .noinit on the board and outlives a reset,
     # so a board that resets mid-dose while it stands says both on one
-    # report: ch207=1 still, and err= turning to resetmid. The reset is
-    # the one named: the edge is seen this once — status.err is resetmid
-    # from here on whatever is named — while the contra repeats on every
-    # report until `clear contra`, so after `dry off` and the resume it
-    # re-latches with its own words. Named the other way round, the reset
-    # hid for ever behind a step already taken (spec D12).
+    # report: ch207=1 still, and err= turning to resetmid. When more than
+    # one applies, contra, then dry, then resetmid: the contra's step
+    # comes first, and the stamp is the one the trouble began with. A
+    # board with ch211 on the wire carries the reset as the dry level,
+    # which names the latch once `clear contra` is typed (test_latches);
+    # on an older board the edge is seen this once, under the contra, and
+    # `clear contra` and the resume close the whole thing (spec A2).
     report(client, "c=0 ch0=1 float=0 pos=ok ch207=1")
     run_sql(db, "UPDATE status SET latched_ts = latched_ts - 60")
     stamp = health(client)["latched"]["since"]
     report(client, "c=0 ch0=1 float=0 pos=ok ch207=1 err=resetmid")
-    assert health(client)["latched"] == {"since": stamp, "reason": "resetmid"}
-    answer = post(client, "/command", "c=0 water=3 ml=50")
-    assert answer.status_code == 409
-    assert answer.text.rstrip().endswith(
-        "check the tank, type dry off on the board, then resume"
-    )
-    # Nobody has acted yet, and the board's next reports say both again:
-    # the contra on every one, err= sticky at resetmid. A repeat is not a
-    # new fault, so the reset stays named, with the same onset — renamed
-    # contra here, the reset hid one report after it was found.
-    report(client, "c=0 ch0=1 float=0 pos=ok ch207=1 err=resetmid")
-    report(client, "c=0 ch0=1 float=0 pos=ok ch207=1 err=resetmid")
-    assert health(client)["latched"] == {"since": stamp, "reason": "resetmid"}
-    answer = post(client, "/command", "c=0 water=3 ml=50")
-    assert answer.status_code == 409
-    assert answer.text.rstrip().endswith(
-        "check the tank, type dry off on the board, then resume"
-    )
-    # `dry off` typed and resumed; the contra still stands on the board,
-    # and it is the next latch, with its own step, then `clear contra`.
-    assert post(client, "/resume", "c=0").text == "resumed=0\n"
-    report(client, "c=0 ch0=1 float=0 pos=ok ch207=1 err=resetmid")
-    again = health(client)["latched"]
-    assert again["reason"] == "contra" and again["since"] > stamp
+    assert health(client)["latched"] == {"since": stamp, "reason": "contra"}
     answer = post(client, "/command", "c=0 water=3 ml=50")
     assert answer.status_code == 409
     assert answer.text.rstrip().endswith(
         "check the tank, type clear contra on the board, then resume"
     )
+    # The board's next reports say both again: the contra on every one,
+    # err= sticky at resetmid. A repeat is not a new fault.
+    report(client, "c=0 ch0=1 float=0 pos=ok ch207=1 err=resetmid")
+    report(client, "c=0 ch0=1 float=0 pos=ok ch207=1 err=resetmid")
+    assert health(client)["latched"] == {"since": stamp, "reason": "contra"}
+    # `clear contra` typed and resumed; err= still says resetmid, which
+    # on a board without ch211 is the reset already seen, not another.
     assert post(client, "/resume", "c=0").text == "resumed=0\n"
     report(client, "c=0 ch0=1 float=1 pos=ok err=resetmid")  # ch207 gone
+    report(client, "c=0 ch0=1 float=1 pos=ok err=resetmid")
     assert health(client)["latched"] is None
+    assert post(client, "/command", "c=0 water=3 ml=50").status_code == 200
 
 
 def test_a_latch_expires_what_was_waiting_and_refuses_new_water(client, db):
@@ -599,6 +586,7 @@ def test_the_latch_names_the_boards_word_for_its_reason(app, client, db, sent):
     words, as the app's map does (spec D12)."""
     assert butler.LATCH_STEP == {
         "contra": "type clear contra on the board",
+        "dry": "type dry off on the board",
         "resetmid": "type dry off on the board",
     }
     report(client, "c=0 ch0=1 float=1 pos=ok err=resetmid")
@@ -637,11 +625,12 @@ def test_the_latch_names_the_boards_word_for_its_reason(app, client, db, sent):
 
 def test_a_renamed_latch_pages_again_with_its_new_words(app, client, db, sent):
     """The latch: row's detail is the reason its page named, and a
-    standing latch whose reason changed — D12's overwrite, the reset
-    landing under a contra — pages again with the new words, floor or no
+    standing latch whose reason changed — D12's overwrite: the board
+    reset under a contra and `clear contra` was typed, leaving the dry
+    level the reason — pages again with the new words, floor or no
     floor: a person told "clear contra" must also be told "dry off". Once
     per name: the tick after that is quiet, and the row is one row (spec
-    D14 d)."""
+    D14 d, A2)."""
     report(client, "c=0 ch0=1 float=1 pos=ok ch207=1")
     tick(app)
     assert keys(sent) == ["latch:0"] and "type clear contra" in sent[0].message
@@ -650,13 +639,17 @@ def test_a_renamed_latch_pages_again_with_its_new_words(app, client, db, sent):
     ]
     tick(app)
     assert keys(sent) == ["latch:0"]  # the same name is not news
-    report(client, "c=0 ch0=1 float=1 pos=ok ch207=1 err=resetmid")  # the reset, under it
-    assert health(client)["latched"]["reason"] == "resetmid"
+    report(client, "c=0 ch0=1 float=1 pos=ok ch207=1 ch211=1 err=resetmid")  # the reset, under it
+    assert health(client)["latched"]["reason"] == "contra"  # its step comes first
+    tick(app)
+    assert keys(sent) == ["latch:0"]
+    report(client, "c=0 ch0=1 float=1 pos=ok ch207=0 ch211=1 err=resetmid")  # clear contra typed
+    assert health(client)["latched"]["reason"] == "dry"
     tick(app)
     assert keys(sent) == ["latch:0", "latch:0"]
     assert sent[1].priority == "high" and "type dry off on the board" in sent[1].message
     assert run_sql(db, "SELECT detail FROM alerts WHERE key = 'latch:0'") == [
-        ("resetmid",)
+        ("dry",)
     ]
     tick(app)
     assert keys(sent) == ["latch:0", "latch:0"]  # once per name
@@ -692,7 +685,8 @@ def test_a_latch_standing_through_the_upgrade_is_named_and_not_paged_again(clien
     tick(upgraded)
     tick(upgraded)
     assert keys(sent) == []  # nothing about the fault changed
-    report(TestClient(upgraded), "c=0 ch0=1 float=1 pos=ok ch207=1 err=resetmid")
+    # `clear contra` typed with the board's dry level standing: renamed.
+    report(TestClient(upgraded), "c=0 ch0=1 float=1 pos=ok ch207=0 ch211=1")
     tick(upgraded)
     assert keys(sent) == ["latch:0"] and "type dry off on the board" in sent[0].message
 

@@ -1,8 +1,10 @@
 """Latches on the wire (0.20.0): the board's flap and dry latches arrive
 as ch210 and ch211 beside ch207's contra, the backend latches on levels
-(the dry one under the resetmid words), /health and the stale page tell
-the flap apart, and a tap answers the flap for one dose (spec
-2026-09-07-latches-on-the-wire, section 2)."""
+(the dry one with reason `dry`, the reset's edge consulted beside it),
+/health and the stale page tell the flap apart, and a tap answers the
+flap for one dose — a try that waits out no refusal's cooldown and is
+paged for only once refused (spec 2026-09-07-latches-on-the-wire,
+sections 2 and 5)."""
 
 import sqlite3
 
@@ -13,14 +15,17 @@ from butler import FLAP_WINDOW_S, PERSIST_S, SOAK_S, create_app
 from test_tank import (  # the fixtures and the tank's own moves, shared
     DRY,
     TOKEN,
+    WET,
     age,
     alerts,
     app,  # noqa: F401 — a fixture
     client,  # noqa: F401 — a fixture
     db,  # noqa: F401 — a fixture
+    dose,
     dry_reports,
     health,
     keys,
+    learn_the_tank,
     make_pot,
     post,
     report,
@@ -57,25 +62,32 @@ def flapped(client, n=1):
     return text
 
 
+def pages(sent, key):
+    """What was sent under `key`, in order: the float and dose pages a
+    walk earns on the side are not the subject."""
+    return [a.message for a in sent if a.key == key and a.message is not None]
+
+
 # --------------------------------------------------------------------------- #
 # The dry latch is a level (spec D1)
 # --------------------------------------------------------------------------- #
 
 
 def test_ch211_latches_the_backend_dry_as_ch207_latches_contra(app, client, db, sent):
-    """The board's dry latch — set by a reset with a dose in flight,
-    cleared only by `dry off` — is on the wire as ch211, a level like
-    ch207, and latches the backend under the resetmid words: the 409,
-    the page, the queued dose expired, and the level re-asserting the
-    latch on every report until the human resumes (spec D1)."""
+    """The board's dry latch — set by a reset with a dose in flight or by
+    `dry on` at the console, cleared only by `dry off` — is on the wire
+    as ch211, a level like ch207, and latches the backend with reason
+    `dry` and its own words: the 409, the page, the queued dose expired,
+    and the level re-asserting the latch on every report until the human
+    resumes (spec D1, A2)."""
     assert post(client, "/command", "c=0 water=3 ml=50").status_code == 200
     report(client, "c=0 ch0=1 float=1 pos=ok ch211=1")
     latched = health(client)["latched"]
-    assert latched["reason"] == "resetmid" and latched["since"] > 0
+    assert latched["reason"] == "dry" and latched["since"] > 0
     assert run_sql(db, "SELECT state FROM commands") == [("expired",)]
     answer = post(client, "/command", "c=0 water=3 ml=50")
     assert answer.status_code == 409
-    assert answer.text.startswith("refused: board 0 stopped watering (resetmid since ")
+    assert answer.text.startswith("refused: board 0 stopped watering (dry since ")
     assert answer.text.rstrip().endswith(
         "check the tank, type dry off on the board, then resume"
     )
@@ -83,8 +95,9 @@ def test_ch211_latches_the_backend_dry_as_ch207_latches_contra(app, client, db, 
     assert keys(sent) == ["latch:0"]
     assert sent[0].priority == "high"
     assert sent[0].message == (
-        "board 0 stopped watering: it reset with the pump running — check the "
-        "tank, type dry off on the board, then resume in the app"
+        "board 0 stopped watering: the board is held dry: a reset with the pump "
+        "running, or dry on at the console — check the tank, type dry off on the "
+        "board, then resume in the app"
     )
     # A level: the board repeats it on every report, and a repeat is not
     # a new fault — the stamp and the name stay, and the page is not news.
@@ -92,7 +105,7 @@ def test_ch211_latches_the_backend_dry_as_ch207_latches_contra(app, client, db, 
     stamp = health(client)["latched"]["since"]
     report(client, "c=0 ch0=1 float=1 pos=ok ch211=1")
     report(client, "c=0 ch0=1 float=1 pos=ok ch211=1")
-    assert health(client)["latched"] == {"since": stamp, "reason": "resetmid"}
+    assert health(client)["latched"] == {"since": stamp, "reason": "dry"}
     tick(app)
     assert keys(sent) == ["latch:0"]
     # Resumed before `dry off` is typed: the level re-latches on the next
@@ -101,13 +114,13 @@ def test_ch211_latches_the_backend_dry_as_ch207_latches_contra(app, client, db, 
     assert health(client)["latched"] is None
     report(client, "c=0 ch0=1 float=1 pos=ok ch211=1")
     again = health(client)["latched"]
-    assert again["reason"] == "resetmid" and again["since"] > stamp
+    assert again["reason"] == "dry" and again["since"] > stamp
     tick(app)
     assert keys(sent) == ["latch:0", "latch:0"]
     # `dry off` typed: the level goes, the latch stands until the human
     # resumes, and stays down after.
     report(client, "c=0 ch0=1 float=1 pos=ok ch211=0")
-    assert health(client)["latched"]["reason"] == "resetmid"
+    assert health(client)["latched"]["reason"] == "dry"
     assert post(client, "/resume", "c=0").text == "resumed=0\n"
     report(client, "c=0 ch0=1 float=1 pos=ok ch211=0")
     assert health(client)["latched"] is None
@@ -121,7 +134,7 @@ def test_both_levels_name_contra_first_and_the_dry_latch_after_the_resume(
     every report, ch207=1 and ch211=1 (and err=resetmid, sticky). The
     contra is the reason: its step comes first. Once `clear contra` is
     typed and ch207 goes, the dry level still stands, and after the
-    resume it latches again with its own words (spec D1)."""
+    resume it latches again with its own words (spec D1, A2)."""
     report(client, "c=0 ch0=1 float=1 pos=ok ch207=1 ch211=1 err=resetmid")
     assert health(client)["latched"]["reason"] == "contra"
     answer = post(client, "/command", "c=0 water=3 ml=50")
@@ -141,7 +154,7 @@ def test_both_levels_name_contra_first_and_the_dry_latch_after_the_resume(
     assert post(client, "/resume", "c=0").text == "resumed=0\n"
     report(client, "c=0 ch0=1 float=1 pos=ok ch207=0 ch211=1 err=resetmid")  # clear contra typed
     again = health(client)["latched"]
-    assert again["reason"] == "resetmid" and again["since"] > stamp
+    assert again["reason"] == "dry" and again["since"] > stamp
     tick(app)
     assert keys(sent) == ["latch:0", "latch:0"]
     assert sent[1].priority == "high"
@@ -169,12 +182,12 @@ def test_clear_contra_under_both_levels_renames_the_standing_latch(app, client, 
     run_sql(db, "UPDATE status SET latched_ts = latched_ts - 60")
     stamp = health(client)["latched"]["since"]
     report(client, "c=0 ch0=1 float=1 pos=ok ch207=0 ch211=1")
-    assert health(client)["latched"] == {"since": stamp, "reason": "resetmid"}
+    assert health(client)["latched"] == {"since": stamp, "reason": "dry"}
     tick(app)
     assert keys(sent) == ["latch:0", "latch:0"]
     assert "type dry off on the board" in sent[1].message
     assert run_sql(db, "SELECT detail FROM alerts WHERE key = 'latch:0'") == [
-        ("resetmid",)
+        ("dry",)
     ]
     tick(app)
     assert keys(sent) == ["latch:0", "latch:0"]  # once per name
@@ -185,26 +198,144 @@ def test_clear_contra_under_both_levels_renames_the_standing_latch(app, client, 
     assert alerts(client) == ["latch:0"]
 
 
-def test_the_resetmid_edge_stays_only_for_a_board_that_sends_no_ch211(client):
-    """An older board carries no ch211: err= turning to resetmid is still
-    the edge that latches it. A board that carries ch211=0 is a board
-    saying it is not dry, and the edge is not consulted; one that
-    carries ch211=1 latches on the level, whatever err= does (spec D1)."""
+def test_the_resetmid_edge_is_consulted_on_every_report(client):
+    """err= turning to resetmid is the reset's edge, consulted on every
+    report, level or no level: an older board carries no ch211 and says
+    a reset with nothing else, and a board that carries ch211=0 may be
+    one whose `dry off` was typed before its first post-reset report —
+    read as "not dry, nothing to see", that reset hid for good. One that
+    carries ch211=1 latches on the level, `dry` before `resetmid`,
+    whatever err= does; and a sticky err= is no edge (spec A2)."""
     report(client, "c=0 ch0=1 float=1 pos=ok err=range")
     report(client, "c=0 ch0=1 float=1 pos=ok err=resetmid")
     assert health(client)["latched"]["reason"] == "resetmid"
     report(client, "c=1 ch0=1 float=1 pos=ok ch211=0 err=range")
     report(client, "c=1 ch0=1 float=1 pos=ok ch211=0 err=resetmid")
-    assert health(client, 1)["latched"] is None
+    assert health(client, 1)["latched"]["reason"] == "resetmid"
     report(client, "c=2 ch0=1 float=1 pos=ok ch211=0 err=resetmid")  # a first report
-    assert health(client, 2)["latched"] is None
+    assert health(client, 2)["latched"]["reason"] == "resetmid"
     report(client, "c=3 ch0=1 float=1 pos=ok ch211=1 err=resetmid")
-    assert health(client, 3)["latched"]["reason"] == "resetmid"
+    assert health(client, 3)["latched"]["reason"] == "dry"
     assert post(client, "/resume", "c=3").text == "resumed=3\n"
     # `dry off` typed; err= is sticky at resetmid and says nothing more.
     report(client, "c=3 ch0=1 float=1 pos=ok ch211=0 err=resetmid")
     report(client, "c=3 ch0=1 float=1 pos=ok ch211=0 err=resetmid")
     assert health(client, 3)["latched"] is None
+
+
+def test_dry_off_typed_before_the_first_post_reset_report_latches_on_the_edge(
+    app, client, sent
+):
+    """Bring-up 7c, exactly: the board resets with the pump running and
+    `dry off` is typed at the console before its first report after the
+    reset. That report carries ch211=0 and err=resetmid — no level, the
+    edge alone — and the edge latches, with the reset's own words in the
+    409 and on the page; the board's next reports repeat the error, and
+    after the resume the latch stays down (spec A2)."""
+    report(client, "c=0 ch0=1 float=1 pos=ok ch211=0")
+    report(client, "c=0 ch0=1 float=1 pos=ok ch211=0 err=resetmid")
+    latched = health(client)["latched"]
+    assert latched["reason"] == "resetmid" and latched["since"] > 0
+    answer = post(client, "/command", "c=0 water=3 ml=50")
+    assert answer.status_code == 409
+    assert answer.text.startswith("refused: board 0 stopped watering (resetmid since ")
+    assert answer.text.rstrip().endswith(
+        "check the tank, type dry off on the board, then resume"
+    )
+    tick(app)
+    assert keys(sent) == ["latch:0"]
+    assert sent[0].message == (
+        "board 0 stopped watering: it reset with the pump running — check the "
+        "tank, type dry off on the board, then resume in the app"
+    )
+    report(client, "c=0 ch0=1 float=1 pos=ok ch211=0 err=resetmid")
+    assert health(client)["latched"]["reason"] == "resetmid"
+    assert post(client, "/resume", "c=0").text == "resumed=0\n"
+    report(client, "c=0 ch0=1 float=1 pos=ok ch211=0 err=resetmid")
+    assert health(client)["latched"] is None
+    assert post(client, "/command", "c=0 water=3 ml=50").status_code == 200
+
+
+def test_a_contra_alone_on_a_board_that_says_it_is_not_dry_latches_contra(
+    app, client, db, sent
+):
+    """A board with ch211 on the wire whose contra trips says ch207=1
+    ch211=0: the contra alone, on a board saying it is not dry. It
+    latches contra with the contra words, the level re-asserts it, and
+    `clear contra` typed — ch207 going, ch211 still 0 — leaves the latch
+    standing under its name until the human resumes, and down after
+    (spec D1, A2)."""
+    report(client, "c=0 ch0=1 float=1 pos=ok ch207=1 ch211=0")
+    latched = health(client)["latched"]
+    assert latched["reason"] == "contra" and latched["since"] > 0
+    answer = post(client, "/command", "c=0 water=3 ml=50")
+    assert answer.status_code == 409
+    assert answer.text.startswith("refused: board 0 stopped watering (contra since ")
+    assert answer.text.rstrip().endswith(
+        "check the tank, type clear contra on the board, then resume"
+    )
+    tick(app)
+    assert keys(sent) == ["latch:0"]
+    assert sent[0].message == (
+        "board 0 stopped watering: the float said full and the meter saw "
+        "nothing — check the tank, type clear contra on the board, then resume "
+        "in the app"
+    )
+    run_sql(db, "UPDATE status SET latched_ts = latched_ts - 60")
+    stamp = health(client)["latched"]["since"]
+    report(client, "c=0 ch0=1 float=1 pos=ok ch207=1 ch211=0")
+    assert health(client)["latched"] == {"since": stamp, "reason": "contra"}
+    report(client, "c=0 ch0=1 float=1 pos=ok ch207=0 ch211=0")  # clear contra typed
+    assert health(client)["latched"] == {"since": stamp, "reason": "contra"}
+    tick(app)
+    assert keys(sent) == ["latch:0"]
+    assert post(client, "/resume", "c=0").text == "resumed=0\n"
+    report(client, "c=0 ch0=1 float=1 pos=ok ch207=0 ch211=0")
+    assert health(client)["latched"] is None
+    assert post(client, "/command", "c=0 water=3 ml=50").status_code == 200
+
+
+def test_a_dead_float_waits_behind_the_boards_own_dry_level(app, client, db, sent):
+    """status.dry's consumer, the alerts' quiet gate: a /resume before
+    `dry off` is typed lifts the backend's latch and not the board's,
+    which keeps saying ch211=1, and the latch page already says what to
+    do — no stale: page while the level stands. The tick after a report
+    without it pages the float as before (spec A2)."""
+    report(client, "c=0 ch0=1 float=1 pos=ok")
+    report(client, "c=0 ch0=1 float=0 pos=ok ch211=1")
+    tick(app)
+    assert keys(sent) == ["latch:0"] and "type dry off" in sent[0].message
+    age(db, FLAP_WINDOW_S + 1)
+    tap(client, db)  # with the float saying empty
+    age(db, PERSIST_S - 60)
+    report(client, "c=0 ch0=1 float=0 pos=ok ch211=1")  # a word, its minutes on
+    assert post(client, "/resume", "c=0").status_code == 200
+    tick(app)
+    assert keys(sent) == ["latch:0"]  # the board still says ch211=1
+    age(db, FLAP_WINDOW_S + 1)  # one more sighting of empty is slosh, not a flap
+    report(client, "c=0 ch0=1 float=0 pos=ok ch211=0")  # dry off typed, still empty
+    tick(app)
+    assert keys(sent) == ["latch:0", "stale:0"]
+
+
+def test_over_waits_behind_the_boards_own_dry_level(app, client, db, sent):
+    """The same gate for the dangerous page: resumed with ch211=1 still
+    on the wire, the board is the latch page's business, not a stuck
+    float's, until `dry off` is typed (spec A2)."""
+    learn_the_tank(app, client, db, sent, 200)
+    tap(client, db)
+    dose(client, 250)
+    report(client, "c=0 ch0=1 float=1 pos=ok ch211=1")
+    assert health(client)["over"] == 1  # the fact stands
+    tick(app)
+    tick(app)
+    assert keys(sent) == ["latch:0"]
+    assert post(client, "/resume", "c=0").status_code == 200
+    tick(app)
+    assert keys(sent) == ["latch:0"]  # resumed, but the board still says ch211=1
+    report(client, "c=0 ch0=1 float=1 pos=ok ch211=0")  # dry off typed
+    tick(app)
+    assert keys(sent) == ["latch:0", "over:0"]
 
 
 def test_status_keeps_the_boards_three_latches_from_its_latest_report(client, db):
@@ -257,11 +388,22 @@ def stuck_at_empty_after_a_tap(client, db, extra=""):
 def test_the_stale_page_names_the_flap_when_the_board_says_it_tripped(
     app, client, db, sent
 ):
+    """The tap made after the flap tripped answers it, and while its try
+    is to come — not yet handed, or with the board — the page would tell
+    the person to do what they just did: nothing. Refused, the tap is
+    spent, and the page says what tripped and what to do (spec D2, A1)."""
     tapped = stuck_at_empty_after_a_tap(client, db, "ch210=1")
     tick(app)
-    assert keys(sent) == ["stale:0"]
-    assert sent[0].priority == "high"
-    assert sent[0].message == (
+    assert pages(sent, "stale:0") == []  # the tap answers the flap: its try is pending
+    assert post(client, "/command", "c=0 water=3 ml=50").status_code == 200
+    assert "cmd=1 water=3 ml=50" in flapped(client)
+    tick(app)
+    assert pages(sent, "stale:0") == []  # with the board
+    report(client, f"c=0 ch0={DRY} float=0 pos=ok ch210=1 ack=1 flow_ml=0 err=float")
+    tick(app)
+    (alert,) = [a for a in sent if a.key == "stale:0"]
+    assert alert.priority == "high"
+    assert alert.message == (
         f"the float on board 0 still says empty 3 min after the refill at "
         f"{butler.hhmm(tapped)}: the board's own float check tripped — refill to "
         "the top and tap refilled, and the butler will try one dose"
@@ -466,6 +608,118 @@ def test_water_handed_in_the_taps_own_second_spends_it(client, db):
 
 
 # --------------------------------------------------------------------------- #
+# The tap's try waits out no refusal's cooldown, and is paged for only
+# once refused (spec A1)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_taps_try_does_not_wait_out_the_refusals_cooldown(app, client, db, sent):
+    """The flap trips on refusals, and a refusal is an acked dose with
+    flow_ml=0, which the cooldown counts as water: the try the tap bought
+    waited six hours while the page told the person to do what they had
+    just done. Three refusals at the line trip the flap; the person
+    refills and taps; the very next report is handed the try, the last
+    refusal well inside the cooldown, and no stale page comes between.
+    Refused, the ack spends the tap, the refusal cools the pot as before,
+    and the tripped text pages on the next tick; the float saying full
+    afterwards is all normal (spec A1)."""
+    make_pot(client, cooldown_h=6, daily_cap_ml=100_000)
+    assert "cmd=1 water=3 ml=100" in dry_reports(client)  # handed on the fifth
+    for cmd_id in (1, 2):
+        # The word says full — the float is at the line — and the board's
+        # own check at dose time says otherwise: a refusal, which cools
+        # the pot as a dose does (a pot the board refuses for ever must
+        # not be asked at report pace), and the cooldown out, the next.
+        text = report(
+            client, f"c=0 ch0={DRY} float=1 pos=ok ack={cmd_id} flow_ml=0 err=float"
+        ).text
+        assert "cmd=" not in text
+        assert "cmd=" not in dry_reports(client)
+        age(db, 6 * 3600 + 1)
+        assert f"cmd={cmd_id + 1} water=3 ml=100" in dry_reports(client, n=1)
+    # The third refusal trips the flap: the board forces its word to 0
+    # and says why. Inside the cooldown, and dry either way.
+    text = report(
+        client, f"c=0 ch0={DRY} float=0 pos=ok ch210=1 ack=3 flow_ml=0 err=float"
+    ).text
+    assert "cmd=" not in text and health(client)["flap"] == 1
+    assert "cmd=" not in flapped(client)
+    assert rules_water(db) == [(1,), (2,), (3,)]
+    age(db, 60)
+    tap(client, db)  # refilled to the top, and said so
+    tick(app)
+    assert pages(sent, "stale:0") == []
+    assert "cmd=4 water=3 ml=100" in flapped(client)  # the try, the refusal minutes old
+    assert rules_water(db) == [(1,), (2,), (3,), (4,)]
+    age(db, PERSIST_S)  # the tap is its minutes old: what stale: waits for
+    text = report(
+        client, f"c=0 ch0={DRY} float=0 pos=ok ch210=1 ack=4 flow_ml=0 err=float"
+    ).text
+    assert "cmd=" not in text
+    assert "cmd=" not in flapped(client)  # the tap spent, the refusal cooling the pot
+    tick(app)
+    tapped = taps(db)[-1]
+    assert pages(sent, "stale:0") == [
+        f"the float on board 0 still says empty 4 min after the refill at "
+        f"{butler.hhmm(tapped)}: the board's own float check tripped — refill to "
+        "the top and tap refilled, and the butler will try one dose"
+    ]
+    report(client, f"c=0 ch0={DRY} float=1 pos=ok ch210=0")  # the float rose: normal
+    assert health(client)["flap"] == 0
+    tick(app)
+    assert pages(sent, "stale:0")[-1] == "the float on board 0 moved"
+    assert "cmd=" not in dry_reports(client)  # the refusal's cooldown, as before
+    age(db, 6 * 3600 + 1)
+    assert "cmd=5 water=3 ml=100" in dry_reports(client, n=1)  # on the word itself
+
+
+def test_no_stale_page_while_the_taps_try_is_pending(app, client, db, sent):
+    """The tap buys a try the rules make when they next would — a pot
+    above its target waits — and until then the page would tell the
+    person to refill and tap, which they just did. Skipped while the tap
+    answers the flap and while its try is with the board: the float is
+    dead by every other measure, and nothing pages; refused, it does
+    (spec A1)."""
+    make_pot(client, cooldown_h=0, daily_cap_ml=100_000)
+    report(client, f"c=0 ch0={WET} float=1 pos=ok")
+    report(client, f"c=0 ch0={WET} float=1 pos=ok")
+    report(client, f"c=0 ch0={WET} float=0 pos=ok ch210=1")  # tripped
+    report(client, f"c=0 ch0={WET} float=0 pos=ok ch210=1")
+    age(db, 60)
+    tap(client, db)
+    age(db, PERSIST_S)
+    report(client, f"c=0 ch0={WET} float=0 pos=ok ch210=1")  # its minutes on; not dry
+    assert rules_water(db) == []
+    with sqlite3.connect(db) as con:
+        assert butler.float_dead(con, 0, butler.latest_refill(con, 0)) is not None
+    tick(app)
+    assert pages(sent, "stale:0") == []
+    flapped(client, n=2)
+    assert "cmd=1 water=3 ml=100" in flapped(client)  # dry at last: the try
+    tick(app)
+    assert pages(sent, "stale:0") == []  # with the board
+    report(client, f"c=0 ch0={DRY} float=0 pos=ok ch210=1 ack=1 flow_ml=0 err=float")
+    tick(app)
+    assert len(pages(sent, "stale:0")) == 1
+    assert "the board's own float check tripped" in pages(sent, "stale:0")[0]
+
+
+def test_the_flap_path_wants_the_boards_word_of_zero(client, db):
+    """The flap forces the board's word to 0, and that word is what the
+    tap answers: a report that omits float= under ch210=1 says nothing
+    the tap can answer and hands no try — an omitted float= is dry here
+    as everywhere (spec A1)."""
+    make_pot(client, cooldown_h=0, daily_cap_ml=100_000)
+    dry_reports(client, n=4)
+    assert "cmd=" not in flapped(client)
+    age(db, FLAP_WINDOW_S + 1)
+    tap(client, db)
+    assert "cmd=" not in report(client, f"c=0 ch0={DRY} pos=ok ch210=1").text
+    assert rules_water(db) == []
+    assert "cmd=1 water=3 ml=100" in flapped(client)
+
+
+# --------------------------------------------------------------------------- #
 # The migration
 # --------------------------------------------------------------------------- #
 
@@ -502,4 +756,4 @@ def test_an_existing_database_grows_the_three_columns_at_startup(db):
     assert run_sql(db, "SELECT flap, dry FROM status") == [(1, 1)]
     assert flap_since(db) > 5
     entry = health(client)
-    assert entry["flap"] == 1 and entry["latched"]["reason"] == "resetmid"
+    assert entry["flap"] == 1 and entry["latched"]["reason"] == "dry"

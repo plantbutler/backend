@@ -85,7 +85,7 @@ curl -s -X POST http://localhost:8000/refill \
 curl -s -X POST http://localhost:8000/resume \
   -H 'X-Token: dev' --data-binary 'c=0'
 # -> resumed=0                (lifts the backend's latch; the board's own word is `clear contra`,
-#                              or `dry off` after a reset mid-dose — the refusal and the page say which)
+#                              or `dry off` for a board held dry — the refusal and the page say which)
 ```
 
 Tell it what hangs where. A bare `name=` creates a pot and mints its id; the answer carries
@@ -255,15 +255,16 @@ empty) or `pos=unknown` (manifold lost) seen twice inside ten minutes — one bl
 is an empty tank; a safety field that vanished after the board had been sending it; a dose that
 was never acked (immediately), came up short on the meter, or did not raise moisture a soak
 later; a learning proposal waiting for approval (one nudge per hose per day); a board that
-stopped itself — `ch207=1`, the float said full and the meter saw nothing, or `ch211=1`, it
-reset with the pump running and is latched dry until `dry off` is typed (both are levels, sent
-while they stand; a board that sends no `ch211` says it with `err=` turning to `resetmid`
-instead — `err=` is the board's sticky last error, so only the change counts) — which latches
-the butler too: no rule waters it and `POST /command` refuses a dose until `POST /resume`, and
-that one pages high every time, floor or no floor, naming the board's own word to type first
-(`clear contra`, or `dry off` after a reset mid-dose, which the board latches dry and `clear
-contra` does not touch — `clear contra` first when both stand, and once it is typed the page
-comes again with `dry off`); a float
+stopped itself — `ch207=1`, the float said full and the meter saw nothing, or `ch211=1`, it is
+held dry, by a reset with the pump running or by `dry on` at its console, until `dry off` is
+typed (both are levels, sent while they stand; `err=` turning to `resetmid` says a reset on
+its own — `err=` is the board's sticky last error, so only the change counts — which is how a
+board whose `dry off` was typed before its first report after the reset, or one that sends no
+`ch211`, is heard) — which latches the butler too: no rule waters it and `POST /command`
+refuses a dose until `POST /resume`, and that one pages high every time, floor or no floor,
+naming the board's own word to type first (`clear contra`, or `dry off` for a board held dry,
+which `clear contra` does not touch — `clear contra` first when both stand, and once it is
+typed the page comes again with `dry off`); a float
 presumed stuck — still saying full after more than the tank holds (plus a tenth) has been pumped
 since the refill you recorded, or since the float last rose if it had gone empty since that tap (a
 tank run down and refilled by someone who forgot to tap restarts the count: the float demonstrably
@@ -277,11 +278,14 @@ at the phone still goes: the board's own float check runs); or still saying empt
 three minutes or more after a tap made with it empty — either the board's own float check tripped
 (`ch210=1`: three float refusals in a row, after which it forces `float=0` until a dose is
 granted), and the page says to refill to the top and tap refilled, since a tap made after the
-check tripped buys the rules one dose to try — the board re-checks its float at dose time, and a
-refusal spends the tap — or, with no `ch210` on the wire, a float presumed stuck at empty: look
-at the magnet — a page and nothing more, since the rules are dry on empty already; neither while
-the board's latch stands, nor while its last report still
-carried `ch207=1` (a resume before `clear contra` is typed lifts the one and not the other); and
+check tripped buys the rules one dose to try, at once — the refusals that tripped the check are
+not water to that pot's cooldown while the tap stands answered — and no page while that try is
+still to come (it would say to do what you just did); the board re-checks its float at dose
+time, and a refusal spends the tap and brings the page — or, with no `ch210` on the wire, a
+float presumed stuck at empty: look at the magnet — a page and nothing more, since the rules are
+dry on empty already; neither while the board's latch stands, nor while its last report still
+carried `ch207=1` or `ch211=1` (a resume before `clear contra` or `dry off` is typed lifts the
+one and not the other); and
 each time the float closes a measurement of the tank — what the meter counted between your tap
 and the first time the float said empty, twice running, after it, on a board neither latched nor
 sending `ch207=1` nor retired (the empty a contra forces is a fault, not a run's end, and the float

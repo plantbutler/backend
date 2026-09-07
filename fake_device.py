@@ -111,8 +111,8 @@ def main():
     ap.add_argument(
         "--err",
         metavar="TOKEN",
-        help="the board's last safety error, on every report (resetmid latches a "
-        "board that sends no ch211; contra never does — ch207 is the latch)",
+        help="the board's last safety error, on every report (err= turning to "
+        "resetmid latches, ch211 or no ch211; contra never does — ch207 is the latch)",
     )
     ap.add_argument(
         "--contra",
@@ -136,7 +136,7 @@ def main():
         "--dry",
         action="store_true",
         help="the board's dry latch stands (ch211=1 on every report; latches the "
-        "backend under the dry off words)",
+        "backend with reason dry, the dry off step)",
     )
     args = ap.parse_args()
     if not args.token:
