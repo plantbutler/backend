@@ -1198,9 +1198,6 @@ def parse_doses(params: QueryParams) -> tuple[str | None, int, int | None, int]:
     a second — a cursor on the timestamp alone would skip or repeat them.
     The commands table is never pruned, so without this the older history
     would be permanently out of reach behind the newest `limit` rows.
-
-    Same query-parameter strictness as /history, and the same plain-text
-    refusal.
     """
 
     def one(key: str, default: str | None = None) -> str | None:
@@ -3380,22 +3377,17 @@ def create_app(
         """Drop the hose-keyed alerts a pot leaves behind when it lets go of
         its wiring — by being buried or by being erased.
 
-        `sensor:<c>:<ch>` is the one that matters, and it is unclearable
-        without this. Both its raise AND its clear live inside a loop over
-        pots_now (see the sensor rule), so once the pot is gone or buried
-        neither branch can ever run again: the row would sit in /health for
-        ever and keep inflating the daily up-probe count, which leaves out
-        ONE_SHOT_KEYS but not sensor:.
-        `proposal:<c>:<outlet>` is the same shape and cheap to take with it,
-        and without it the next pot on that hose inherits up to a day of
-        nudge silence.
+        `sensor:<c>:<ch>` is unclearable without this: both its raise and its
+        clear live inside a loop over pots_now, so once the pot is gone or
+        buried neither branch can run again and the row sits in /health for
+        ever, inflating the daily up-probe count that leaves out ONE_SHOT_KEYS
+        but not sensor:. `proposal:<c>:<outlet>` is the same shape, and
+        without it the next pot on that hose inherits a day of nudge silence.
 
-        Only when nobody alive is left on that pair — another pot may hold
-        the channel or the outlet, and its alarm is not this pot's to clear.
-
-        Removing a row is SILENT: no `cleared` goes to the phone, unlike
-        clear(). That is the right answer for a condition nobody owns any
-        more, and it is chosen here rather than discovered later.
+        Only when nobody alive is left on that pair: another pot may hold the
+        channel or the outlet, and its alarm is not this pot's to clear.
+        Removing a row is SILENT, unlike clear() — no `cleared` reaches the
+        phone, which is the right answer for a condition nobody owns.
         """
         for key, col, value in (
             (f"sensor:{controller}:{channel}", "m.channel", channel),
@@ -3423,15 +3415,14 @@ def create_app(
         hose-keyed cooldown and cap floors, so for up to a day the next pot on
         that hose can be watered sooner than the dry direction wants.
 
-        Order is forced by reachability, not by foreign keys — there are
-        none in this database and nothing cascades. The verdicts and the
-        `dose:<id>` ledger rows must go BEFORE the commands they are found
-        through, and both must go at all: commands.id is a rowid alias with
-        no AUTOINCREMENT, so sqlite hands the same ids out again. A
-        leftover verdict would then label a stranger's dose, and a leftover
-        dose: row would make the judgement loop skip a real dose for ever
-        on its NOT EXISTS guard — a silent hole in "tell me when it's
-        wrong", which is the worst kind of leftover this file can have.
+        Order is forced by reachability: there are no foreign keys in this
+        database and nothing cascades, so the verdicts and the `dose:<id>`
+        ledger rows must go BEFORE the commands they are found through. Both
+        must go at all, because a leftover verdict labels a stranger's dose
+        and a leftover dose: row makes the judgement loop skip a real dose for
+        ever on its NOT EXISTS guard — a silent hole in "tell me when it's
+        wrong". commands.id is AUTOINCREMENT so no id is handed out twice,
+        which is the belt to this pair of braces.
         """
         with connect() as con:
             con.execute("BEGIN IMMEDIATE")
