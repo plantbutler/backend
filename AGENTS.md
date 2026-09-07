@@ -72,7 +72,8 @@ watering.
   too_little per executed dose), `GET /health` (count, last ts, the default interval, per-controller
   heartbeat/knob/open command/safety fields — since 0.18.0 also `err`, `err_ts`, `pos_ok_seen`,
   `retired`, `latched` (`{since, reason}` or null) and `last_refill`, since 0.19.0 `tank_ml`,
-  `tank_samples`, `pumped_ml` and `over` — raised alerts), `GET /hello` (`butler=<VERSION>`, or
+  `tank_samples`, `pumped_ml` and `over`, since 0.20.0 `flap` — raised alerts), `GET /hello`
+  (`butler=<VERSION>`, or
   401 — the one gated route that neither writes nor reads the database, so a phone being set up can
   tell a wrong address from a wrong token, and a butler whose volume came unmounted can still say
   the token was wrong. `VERSION` lives in butler.py because the container installs no package; a
@@ -133,7 +134,9 @@ watering.
 - **The tank (0.18.0, pitch "Trust the tank").** The board's `err=` is stored on `status` (last
   value — a short token, digits included, since the I2C refusal's is `i2c` — and `err_ts` = when
   it last *changed*: the board repeats its last error on every report).
-  `ch207=1` latches the backend, and so does `err=` *turning to* `resetmid` — an edge, never a
+  `ch207=1` latches the backend, and since 0.20.0 so does `ch211=1`, the board's dry latch,
+  under the `resetmid` words — levels both, sent while they stand (see the 0.20.0 bullet). A
+  board that sends no `ch211` says a reset with `err=` *turning to* `resetmid` — an edge, never a
   level, and `err=contra` never latches: `err=` is sticky and `clear contra` on the console never
   touches it, so a level would re-latch a resumed board forever. A latch: `water_rules` goes dry,
   `POST /command water=` answers 409, the queued dose expires, and `latch:<c>` pages high without
@@ -143,9 +146,11 @@ watering.
   pump running, which the firmware latches dry and `clear contra` does not touch, the contra
   words for a reason neither knows. A second fault landing while the latch stands overwrites
   the reason and keeps the stamp: the newest fault is the one to fix, and a fault the board
-  merely repeats is not a second one; both on one report name `resetmid`, the edge seen this
-  once — the contra level re-asserts the latch under that name until the resume, then
-  re-latches with its own words. The `latch:<c>` row's `detail` is the reason its page named,
+  merely repeats is not a second one; both on one report name `resetmid` on a board without
+  `ch211`, the edge seen this once — the contra level re-asserts the latch under that name
+  until the resume, then re-latches with its own words — and `contra` on a board with it, the
+  step that comes first, `ch207` going while `ch211` stands renaming the latch `resetmid`. The
+  `latch:<c>` row's `detail` is the reason its page named,
   and a standing latch whose reason changed pages again with the new words, floor or no floor:
   a person told `clear contra` must also be told `dry off`. The float
   going empty does not latch: the rules already refuse on it. `POST /refill` records a human
@@ -161,7 +166,7 @@ watering.
   latch is) and risen strictly later: a float that went
   1 → 0 → 1 since the tap is a tank refilled by someone who forgot to tap; a rise with no drop
   since the tap is the tap's own refill reaching the float, a `clear contra` after a tap, the
-  manual dose lifting the flap, and the tap stands; one that said nothing once has not moved;
+  dose lifting the flap, and the tap stands; one that said nothing once has not moved;
   and a second drain keeps the rise rather than falling back to the tap — and the stuck-at-empty
   rule reads `latest_refill()`, snapshot and all; the ticker reads both once per board.
   `POST /controller c= retired=1` retires a board: reports land (the latch row included —
@@ -221,13 +226,44 @@ watering.
   or more after it (`status.float_seen`, not the wall clock: a board behind a WiFi drop has said
   nothing and is judged on nothing), and still 0 (`float_ok`: a report that said nothing said
   nothing) since before the tap (`float_word_since`) — pages `stale:<c>` (not while latched, on
-  `ch207=1`, or retired) and nothing else, cleared when the float reads 1 (the key is the 0.18.0 clock rule's,
+  `ch207=1`, or retired) and nothing else — naming the board's own float check when
+  `status.flap` stands, a float presumed stuck at empty otherwise (0.20.0) — cleared when the
+  float reads 1 (the key is the 0.18.0 clock rule's,
   so a page standing from it clears through the same path). Every sample is announced once as
   `tank:<c>:<refill_ts>`, marked like `dose:<id>` and left out of `/health` and the up-probe count
   like it, as a warning when it is more than `TANK_DRIFT_PCT` (25) off the median of the samples
   before it; the pending ones are found board by board from the latest announced one back
   (`unannounced_samples()`), never by scanning a board's life of samples every tick. `ch204`
   still lands and nothing reads it.
+- **Latches on the wire (0.20.0).** The board's three latches are channels in every report,
+  absent meaning 0 (an older board: never latched, never tripped): `ch207` the contra,
+  `ch210` the flap (`FLAP_CHANNEL`: three consecutive float refusals, after which the firmware
+  forces `float=0` until a dose is granted — the channel says *why* the word is 0; `float=`
+  itself is unchanged) and `ch211` the dry latch (`DRY_CHANNEL`: set by a reset with a dose in
+  flight, cleared only by `dry off`). `status.flap`, `status.flap_since` (when the flap last
+  went 0 → 1, kept through the level, left where it was when the flap lets go) and
+  `status.dry` come from the latest report, kept by the upsert as `contra` is, in the
+  `CREATE` and in `ADDED_COLUMNS`. The backend latches on the levels: `ch211=1` latches with
+  reason `resetmid`, exactly as `ch207=1` latches `contra`; both standing name `contra` (its
+  step comes first), and `ch207` going while `ch211` stands renames the standing latch, which
+  pages again with `dry off` — after a resume with the level still on the wire it re-latches,
+  as the contra does. The `err=resetmid` edge is consulted only for a report that carries no
+  `ch211` at all; a report with `ch211=0` is a board saying it is not dry, and the edge is not
+  consulted (closes backend#27: a second reset mid-dose is a level again). `/health` entries
+  carry `flap`, and the `stale:<c>` page tells the two apart: "the board's own float check
+  tripped — refill to the top and tap refilled, and the butler will try one dose" against
+  "presumed stuck at empty, look at the magnet". A tap answers the flap (`tap_answers_flap()`,
+  the rules' float gate): `float=1`, **or** `ch210=1` with the latest non-NULL-snapshot tap
+  later than `flap_since` **and no water handed to the board since that tap** — the rules
+  queue their next dose as they would, the board re-checks its float at dose time, and a
+  granted dose resets the flap (`float=1` returns), a refused one (`ack= flow_ml=0 err=float`)
+  leaves it standing and spends the tap: one dosefail page, dry again until the next tap. The
+  last clause is the backend's, not the spec's wording: the flap does not move on the wire for
+  a refusal (the board's counter only grows, `safety.cpp`), so on `flap_since` alone a refused
+  try was queued again at cooldown pace — the loop the flap exists to stop — and the page
+  promises one dose. The sample, counter and origin logic are untouched: a flap-forced 0 is a
+  firm drop, and the rise a granted dose brings leaves the tap as the origin. `POST /command`
+  stays ungated. `fake_device.py --flap` / `--dry` put `ch210=1` / `ch211=1` on every report.
 - The controller is an INTEGER on the wire and in every column, 0..255 (`MAX_CONTROLLER`), since
   0.17.0. It was free text, which made `c=` the one field a typo could turn into a second garden:
   a report from `bench1 ` opened its own controller row, heartbeat and alerts and nothing said the
