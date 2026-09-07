@@ -2465,22 +2465,20 @@ def create_app(
             raise ValueError(f"{photo_id} is listed but its file is gone") from None
 
     def forget_photo(photo_id: str) -> None:
-        """The row, then the file — the opposite order to keeping one, and
-        for the same reason: whichever way a crash lands, what is left over
-        is a file nobody knows about rather than a row nobody can show. The
-        person said the picture is gone, so it goes from the listing even
-        if the volume refuses to give up the bytes."""
+        """The row, then the file — the opposite order to keeping one, and for
+        the same reason: whichever way a crash lands, what is left over is a
+        file nobody knows about rather than a row nobody can show. The person
+        said the picture is gone, so it leaves the listing even if the volume
+        refuses to give up the bytes."""
         with connect() as con:
             row = con.execute(
                 "SELECT pot_id FROM photos WHERE id = ?", (photo_id,)
             ).fetchone()
             if row is None:
                 raise ValueError(f"no such photo: {photo_id}")
-            # The DELETE decides, not the SELECT before it. Two deletes of
-            # one photograph can both see the row — a bare SELECT takes no
-            # lock — and only the one that actually removed it may answer
-            # ok. Otherwise "deleting twice is refused rather than
-            # pretended" would hold only when nobody is in a hurry.
+            # The DELETE decides, not the SELECT before it: two deletes of one
+            # photograph can both see the row — a bare SELECT takes no lock —
+            # and only the one that removed it may answer ok.
             if con.execute("DELETE FROM photos WHERE id = ?", (photo_id,)).rowcount == 0:
                 raise ValueError(f"no such photo: {photo_id}")
         with contextlib.suppress(OSError):
@@ -2504,13 +2502,11 @@ def create_app(
                 "FROM species_names WHERE query = ?",
                 (query,),
             ).fetchone()
-        # A hit is kept for ever only when it is COMPLETE. A row that
-        # resolved a name but carries no family is a row that can suggest no
-        # plant kind, and a cache hit never re-asks — so without this it
-        # would suggest nothing for the life of the database. Rows written
-        # before `family` existed are the loud case; a genus-level answer is
-        # the ordinary one. Re-asking is TTL-gated, so a name GBIF really has
-        # no family for costs one call a month, not one per screen open.
+        # A hit is kept for ever only when it is COMPLETE: a row that resolved
+        # a name but carries no family can suggest no plant kind, and a cache
+        # hit never re-asks, so without this it would suggest nothing for the
+        # life of the database. Re-asking is TTL-gated, so a name that really
+        # has no family costs one call a month, not one per screen open.
         fresh = row and now - row[3] < CARE_MISS_TTL_S
         complete = row and row[0] is not None and row[4] is not None
         if row and (complete or fresh):
@@ -2738,11 +2734,11 @@ def create_app(
             )
 
     def water_rules(con: sqlite3.Connection, r: Report, now: int) -> None:
-        """The ladder from the design sketch, statelessly, inside the
-        report's own transaction. Median over the last RULES_WINDOW
-        readings is both the smoothing and the consecutive-dry test: a
-        dry median of five means most of the window was dry. Every gate
-        errs dry; a skipped pot is retried on the next report for free.
+        """The watering ladder, statelessly, inside the report's own
+        transaction. The median over the last RULES_WINDOW readings is both
+        the smoothing and the consecutive-dry test: a dry median of five means
+        most of the window was dry. Every gate errs dry, and a skipped pot is
+        retried on the next report for free.
         """
         con.execute(
             "UPDATE commands SET state = 'expired' "
@@ -2766,12 +2762,12 @@ def create_app(
         if r.float_ok != 1 and answering is None:
             return  # no reservoir, no report field: dry — unless a tap answers the flap
         # While the tap answers the flap, a refusal acked before it — the
-        # board's float check failing with the word still up, the very
-        # thing the flap counts — is not water to the cooldown below: the
-        # try the tap bought must not wait out the refusal's six hours, a
-        # person told "refill and tap" having just done both. Any other
-        # time a refusal cools the pot as a dose does: a pot the board
-        # refuses for ever must not be asked at report pace (spec A1).
+        # board's float check failing with the word still up, the thing the
+        # flap counts — is not water to the cooldown below: the try the tap
+        # bought must not wait out the refusal's six hours, when the person
+        # told to refill and tap has just done both. Any other time a refusal
+        # cools the pot as a dose does, or a pot the board refuses for ever
+        # would be asked at report pace.
         refusals_before = 0 if answering is None else answering
         # This board's own beat, so "recent" below means the same number of
         # reports whether it speaks every minute or every hour.
@@ -2854,13 +2850,12 @@ def create_app(
                 "AND (flow_ml IS NOT 0 OR acked_ts >= ?) LIMIT 1",
                 (pot_id, now - cooldown_s, refusals_before),
             ).fetchone() or con.execute(
-                # ...and the hose underneath it. Attribution is a lookup and
-                # a lookup can come back empty for reasons that say nothing
-                # about the plant: a dose handed before the pot was ever
-                # registered, a clock that stepped while the wiring was
-                # saved. Water went down this hose either way, so the old
-                # hose-keyed gate stays as the floor — decision #5, unknown
-                # state waters LESS, never more.
+                # ...and the hose underneath it. Attribution is a lookup, and
+                # a lookup comes back empty for reasons that say nothing about
+                # the plant: a dose handed before the pot was registered, a
+                # clock that stepped while the wiring was saved. Water went
+                # down this hose either way, so the hose-keyed gate is the
+                # floor: an unknown state waters LESS, never more.
                 "SELECT 1 FROM commands WHERE controller = ? AND outlet = ? "
                 "AND sent_ts IS NOT NULL AND COALESCE(acked_ts, sent_ts) > ? "
                 "AND (flow_ml IS NOT 0 OR acked_ts >= ?) LIMIT 1",
@@ -2870,16 +2865,12 @@ def create_app(
                 continue
             cap = cap_ml if cap_ml is not None else DEFAULT_DAILY_CAP_DOSES * dose
             # Acked water only. A handed command the board never acked is far
-            # likelier a response that never arrived than an ack that was
-            # lost — the firmware never retries once any response bytes came
-            # back — and charging its full dose starved the pot for the day
-            # on nothing. The cooldown above still counts it: spacing errs
-            # dry, the cap counts water. (Jacopo, 2026-09-05.)
-            #
-            # One row, one owner, one SUM. This used to need a DISTINCT over
-            # a join, because a dose handed in the very second of a remap sat
-            # in both the window that closed and the one that opened; a
-            # stamped row cannot be in two windows at once.
+            # likelier a response that never arrived than a lost ack — the
+            # firmware never retries once any response bytes came back — and
+            # charging its full dose would starve the pot for the day on
+            # nothing. The cooldown above still counts it: spacing errs dry,
+            # the cap counts water. One row, one owner, one SUM: the stamp
+            # means no dose can fall inside two mapping windows at once.
             (spent,) = con.execute(
                 "SELECT COALESCE(SUM(CASE WHEN acked_ts IS NOT NULL "
                 "THEN COALESCE(flow_ml, ml) ELSE 0 END), 0) FROM commands "
@@ -2932,14 +2923,15 @@ def create_app(
                 (r.controller, now),
             )
             # The firmware retries a report with the body kept when the
-            # response is lost (the module docstring), and the retry is the
-            # same report, not the next one: heard once. Judged here,
-            # before the status upsert and the float's edge, not only
-            # before the readings — a one-glitch sighting delivered twice
-            # would otherwise agree with itself into the firm word. The
-            # heartbeat above still counts, and the hand-off below still
-            # runs: the board never saw the response the retry stands in
-            # for (spec D4).
+            # response is lost, so an identical (controller, t) inside the
+            # window is one report heard twice, not two — and t is board
+            # uptime, which recurs after every reboot, so the window is what
+            # keeps a permanent uniqueness rule from dropping real readings.
+            # Judged here, before the status upsert and the float's edge and
+            # not only before the readings: a one-glitch sighting delivered
+            # twice would otherwise agree with itself into the firm word. The
+            # heartbeat above still counts and the hand-off below still runs,
+            # since the board never saw the response the retry stands in for.
             duplicate = (
                 r.t is not None
                 and con.execute(
@@ -2949,40 +2941,32 @@ def create_app(
                 ).fetchone()
             )
             if not duplicate:
-                # The board's error and float before this report: the
-                # resetmid latch is an edge on the one, a tank sample on
-                # the other, and the upsert below overwrites both. The
-                # float is its last word, not float_ok: a report that
-                # omits float= blanks that column (its vanishing is its
-                # own alarm) and must not hide the edge. A first report
-                # has none of these: there is no row yet, and it closes
-                # nothing.
+                # The board's error and float before this report: the resetmid
+                # latch is an edge on the one and a tank sample on the other,
+                # and the upsert below overwrites both. The float is its last
+                # word rather than float_ok, because a report that omits
+                # float= blanks that column — its vanishing being its own
+                # alarm — and must not hide the edge.
                 prev = con.execute(
                     "SELECT err, float_word, float_firm, float_word_since "
                     "FROM status WHERE controller = ?",
                     (r.controller,),
                 ).fetchone()
                 prev_err, prev_word, prev_firm, prev_fell = prev or (None,) * 4
-                # The firm word going 1 -> 0: the word was firmly full, the
-                # last report that carried float= said empty, and so does
-                # this one. One sighting is a glitch by the board's own
-                # design (any of its three samples failing fails the word),
-                # and a slosh at report time must not close a sample early
-                # and hand the origin to its recovery; a firm word of NULL
-                # — a board's first, or the one the upgrade left — was
-                # never firmly full and is no edge. The tap the drop
-                # belongs to is the one the word fell after (base_tap's
-                # `fell`, the word's clock before this report): a person
-                # who filled and tapped between the two sightings made a
-                # tap this run did not start from. The first drop after a
-                # tap is stamped on it below and closes its run; a later
-                # one is a second drain after an untapped refill. Not on a
-                # report carrying ch207=1: the contra latch is what forces
-                # the word to 0 — "float OK, zero pulses", a fault and not
-                # a drop — and the upsert remembers the forced 0 so that
-                # the word coming back out of it is no rise. Any other
-                # latch leaves the float's word its own, and a drain under
-                # it is a drop like any other (spec D3, D4).
+                # The firm word going 1 -> 0: firmly full, the last report
+                # that carried float= said empty, and so does this one. One
+                # sighting is a glitch by the board's own design — any of its
+                # three samples failing fails the word — and a slosh at report
+                # time must not close a sample early and hand the origin to
+                # its recovery; a firm word of NULL was never firmly full and
+                # is no edge. The drop belongs to the tap the word fell after,
+                # since a person who filled and tapped between the two
+                # sightings made a tap this run did not start from. Not on a
+                # report carrying ch207=1: the contra latch is what forces the
+                # word to 0 — "float OK, zero pulses" is a fault, not a drop —
+                # and the upsert remembers the forced 0 so the word coming
+                # back out of it is no rise. Under any other latch the float's
+                # word is its own and a drain is an ordinary drop.
                 edge = prev_firm == 1 and prev_word == 0 and r.float_ok == 0
                 forced = r.channels.get(CONTRA_CHANNEL) == 1
                 flap = int(r.channels.get(FLAP_CHANNEL) == 1)
