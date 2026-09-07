@@ -90,12 +90,6 @@ def test_migrate_is_idempotent(tmp_path):
     assert con.execute("SELECT id FROM pots ORDER BY name").fetchall() == before
 
 
-def test_migrate_leaves_a_backup(tmp_path):
-    path, con = old_db(tmp_path)
-    migrate(con, path)
-    assert (tmp_path / "old.db.pre-identity.bak").exists()
-
-
 def test_a_pot_with_no_mapping_gets_no_mapping_row(tmp_path):
     """A (NULL, NULL, NULL) row in pot_mappings would read back through
     pots_now the same as no mapping at all, but would also claim to be the

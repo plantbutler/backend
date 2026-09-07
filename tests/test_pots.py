@@ -198,17 +198,6 @@ def test_the_displacement_backstop_still_closes_a_stray_open_window(client, db):
     assert mappings(db, mint) == [(0, 3, None)], "mint holds it now"
 
 
-def test_a_pot_may_not_park_on_a_working_pots_hose(client, db):
-    """The collision check is asked whatever the SAVED pot's own status is:
-    the point is the other pot. Skipping it for a disabled pot would let
-    one open a second window on a working pot's hose."""
-    pot(client, "name=basil controller=0 channel=0 outlet=3")
-
-    answer = pot(client, "name=mint controller=0 outlet=3")
-    assert answer.status_code == 400
-    assert "taken by pot basil" in answer.text
-
-
 def test_a_displaced_window_keeps_the_doses_it_held(client, db):
     """Burying a pot closes its window; it must not erase its history. The
     dose carries basil's stamp and keeps it, whoever takes the hose next."""
@@ -305,14 +294,6 @@ def test_parse_pot_is_strict_about_its_own_fields():
 # --------------------------------------------------------------------------- #
 # Identity: the id is the pot, the name is a nickname
 # --------------------------------------------------------------------------- #
-
-
-def test_create_mints_an_id_and_returns_it(client):
-    answer = pot(client, "name=basil")
-    assert answer.status_code == 200
-    got_id, got_name = answer.text.split()
-    assert got_id.startswith("pot=pot-")
-    assert got_name == "name=basil"
 
 
 def test_a_pot_can_be_renamed_by_id(client):

@@ -45,6 +45,8 @@ def post_pot(client, body):
 
 
 def get(client, **params):
+    """The list, read with no token: /doses is a read, like /pots and
+    /history."""
     answer = client.get("/doses", params=params)
     assert answer.status_code == 200, answer.text
     return answer.json()["doses"]
@@ -195,11 +197,6 @@ def test_the_cursor_crosses_a_second_boundary_too(client, db):
     assert [r["id"] for r in page] == [3]
     rest = get(client, pot="pot-1", before=page[0]["sent_ts"], before_id=page[0]["id"])
     assert [r["id"] for r in rest] == [2, 1]
-
-
-def test_doses_needs_no_token(client, db):
-    """A read, like /pots and /history."""
-    assert client.get("/doses").status_code == 200
 
 
 def test_the_answer_carries_the_servers_clock(client, db):

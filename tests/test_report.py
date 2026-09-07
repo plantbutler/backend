@@ -95,14 +95,6 @@ def test_a_buried_pots_channel_stamps_nobody(client, db):
     assert stamps(db) == [(0, basil), (0, None)]
 
 
-def test_a_retry_still_dedups_when_nothing_is_mapped(client, db):
-    """The dedup probe is on (controller, t), not on pots: an unmapped
-    board must not write its readings twice."""
-    reported(client, REPORT)
-    reported(client, REPORT)
-    assert len(stamps(db)) == 3
-
-
 # --------------------------------------------------------------------------- #
 # The good path
 # --------------------------------------------------------------------------- #
@@ -177,6 +169,9 @@ def test_health_reports_the_default_interval_not_an_override(db):
 
 
 def test_an_identical_retry_is_answered_200_and_stored_once(client, db):
+    """No pot is mapped here, which is the point: the dedup probe is on
+    (controller, t), not on pots, so an unmapped board must not write its
+    readings twice either."""
     first = reported(client, REPORT)
     retry = reported(client, REPORT)
 

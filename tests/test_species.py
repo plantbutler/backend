@@ -376,11 +376,9 @@ def test_height_never_lifts_the_ceiling():
 
 def test_a_typo_sized_measurement_is_capped_not_obeyed():
     # 200 cm across and 1000 cm tall are both inside what the write path
-    # allows, and neither may propose a band nobody could water to.
-    for diameter in (1, 200):
-        for height in (1, 1000):
-            band = target_band("herb", None, diameter, height, 1)
-            assert 5 <= band.low < band.high <= 95, (diameter, height, band)
+    # allows. That neither proposes a band nobody could water to is
+    # test_the_band_never_closes_or_leaves_the_scale's whole cross product;
+    # this is the cap those readings run into.
     assert size_shifts(1, None)[0] == 7.5  # the cap, exactly
     assert size_shifts(200, None)[0] == -7.5
 
