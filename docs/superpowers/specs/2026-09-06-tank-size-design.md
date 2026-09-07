@@ -240,6 +240,21 @@ reason); left level-triggered, the board's next report after the edge, still car
 renamed the reset `contra` before anyone had looked. Pre-existing in 0.18.0, fixed here
 because D6/D7's pages send a person down the same steps.
 
+**D14 — The last round, 2026-09-07.** Five things the fifth review left, ruled and closed here,
+after which what remains becomes issues, not rounds. (a) `is_over` reads the **firm** word
+(`status.float_firm = 1`), not `float_ok`: the origin waits for the firm word, so in the beat
+between a 0 → 1 sighting and its confirmation the raw word said full while the origin was still
+the tap whose run had just closed, and any run 10 % above the median paged "presumed stuck" and
+dried the rules until a tap. (b) The tap clears the `over:<c>` row **inline** in `record_refill`
+(`cleared_ts` = the tap), as `/resume` clears `latch:<c>`; no clear page is sent — the person did
+the thing — and `over_stands` is simply "raised and not cleared", for the rules, `/health` and
+the phone's strip alike. (c) The firm word starts NULL and becomes the word only once two
+consecutive float-carrying reports agree; NULL is never an edge, for the drop, the rise or
+`float_forced`. (d) The `latch:<c>` page carries the reason in the alert row's `detail`, and a
+standing latch whose reason changed (D12's overwrite) pages again with the new words, floor or
+no floor — a person told "clear contra" must also be told "dry off". (e) Tests must not compare a
+stamp to the wall clock across a second boundary.
+
 **D13 — `ERR_TOKEN` accepts digits.** *2026-09-07, from the review:* the firmware's
 `DOSE_REFUSED_I2C` token is `i2c` (`safety.cpp:150`); `[a-z_]{1,16}` refused it, and since `err=`
 is the board's sticky last error, one I2C refusal made every later report a 400 until reboot.
